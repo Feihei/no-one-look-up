@@ -22,7 +22,7 @@ fn main() -> AppExit {
             HeadsUpPlugins,
         ))
         .add_systems(Startup, (setup_scene, log_sky_state.after(setup_scene)))
-        .add_systems(Update, report_sun_altitude)
+        .add_systems(Update, aim_at_sun_once)
         .run()
 }
 
@@ -34,8 +34,9 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Look 50° up (inside the design band of 40–60° elevation, adr-0001) at a
-    // heading roughly opposite the evening sun so the gradient is in frame.
+    // Spawn level; `aim_at_sun_once` turns the camera toward the sun after the
+    // ephemeris settles. (A fixed 50° pitch only frames the high sky — the
+    // horizon band needs a low sun-centered view.)
     commands.spawn((
         Name::new("PlayerCamera"),
         Camera3d::default(),
@@ -45,12 +46,7 @@ fn setup_scene(
             },
             ..default()
         },
-        Transform::from_xyz(0.0, 1.6, 0.0).with_rotation(Quat::from_euler(
-            EulerRot::YXZ,
-            0.0,
-            50f32.to_radians(),
-            0.0,
-        )),
+        Transform::from_xyz(0.0, 1.6, 0.0),
     ));
 
     // Simple asphalt-toned ground plane for IBL/fog reference.
@@ -80,17 +76,29 @@ fn log_sky_state(sky: Res<HeadsUpSky>) {
     );
 }
 
-/// Continuous sun-altitude report during R1 tuning (rate-limited).
-fn report_sun_altitude(
+/// Aims the camera at the sun once the ephemeris settles (first frame's
+/// `SunState` is still the default), keeping the golden horizon band and sun
+/// disc in frame. Replaced by the player controller in R3.
+fn aim_at_sun_once(
     sun: Res<bevy_elements::SunState>,
-    time: Res<Time>,
-    mut next_log: Local<f32>,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+    mut framed: Local<bool>,
 ) {
-    if time.elapsed_secs() >= *next_log {
-        *next_log = time.elapsed_secs() + 2.0;
-        info!(
-            "sun_alt={:.2}° moon_alt={:.2}°",
-            sun.altitude_deg, sun.moon_altitude_deg
-        );
+    if *framed {
+        return;
     }
+    let Ok(mut transform) = cameras.single_mut() else {
+        return;
+    };
+    *framed = true;
+    let dir = sun.direction.normalize_or(Vec3::NEG_Z);
+    let yaw = (-dir.x).atan2(-dir.z);
+    // Keep the horizon in frame: aim at the sun but never above 15°.
+    let pitch = dir.y.clamp(-1.0, 1.0).asin().max(10f32.to_radians());
+    *transform = Transform::from_xyz(0.0, 1.6, 0.0).with_rotation(Quat::from_euler(
+        EulerRot::YXZ,
+        yaw,
+        pitch,
+        0.0,
+    ));
 }

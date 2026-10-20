@@ -65,7 +65,11 @@ impl Default for HeadsUpSky {
             golden_hour: 17.5,
             location: GeoLocation {
                 latitude_deg: 39.9042,
-                longitude_deg: 125.0,
+                // Tuned so 17:30 lands the sun at ~2.6° altitude: dusk tint
+                // factor ≈ 0.75 (deeper orange horizon) and a relatively
+                // darker blue-purple zenith (Feihei: "slightly more
+                // orange-purple").
+                longitude_deg: 126.4,
                 utc_offset_hours: 8.0,
             },
             cloud_cover: None,
