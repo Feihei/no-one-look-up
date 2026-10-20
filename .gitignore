@@ -1,0 +1,11 @@
+# Build
+/target
+
+# Agent/session housekeeping
+/.box-agent/
+/.box-agent-scratch/
+.AGENTS.md.artifact.json
+
+# OS
+.DS_Store
+Thumbs.db

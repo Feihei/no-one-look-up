@@ -1,0 +1,25 @@
+[package]
+name = "heads_up_bevy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Heads-Up: a first-person endless strolling experience focused on the golden-hour sky (Bevy 0.20 migration of the original Godot 4.7 project)"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+# Single-package workspace root; members may be split out later if needed.
+
+[dependencies]
+bevy = "=0.20.0"
+bevy_elements = "0.5.3"
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+# Keep iteration fast while still allowing debuggable game code.
+opt-level = 1
+
+[profile.dev.package."*"]
+# Dependencies (bevy et al.) get a bit more optimization; they are rarely stepped into.
+opt-level = 3
