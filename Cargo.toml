@@ -19,7 +19,12 @@ serde_json = "1"
 [profile.dev]
 # Keep iteration fast while still allowing debuggable game code.
 opt-level = 1
+# Line tables only: cuts debuginfo generation memory and disk use hard while
+# keeping file/line info in backtraces (32 GB host, parallel bevy builds).
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
-# Dependencies (bevy et al.) get a bit more optimization; they are rarely stepped into.
-opt-level = 3
+# Dependencies get moderate optimization: 2 keeps the runtime fast enough for
+# atmosphere/cloud iteration on this machine while easing parallel rustc peak
+# memory (opt-level 3 pushed parallel bevy compiles past the host's budget).
+opt-level = 2

@@ -1,0 +1,10 @@
+# Local build tuning (Windows host: i7-8700 6C/12T, 32 GB RAM).
+#
+# cargo defaults to one rustc per logical core (12 here); parallel opt-level
+# compiles of bevy crates can push peak memory past the host budget and stall
+# the machine. Cap parallel jobs and use a faster linker if available.
+
+[build]
+# Physical core count: roughly halves parallel rustc peak memory vs 12 threads
+# with a modest compile-time cost.
+jobs = 6
