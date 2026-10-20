@@ -29,13 +29,13 @@
 
 **目标**：用 Bevy 0.20 Atmosphere + bevy_elements 复现原 M1 的黄昏氛围。
 
-- [ ] 1.1 集成 bevy_elements：`ElementsCamera` + Atmosphere/EnvironmentMapLight/DepthPrepass/VolumetricFog/Exposure 自动挂接
-- [ ] 1.2 编写 `HeadsUpSky` Resource：时间锁定 17:30（`WorldClock` time_scale=0）、天气锁定晴朗（`WeatherDirector::force` 低云量）、黄昏参数接口（云密度/星星可见度/月亮形态）
-- [ ] 1.3 配置黄昏色调：物理散射 + `Exposure { ev100: 13.0 }`（或 auto_exposure）+ ACES + `Bloom::NATURAL`，实测调校金黄→橙红→深蓝紫
-- [ ] 1.4 裁剪 bevy_elements 未用模块（雨雪/雷电/风场调度不编译），减小编译体积
-- [ ] 1.5 天空动态变化：世界坐标噪声驱动 ScatteringMedium 密度乘子/exposure 微扰（不同位置氛围细微差异）
-- [ ] 1.6 后期效果：Bloom/ACES/DoF 内置配置；CA 用 `FullscreenMaterial` 自写（可延后）
-- [ ] 1.7 头less 截图冒烟测试：黄昏天空关键帧截图断言（CI 可跑）
+- [x] 1.1 集成 bevy_elements：`ElementsCamera` + Atmosphere/EnvironmentMapLight/DepthPrepass/VolumetricFog/Exposure 自动挂接
+- [x] 1.2 编写 `HeadsUpSky` Resource：时间锁定 17:30（`WorldClock` time_scale=0 + paused）、天气锁定晴朗（`WeatherDirector::force(WeatherPreset::Clear, Duration::ZERO)`）、黄昏参数接口（cloud_cover/cloud_layer 覆盖 + 曝光基准；星星可见度为保留接口——星场内置于 CelestialPlugin 无公开 API，黄金时刻被亮天空掩盖属预期）
+- [x] 1.3 配置黄昏色调：物理散射 + `Exposure { ev100: 13.0 }` + ACES + Bloom（intensity 0.3）；选定 date=2026-03-21 + lon=125.0 → 17:30 太阳 3.5°/月亮 36°；实测：太阳盘+光晕+暖地平线带+云剪影暖镶边+冷蓝顶渐变（橙红饱和度/天顶紫调待 Feihei 人眼迭代，估 60%）
+- [x] 1.4 裁剪 bevy_elements 未用模块（Wind/Precipitation/Lightning/Dust/Terrain/Hydrology/Water/GroundCover/Weathered 共 9 个 disable，保留 Climate/Celestial/Fog/Cloud）
+- [x] 1.5 天空动态变化：世界坐标噪声（sum-of-sines，确定性）驱动 exposure 微扰 ±0.15 ev100；ScatteringMedium 密度乘子受 GPU LUT 资产限制（每帧重建不可行），记录在笔记中
+- [x] 1.6 后期效果：Bloom/ACES 内置配置；CA 用 `FullscreenMaterial` 自写（延后至 R5 润色）
+- [x] 1.7 headless 截图冒烟测试：`tests/sky_screenshot.rs` 黄昏天空帧断言（HDR 带分析：渐变/暖地平线/非黑；本地 GPU `--ignored` 运行，CI GPU-less runner 不能跑）
 
 ### 可验证
 
@@ -131,7 +131,7 @@
 
 ```
 R0: 骨架与依赖锁定   [██████████] 完成（2026-10-20）
-R1: 天空系统迁移     [░░░░░░░░░░] 待开始
+R1: 天空系统迁移     [████████░░] 完成（2026-10-20，色调饱和度待人眼迭代）
 R2: 布局图与Chunk    [░░░░░░░░░░] 待开始
 R3: 放置碰撞与季节   [░░░░░░░░░░] 待开始
 R4: 存档与菜单       [░░░░░░░░░░] 待开始

@@ -115,7 +115,7 @@ serde_json = "1"
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | R0 | 项目骨架 + 依赖锁定 + 版本验证 | 完成（2026-10-20，R0.5 树资产仅 3/5 种，其余待 .blend） |
-| R1 | 天空系统迁移（Atmosphere + bevy_elements + HeadsUpSky） | 待开始 |
+| R1 | 天空系统迁移（Atmosphere + bevy_elements + HeadsUpSky） | 完成（2026-10-20；黄昏渐变饱和度待人眼迭代） |
 | R2 | 布局图/WorldGrid + Chunk 流式（Rust 移植） | 待开始 |
 | R3 | 放置/碰撞/季节（负形街道模型） | 待开始 |
 | R4 | 存档与菜单 | 待开始 |

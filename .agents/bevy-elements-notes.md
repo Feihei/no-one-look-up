@@ -260,3 +260,17 @@ R0.5 的 headless 资产加载测试（`tests/assets_load.rs`）踩坑记录，R
 - **AssetServer 路径相对 `assets/` 根目录**：`server.load("models/aspen_1.glb")`，不要带 `assets/` 前缀（文件存在性检查用 `assets/models/...`）。
 - 本机冒烟：RTX 2070 / Vulkan / driver 610.47，窗口创建与 GPU preprocessing 正常；日志中 RenderDoc JSON 报错是机器上的 Vulkan layer 残留（`E:\Program Files\RenderDoc_1.30_64\renderdoc.json` 缺失），与项目无关。
 - 首次并行 `cargo check` 曾在多个 proc-macro crate 上无诊断失败（derive_more/serde_derive/zerofrom 等），单 crate 重试即过，判断为临时故障（疑似杀软/文件锁）；CI 上需留意偶发。
+
+## R1 补充：headless 渲染/截图测试要点（2026-10-20，已实测验证）
+
+R1.7 截图冒烟测试（`tests/sky_screenshot.rs`）踩坑记录，后续截图类测试直接复用：
+
+- **测试帧必须节流（delta 饿死）**：测试循环 600 帧只跑 ~1.5s，`Time<Virtual>` delta≈0，bevy_elements 的时间平滑/读回 cadence 全部饿死，天空渲染成均匀平色（各值与清屏色不同但无内容）。测试循环每帧 `sleep(16ms)` 模拟真实节奏后，完整天空（渐变+太阳盘+云）立即正常。这是 headless 截图测试的第一嫌疑。
+- **`Hdr` 相机（ElementsCamera required）+ LDR 图片目标 = 渲染被跳过**：输出停在清屏色 `srgb_u8(43,44,47)`，无任何错误。必须 `Rgba16Float` 目标；断言用曝光不变的比值/分带分析（线性值含曝光标度，阈值放宽）。
+- **MinimalPlugins 不含 TransformPlugin**：GlobalTransform 永不传播，破坏 bevy_elements 的相机跟随雾与大气视图（平色帧）。测试插件组合最终清单：
+  `MinimalPlugins + TransformPlugin + AssetPlugin + RenderPlugin + WindowPlugin{None} + ImagePlugin + MeshPlugin + CameraPlugin + CorePipelinePlugin` + `PostProcessPlugin + GltfPlugin(先于 PbrPlugin!) + PbrPlugin + LightPlugin + GizmoPlugin + HeadsUpPlugins + LogPlugin`。
+- **Bevy 0.20 API 变化**：`RenderTarget` 是独立 Component（不再是 `Camera.target` 字段）；`Camera` 无 `fov` 字段（用 `Projection::Perspective`）；`Exposure { ev100 }` 在 prelude；Bloom 在 `bevy::post_process::bloom`；TextureFormat 在 `bevy::render::render_resource`；PbrPlugin 非 unit struct（用 `::default()`）。
+- **黄昏取景**：pitch 50° + 默认 fov 45° → 画面覆盖 27°–72° 仰角，完全看不到地平线带（易误判"天空没渲染"）。验证/截图应对准太阳方向或 pitch ≤ 15°。
+- **太阳高度调参经验**：北京纬度 + 3 月 21 日，经度每 +1° → 17:30 太阳高度约 −0.78°。116.4°→10.06°、121.8°→5.95°、125.0°→3.5°（dusk_tint 线性：alt/10° 即因子，10° 起始、0° 全橙、−6° 淡出）。
+- **月亮可见性**：date 决定月相与太阳高度（固定时刻下唯一自由参数）。Mar 21 = 2 日细月牙（月亮 36° 高但很淡）；月亮形态调校 = 换 date，会联动太阳高度。
+- **黄昏视觉现状（估 60% 达标）**：太阳盘+光晕、暖地平线带、云剪影暖橙镶边、顶部冷蓝渐变、无过曝；短板：橙红中间色阶缺失、天顶偏灰蓝缺紫调、云暗部过暗。待 Feihei 人眼迭代（候选：更低太阳 / Bloom 阈值 / ScatteringMedium 调色 / FullscreenMaterial 黄昏分级 pass）。
