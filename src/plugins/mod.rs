@@ -10,6 +10,8 @@ pub mod season;
 pub mod sky;
 pub mod world;
 
+pub use sky::GoldenHourCamera;
+
 use bevy::app::PluginGroupBuilder;
 use bevy::prelude::*;
 
