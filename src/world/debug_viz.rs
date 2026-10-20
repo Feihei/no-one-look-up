@@ -1,0 +1,160 @@
+//! Debug visualization (R2.7): chunk boundaries, street network, and block
+//! labels drawn with Bevy Gizmos in development mode.
+//!
+//! Toggled with [`crate::core::input::DEV_TOGGLE_GIZMOS`] (G). Enabled by
+//! default in debug builds, off in release builds. The label entities are
+//! plain `Text2d` markers; the gizmo drawing is immediate-mode per frame.
+
+use bevy::prelude::*;
+
+use crate::core::input::DEV_TOGGLE_GIZMOS;
+use crate::world::CHUNK_SIZE;
+use crate::world::chunks::{ChunkManager, WorldSystems};
+use crate::world::layout_graph::{BlockType, LayoutGraph};
+
+/// Whether debug visualization is on (toggled with G).
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct DebugVizEnabled(pub bool);
+
+impl Default for DebugVizEnabled {
+    fn default() -> Self {
+        Self(cfg!(debug_assertions))
+    }
+}
+
+/// Marker on block label entities.
+#[derive(Component, Debug)]
+pub struct BlockLabel;
+
+/// Flips the debug visualization flag and syncs the label visibility.
+pub(crate) fn toggle_debug_viz(
+    input: Res<ButtonInput<KeyCode>>,
+    mut enabled: ResMut<DebugVizEnabled>,
+    mut labels: Query<&mut Visibility, With<BlockLabel>>,
+) {
+    if input.just_pressed(DEV_TOGGLE_GIZMOS) {
+        enabled.0 = !enabled.0;
+        info!(
+            "debug visualization {}",
+            if enabled.0 { "on" } else { "off" }
+        );
+        for mut visibility in labels.iter_mut() {
+            *visibility = if enabled.0 {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+}
+
+/// Spawns one text label per block the first time the layout graph appears.
+pub(crate) fn spawn_block_labels(graph: Option<Res<LayoutGraph>>, mut commands: Commands) {
+    let Some(graph) = graph else {
+        return;
+    };
+    if !graph.is_changed() {
+        return;
+    }
+    for block in &graph.blocks {
+        let center = block.center();
+        commands.spawn((
+            Name::new(format!("BlockLabel({})", block.id)),
+            BlockLabel,
+            Text2d::new(format!("{:?}", block.kind)),
+            TextFont {
+                font_size: FontSize::Px(6.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            Transform::from_xyz(center.x, 2.0, center.y),
+        ));
+    }
+    info!("debug labels spawned: {} blocks", graph.blocks.len());
+}
+
+/// Draws the debug overlay: chunk boundaries, street network, block outlines.
+pub(crate) fn draw_debug_viz(
+    enabled: Res<DebugVizEnabled>,
+    manager: Option<Res<ChunkManager>>,
+    graph: Option<Res<LayoutGraph>>,
+    mut gizmos: Gizmos,
+) {
+    if !enabled.0 {
+        return;
+    }
+
+    // Chunk boundaries (active set only).
+    if let Some(manager) = &manager {
+        for key in manager.active.keys() {
+            let (x, z) = *key;
+            let min = Vec3::new(x as f32 * CHUNK_SIZE, 0.05, z as f32 * CHUNK_SIZE);
+            let step = Vec3::new(CHUNK_SIZE, 0.0, 0.0);
+            let depth = Vec3::new(0.0, 0.0, CHUNK_SIZE);
+            let c = Color::srgba(1.0, 1.0, 1.0, 0.25);
+            gizmos.linestrip([min, min + step, min + step + depth, min + depth, min], c);
+        }
+    }
+
+    // Street network segments (centerlines).
+    if let Some(graph) = &graph {
+        let street = Color::srgba(1.0, 0.55, 0.1, 0.8);
+        for edge in &graph.edges {
+            let (Some(a), Some(b)) = (
+                graph.nodes.get(edge.from as usize),
+                graph.nodes.get(edge.to as usize),
+            ) else {
+                continue;
+            };
+            gizmos.line(
+                Vec3::new(a.pos.x, 0.1, a.pos.y),
+                Vec3::new(b.pos.x - a.pos.x, 0.0, b.pos.y - a.pos.y),
+                street,
+            );
+        }
+
+        // Block outlines (inset polygons), colored by type.
+        for block in &graph.blocks {
+            if block.polygon.len() < 3 {
+                continue;
+            }
+            let color = match block.kind {
+                BlockType::OldCity => Color::srgba(0.9, 0.3, 0.3, 0.6),
+                BlockType::Apartment => Color::srgba(0.3, 0.5, 0.9, 0.6),
+                BlockType::Factory => Color::srgba(0.9, 0.9, 0.3, 0.6),
+                BlockType::Plaza => Color::srgba(0.3, 0.9, 0.3, 0.6),
+                BlockType::Forest => Color::srgba(0.2, 0.7, 0.3, 0.6),
+            };
+            let mut points: Vec<Vec3> = block
+                .polygon
+                .iter()
+                .map(|p| Vec3::new(p.x, 0.08, p.y))
+                .collect();
+            points.push(points[0]);
+            gizmos.linestrip(points, color);
+        }
+    }
+}
+
+/// Debug visualization plugin: gizmo overlay + block labels, toggled with G.
+///
+/// Ordering contract (R2.8): explicit chain
+/// `spawn_block_labels -> toggle_debug_viz -> draw_debug_viz` (label spawn
+/// writes visibility the toggle reads; toggle writes the flag draw reads),
+/// and `WorldSystems::Streaming` before drawing (draw reads the chunk set).
+pub struct DebugVizPlugin;
+
+impl Plugin for DebugVizPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<DebugVizEnabled>().add_systems(
+            Update,
+            (
+                spawn_block_labels,
+                toggle_debug_viz.after(spawn_block_labels),
+                draw_debug_viz
+                    .after(toggle_debug_viz)
+                    .after(WorldSystems::Streaming),
+            ),
+        );
+    }
+}

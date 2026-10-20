@@ -1,8 +1,9 @@
 //! Heads-Up: a first-person endless strolling experience focused on the
 //! golden-hour sky. Bevy 0.20 migration of the original Godot 4.7 project.
 //!
-//! R1: golden-hour sky (bevy_elements). World/plugins per milestone
-//! (R2 world, R3 placement/seasons, R4 save/menu).
+//! R2: world generation + chunk streaming (ground tiles stream around the
+//! camera; debug gizmos toggle with G). Sky per R1; placement/seasons (R3)
+//! and save/menu (R4) per milestone.
 
 use bevy::camera::Exposure;
 use bevy::prelude::*;
@@ -30,17 +31,13 @@ fn main() -> AppExit {
         .run()
 }
 
-/// R1 verification scene: the sky camera looking up from street level plus a
-/// ground plane for light/IBL context. Replaced by the world in R2.
-fn setup_scene(
-    mut commands: Commands,
-    sky: Res<HeadsUpSky>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    // Spawn level; `aim_at_sun_once` turns the camera toward the sun after the
-    // ephemeris settles. (A fixed 50° pitch only frames the high sky — the
-    // horizon band needs a low sun-centered view.)
+/// R2 scene: the golden-hour sky camera at street level over the streamed
+/// world (chunk ground tiles spawn around the camera). The R1 verification
+/// ground plane is gone — the world provides the floor. Replaced by the
+/// player controller in R3.
+fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
+    // Spawn level at the world center; `aim_at_sun_once` turns the camera
+    // toward the sun after the ephemeris settles.
     commands.spawn((
         Name::new("PlayerCamera"),
         Camera3d::default(),
@@ -50,19 +47,7 @@ fn setup_scene(
             },
             ..default()
         },
-        Transform::from_xyz(0.0, 1.6, 0.0),
-    ));
-
-    // Simple asphalt-toned ground plane for IBL/fog reference.
-    commands.spawn((
-        Name::new("GroundPlane"),
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(4000.0, 4000.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.08, 0.08, 0.09),
-            perceptual_roughness: 0.95,
-            ..default()
-        })),
-        Transform::from_xyz(0.0, 0.0, 0.0),
+        Transform::from_xyz(1000.0, 1.6, 1000.0),
     ));
 }
 
@@ -99,7 +84,7 @@ fn aim_at_sun_once(
     let yaw = (-dir.x).atan2(-dir.z);
     // Keep the horizon in frame: aim at the sun but never above 15°.
     let pitch = dir.y.clamp(-1.0, 1.0).asin().max(10f32.to_radians());
-    *transform = Transform::from_xyz(0.0, 1.6, 0.0).with_rotation(Quat::from_euler(
+    *transform = Transform::from_xyz(1000.0, 1.6, 1000.0).with_rotation(Quat::from_euler(
         EulerRot::YXZ,
         yaw,
         pitch,

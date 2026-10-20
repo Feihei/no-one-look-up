@@ -1,16 +1,8 @@
-//! World generation plugin (R2).
+//! World plugin wiring (R2).
 //!
-//! Layout graph + world grid + block-first path network + chunk streaming,
-//! ported from the original M2/M3 algorithms (ADR-0002/0004). Deterministic
-//! generation via `rand_chacha` seeded from the save seed. Filled in during
-//! milestone R2.
+//! The world plugin itself lives in `crate::world::chunks` (layout
+//! generation + chunk streaming, ADR-0002/0004); this module re-exports it
+//! for the plugin group so the file layout mirrors the original Godot
+//! Manager split (see ADR-0005 mapping table).
 
-use bevy::prelude::*;
-
-pub struct WorldPlugin;
-
-impl Plugin for WorldPlugin {
-    fn build(&self, _app: &mut App) {
-        // R2: layout_graph, world_grid, path_network, chunks.
-    }
-}
+pub use crate::world::chunks::WorldPlugin;

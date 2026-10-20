@@ -21,6 +21,8 @@ use season::SeasonPlugin;
 use sky::SkyPlugin;
 use world::WorldPlugin;
 
+use crate::world::debug_viz::DebugVizPlugin;
+
 /// Group plugin wiring every feature plugin in dependency order.
 pub struct HeadsUpPlugins;
 
@@ -29,6 +31,7 @@ impl PluginGroup for HeadsUpPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(SkyPlugin)
             .add(WorldPlugin)
+            .add(DebugVizPlugin)
             .add(SeasonPlugin)
             .add(SavePlugin)
             .add(MenuPlugin)
