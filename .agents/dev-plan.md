@@ -49,14 +49,14 @@
 
 **目标**：移植原 M2/M3 生成算法到 Rust，实现 Chunk 流式加载。
 
-- [ ] 2.1 `layout_graph.rs`：LayoutGraph 数据结构（节点、边、宽度、Block 标签、边界，serde）
-- [ ] 2.2 `world_grid.rs`：2D 网格中间结构（block_id/道路/路口，get_cell 快速查询，serde）
-- [ ] 2.3 `path_network.rs`：Block 优先生成算法（合并规模：老城区 1×1 / 公寓 2-3 / 厂房 4-5 / 广场 1×1 / 树林边缘），内部道路物理删除，环路无死胡同
-- [ ] 2.4 种子系统：`rand_chacha::StdRng::seed_from_u64(seed)`，同 seed bit-exact 单元测试
-- [ ] 2.5 `chunks.rs`：50m×50m Chunk 划分，不对称半径（前方 4 / 后方 2，峰值约 55 Chunk）流式 spawn/despawn（`despawn_all`）
-- [ ] 2.6 几何验证单元测试：半平面内缩裁剪（`inset_polygon_clip`）+ OVERLAPS=0 断言
-- [ ] 2.7 调试可视化：Bevy Gizmos 绘制 Chunk 边界/路径网络/Block 标签（开发模式可开关）
-- [ ] 2.8 系统排序显式声明（`.before()/.after()`）+ 调度随机化 property testing
+- [x] 2.1 `layout_graph.rs`：LayoutGraph 数据结构（节点/边/宽度、Block 标签、边界，serde）；plaza 块中心作为图节点（放置锚点）
+- [x] 2.2 `world_grid.rs`：2D 网格中间结构（cell 记录 block_id/is_road/is_junction，`get_cell` 快速查询，serde）；is_road=贴街 cell，is_junction=含图节点的 cell
+- [x] 2.3 `path_network.rs`：Block 优先生成（行序扫描 carve 矩形：老城区 1×1 / 公寓 2-3 / 厂房 4-5 / 广场 1×1 / 树林边缘带；目标区被占或越出非 band 区则回退 1×1 老城区）；街道=块间网格线，减去 band 内部边（band 规则）；完整矩形 partition + band 规则在数学上保证街道全为环路（无死胡同），单测锁定
+- [x] 2.4 种子系统：`rand_chacha::StdRng::seed_from_u64(seed)`，同 seed bit-exact 单元测试；`thread_rng` 不进入生成路径
+- [x] 2.5 `chunks.rs`：50m×50m Chunk（40×40=1600，与 cell 1:1 对齐），不对称半径（前方 4 / 后方 2 / 侧 3，窗口最坏 8×8=64）流式 spawn/despawn（0.20 递归 `despawn` 组删除）+ 每 Chunk 地面 tile（seed 着色）供流式反馈
+- [x] 2.6 几何验证单元测试：半平面内缩裁剪（`inset_polygon_clip`）+ SAT；OVERLAPS=0 断言（4 个 seed 全块对）
+- [x] 2.7 调试可视化：Bevy Gizmos 绘制 Chunk 边界/街道中心线/Block 轮廓（按类型着色）+ Text2d Block 标签；G 键开关（debug 构建默认开）
+- [x] 2.8 系统排序显式声明（`.before()/.after()` 链）+ 调度随机化 property testing（16 种子随机注册顺序 + 歧义检测 = Error）
 
 ### 可验证
 
@@ -64,6 +64,11 @@
 - 移动时周围物体出现/消失，无明显卡顿
 - 同一 seed 每次生成的地图完全一致（bit-exact 测试）
 - 几何测试 OVERLAPS=0
+
+### 实现备注
+
+- 原始 GDScript 源不可得：算法按 ADR-0002/0004 记录的不变量重新实现（无死胡同的构造性保证：完整矩形 partition 下内部格点街道度数不可能为 1，band 内部无街道使边界格点度数为 0），由单元测试锁定行为
+- R3 碰撞可直接用 Block inset 多边形（全部为凸矩形）；非矩形 band 拼块不存在（band cell 全为 1×1）
 
 ---
 
@@ -132,7 +137,7 @@
 ```
 R0: 骨架与依赖锁定   [██████████] 完成（2026-10-20）
 R1: 天空系统迁移     [████████░░] 完成（2026-10-20，色调饱和度待人眼迭代）
-R2: 布局图与Chunk    [░░░░░░░░░░] 待开始
+R2: 布局图与Chunk    [██████████] 完成（2026-10-19，按 ADR 不变量重实现，单测锁定）
 R3: 放置碰撞与季节   [░░░░░░░░░░] 待开始
 R4: 存档与菜单       [░░░░░░░░░░] 待开始
 R5: 声音与润色       [░░░░░░░░░░] 待开始（原 M5 顺延）
