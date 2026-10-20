@@ -1,6 +1,9 @@
 # Build
 /target
 
+# Assets (models/images stay local-only; not committed for now)
+/assets/
+
 # Agent/session housekeeping
 /.box-agent/
 /.box-agent-scratch/
