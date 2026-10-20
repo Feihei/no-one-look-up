@@ -22,7 +22,11 @@ fn main() -> AppExit {
             HeadsUpPlugins,
         ))
         .add_systems(Startup, (setup_scene, log_sky_state.after(setup_scene)))
-        .add_systems(Update, aim_at_sun_once)
+        // PostUpdate, not Update: the aim must run AFTER bevy_elements'
+        // `update_sun_state` (ElementsSystems::Celestial, in Update) so the
+        // first aim reads the settled ephemeris instead of the default
+        // overhead-sun state. Same pattern as the day_night example.
+        .add_systems(PostUpdate, aim_at_sun_once)
         .run()
 }
 
