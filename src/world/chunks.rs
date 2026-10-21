@@ -11,14 +11,14 @@
 //! `CHUNK_AHEAD` chunks in front, `CHUNK_BEHIND` behind, `CHUNK_SIDE` to each
 //! side — about 49 chunks at peak (see `desired_chunks`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::prelude::*;
 
 use crate::core::input::{MOVE_BACKWARD, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT};
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
-use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIDE, CHUNK_SIZE, GRID_CELLS};
+use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
 
 /// Default seed until the R4 menu provides one (dev builds).
 pub const DEFAULT_SEED: u64 = 0x4845_4144; // "HEAD"
@@ -60,47 +60,63 @@ pub struct ChunkRoot;
 pub struct ChunkManager {
     /// Active chunk -> group root entity.
     pub active: HashMap<(i32, i32), Entity>,
+    /// Chunks waiting to be spawned, nearest-first (original load queue).
+    pub pending_load: VecDeque<(i32, i32)>,
+    /// Chunks waiting to be despawned (original unload queue).
+    pub pending_unload: VecDeque<(i32, i32)>,
 }
 
 impl ChunkManager {
     /// Chunks that should be active for a player at `pos` walking toward
     /// `forward` (world-plane direction).
     pub fn desired_chunks(pos: Vec2, forward: Vec2) -> Vec<ChunkCoords> {
+        // Port of `chunk_manager.gd::_compute_needed` (user-facing behaviour:
+        // a square window with a smaller radius behind).
         let forward = if forward.length_squared() > f32::EPSILON {
             forward.normalize()
         } else {
+            // Looking straight down: no horizontal facing, keep the defaults.
             Vec2::new(0.0, -1.0)
         };
-        let right = Vec2::new(-forward.y, forward.x);
         let player = ChunkCoords::from_world(pos);
+        let max_r = CHUNK_AHEAD.max(CHUNK_BEHIND);
 
-        // Chebyshev scan bound covering the rotated footprint (radius-4
-        // ahead + 3-side footprint fits within 8 chunk indices).
-        let radius = CHUNK_AHEAD + CHUNK_SIDE + 1;
         let mut out = Vec::new();
-        for cx in (player.x - radius)..=(player.x + radius) {
-            for cz in (player.z - radius)..=(player.z + radius) {
-                // The world is bounded: no chunks outside the 40x40 grid.
-                if cx < 0 || cz < 0 || cx >= GRID_CELLS as i32 || cz >= GRID_CELLS as i32 {
+        for dx in -max_r..=max_r {
+            for dz in -max_r..=max_r {
+                let x = player.x + dx;
+                let z = player.z + dz;
+                if x < 0 || z < 0 || x >= GRID_CELLS as i32 || z >= GRID_CELLS as i32 {
                     continue;
                 }
-                let center = Vec2::new(
-                    (cx as f32 + 0.5) * CHUNK_SIZE,
-                    (cz as f32 + 0.5) * CHUNK_SIZE,
-                );
-                let delta = center - pos;
-                let along = delta.dot(forward);
-                let cross = delta.dot(right);
-                let behind_limit = -(CHUNK_BEHIND as f32 + 0.5) * CHUNK_SIZE;
-                let ahead_limit = (CHUNK_AHEAD as f32 + 0.5) * CHUNK_SIZE;
-                let side_limit = (CHUNK_SIDE as f32 + 0.5) * CHUNK_SIZE;
-                if along >= behind_limit && along <= ahead_limit && cross.abs() <= side_limit {
-                    out.push(ChunkCoords { x: cx, z: cz });
+                let coords = ChunkCoords { x, z };
+                if dx == 0 && dz == 0 {
+                    out.push(coords); // Player's own chunk: always loaded.
+                    continue;
+                }
+                let center = coords.center();
+                let to_chunk = center - pos;
+                // Ahead (or exactly abeam) uses the front radius, behind the
+                // back radius. Chebyshev keeps the window square, so the side
+                // extent equals the front radius ahead of the player.
+                let radius = if to_chunk.dot(forward) >= 0.0 {
+                    CHUNK_AHEAD
+                } else {
+                    CHUNK_BEHIND
+                };
+                if dx.abs().max(dz.abs()) <= radius {
+                    out.push(coords);
                 }
             }
         }
         out
     }
+}
+
+/// Expands a Chebyshev key towards `pos` for stable load ordering.
+fn chunk_distance(key: (i32, i32), pos: Vec2) -> f32 {
+    let center = ChunkCoords { x: key.0, z: key.1 }.center();
+    (center - pos).length_squared()
 }
 
 /// Deterministic per-chunk asphalt tint (subtle luminance variation) so the
@@ -157,23 +173,62 @@ pub(crate) fn update_chunk_streaming(
     let forward = Vec2::new(camera.forward().x, camera.forward().z);
 
     let desired = ChunkManager::desired_chunks(pos, forward);
-    let mut desired_keys = Vec::with_capacity(desired.len());
+    let desired_keys: HashSet<(i32, i32)> = desired.iter().map(|c| (c.x, c.z)).collect();
 
-    // Spawn missing chunks (group root + ground tile).
-    for coords in desired {
+    // Rebuild the load queue: everything wanted but not active and not
+    // already queued, ordered nearest-first so the player's surroundings fill
+    // in before the horizon.
+    let active_keys: Vec<(i32, i32)> = manager.active.keys().copied().collect();
+    manager
+        .pending_load
+        .retain(|key| desired_keys.contains(key) && !active_keys.contains(key));
+    for coords in &desired {
         let key = (coords.x, coords.z);
-        desired_keys.push(key);
+        if !active_keys.contains(&key) && !manager.pending_load.contains(&key) {
+            manager.pending_load.push_back(key);
+        }
+    }
+    manager.pending_load.make_contiguous().sort_by(|a, b| {
+        chunk_distance(*a, pos)
+            .partial_cmp(&chunk_distance(*b, pos))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Same for unloads: chunks outside the window leave, closest first.
+    manager
+        .pending_unload
+        .retain(|key| active_keys.contains(key));
+    for key in &active_keys {
+        if !desired_keys.contains(key) && !manager.pending_unload.contains(key) {
+            manager.pending_unload.push_back(*key);
+        }
+    }
+
+    // Process at most CHUNKS_PER_FRAME of each per frame (original budget):
+    // spawning builds a chunk's whole contents, so a teleport or sharp turn
+    // must not pay for all of them in a single frame.
+    for _ in 0..CHUNKS_PER_FRAME {
+        let Some(key) = manager.pending_unload.pop_front() else {
+            break;
+        };
+        if let Some(root) = manager.active.remove(&key) {
+            commands.entity(root).try_despawn();
+        }
+    }
+
+    for _ in 0..CHUNKS_PER_FRAME {
+        let Some(key) = manager.pending_load.pop_front() else {
+            break;
+        };
         if manager.active.contains_key(&key) {
             continue;
         }
+        let coords = ChunkCoords { x: key.0, z: key.1 };
         let root = commands
             .spawn((
                 Name::new(format!("Chunk({}, {})", coords.x, coords.z)),
                 ChunkRoot,
-                ChunkCoords {
-                    x: coords.x,
-                    z: coords.z,
-                },
+                coords,
             ))
             .id();
         // Ground tile: real streaming feedback; R3 adds placement content.
@@ -195,18 +250,6 @@ pub(crate) fn update_chunk_streaming(
             });
         }
         manager.active.insert(key, root);
-    }
-
-    // Despawn chunks the player walked away from (recursive group removal).
-    let mut removed = Vec::new();
-    for (&key, &root) in manager.active.iter() {
-        if !desired_keys.contains(&key) {
-            removed.push((key, root));
-        }
-    }
-    for (key, root) in removed {
-        manager.active.remove(&key);
-        commands.entity(root).try_despawn();
     }
 }
 
@@ -289,39 +332,63 @@ mod tests {
 
     #[test]
     fn desired_chunks_follow_the_walk_direction() {
-        // Player at the world center facing -Z (north, toward row 0).
+        // Player at the world center facing -Z (north): the window is the
+        // original's square scan — 4 ahead, 2 behind (Chebyshev).
         let pos = Vec2::new(1000.0, 1000.0);
         let forward = Vec2::new(0.0, -1.0);
         let desired = ChunkManager::desired_chunks(pos, forward);
-        // Center-based window: 8 x 8 = 64 at the worst sub-chunk offset.
+
+        let player = ChunkCoords::from_world(pos);
+        assert_eq!(player, ChunkCoords { x: 20, z: 20 });
+        // Square scan: rows are 2 behind + own + 4 ahead. Columns whose
+        // centre sits exactly abeam have dot == 0 and count as "ahead", so the
+        // window is symmetric on both axes near the centre of a chunk.
         assert!(
-            (49..=64).contains(&desired.len()),
+            (49..=63).contains(&desired.len()),
             "unexpected footprint size: {}",
             desired.len()
         );
 
-        let player = ChunkCoords::from_world(pos);
         for chunk in &desired {
-            let center = chunk.center();
-            let delta = center - pos;
-            let along = delta.dot(forward);
-            let cross = delta.dot(Vec2::new(-forward.y, forward.x));
-            assert!(along <= (CHUNK_AHEAD as f32 + 0.5) * CHUNK_SIZE);
-            assert!(along >= -(CHUNK_BEHIND as f32 + 0.5) * CHUNK_SIZE);
-            assert!(cross.abs() <= (CHUNK_SIDE as f32 + 0.5) * CHUNK_SIZE);
+            let dx = chunk.x - player.x;
+            let dz = chunk.z - player.z;
+            let ahead = (chunk.center() - pos).dot(forward) >= 0.0;
+            let radius = if ahead { CHUNK_AHEAD } else { CHUNK_BEHIND };
+            assert!(
+                dx.abs().max(dz.abs()) <= radius,
+                "chunk {chunk:?} outside the chebyshev radius {radius}"
+            );
         }
-        assert_eq!(player, ChunkCoords { x: 20, z: 20 });
+        // The own chunk is always present.
+        assert!(desired.contains(&player));
     }
 
     #[test]
     fn desired_chunks_shift_with_facing() {
         let pos = Vec2::new(1000.0, 1000.0);
-        // Facing +X (east): chunks ahead in x.
-        let desired = ChunkManager::desired_chunks(pos, Vec2::new(1.0, 0.0));
-        let max_x = desired.iter().map(|c| c.x).max().expect("non-empty");
-        let min_x = desired.iter().map(|c| c.x).min().expect("non-empty");
-        assert!(max_x - 20 >= CHUNK_AHEAD - 1, "chunks reach ahead of +X");
-        assert!(min_x >= 20 - CHUNK_BEHIND - 1);
+        let player = ChunkCoords::from_world(pos);
+        // Facing +X (east): the window reaches CHUNK_AHEAD east, less west.
+        let east = ChunkManager::desired_chunks(pos, Vec2::new(1.0, 0.0));
+        assert!(east.iter().any(|c| c.x == player.x + CHUNK_AHEAD));
+        assert!(!east.iter().any(|c| c.x == player.x + CHUNK_AHEAD + 1));
+        assert!(!east.iter().any(|c| c.x == player.x - CHUNK_AHEAD));
+
+        // Turning 180° mirrors it.
+        let west = ChunkManager::desired_chunks(pos, Vec2::new(-1.0, 0.0));
+        assert!(west.iter().any(|c| c.x == player.x - CHUNK_AHEAD));
+        assert!(!west.iter().any(|c| c.x == player.x + CHUNK_AHEAD));
+    }
+
+    #[test]
+    fn desired_chunks_never_leave_the_world() {
+        // Player in the north-west corner: no chunk index may go negative or
+        // past the 40x40 grid.
+        let desired = ChunkManager::desired_chunks(Vec2::new(10.0, 10.0), Vec2::Y);
+        assert!(!desired.is_empty());
+        for chunk in &desired {
+            assert!((0..GRID_CELLS as i32).contains(&chunk.x), "{chunk:?}");
+            assert!((0..GRID_CELLS as i32).contains(&chunk.z), "{chunk:?}");
+        }
     }
 
     #[test]
@@ -373,8 +440,15 @@ mod tests {
             all_x.iter().all(|x| *x >= 26),
             "chunks behind the teleport should have despawned: {all_x:?}"
         );
-        // The active set matches the center-based footprint at (30, 20).
-        assert!((49..=64).contains(&manager.active.len()));
+        // The active set matches the footprint once the per-frame budget has
+        // drained the queue (CHUNKS_PER_FRAME = 1, so give it time).
+        let expected =
+            ChunkManager::desired_chunks(Vec2::new(1500.0, 1000.0), Vec2::new(0.0, -1.0)).len();
+        for _ in 0..(expected + 8) {
+            app.update();
+        }
+        let manager = app.world().resource::<ChunkManager>();
+        assert_eq!(manager.active.len(), expected, "active set should converge");
     }
 
     #[test]

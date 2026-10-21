@@ -76,14 +76,17 @@ pub const CHUNK_SIZE: f32 = 50.0;
 pub const CHUNK_AHEAD: i32 = 4;
 /// Streaming radius: chunks kept behind the walk direction (turn safety).
 pub const CHUNK_BEHIND: i32 = 2;
-/// Streaming radius: chunks kept to each side.
+// Streaming window: the original's square scan, `chebyshev(dx, dz) <= FRONT`
+// ahead and `<= BEHIND` behind, decided per chunk by the dot product with the
+// walk direction (no separate side radius — the side extent IS the front
+// radius, exactly like `chunk_manager.gd`).
+
+/// Chunk loads/unloads processed per frame (original `CHUNKS_PER_FRAME`).
 ///
-/// Active window: `(AHEAD + 0.5)` chunks ahead, `BEHIND + 0.5` behind,
-/// `SIDE + 0.5` to each side (chunk-center based). Worst case (player at a
-/// sub-chunk offset) the window covers 8 x 8 = 64 chunks; the ADR-0002
-/// estimate was ~55 at peak — in range, and ground tiles are cheap for the
-/// 2-4 GB VRAM budget (placement content is what R5's LOD budget targets).
-pub const CHUNK_SIDE: i32 = 3;
+/// Spawning a chunk builds its contents; doing all 64 in one frame after a
+/// teleport or a sharp turn would stall. One per frame spreads the burst over
+/// ~64 frames while the player is still walking into it.
+pub const CHUNKS_PER_FRAME: usize = 1;
 
 #[cfg(test)]
 mod tests {
