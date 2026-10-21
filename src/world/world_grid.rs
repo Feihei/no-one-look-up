@@ -13,6 +13,7 @@
 //! polygon-heavy layout graph, at a fraction of the size.
 
 use bevy::ecs::prelude::Resource;
+use bevy::math::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::{HeadsUpError, HeadsUpResult};
@@ -32,6 +33,24 @@ pub struct WorldGrid {
     pub height: u32,
     /// Row-major: index = `row * width + col`. Row 0 is the northernmost band.
     pub cells: Vec<CellInfo>,
+    /// Perturbed lattice node positions (R2.9), row-major over
+    /// `(width + 1) x (height + 1)` nodes: index = `row * (width + 1) + col`.
+    /// These are the street centerline vertices every block polygon is built
+    /// from, so placement and collision can reuse them directly.
+    #[serde(default)]
+    pub node_positions: Vec<Vec2>,
+}
+
+impl WorldGrid {
+    /// Position of a lattice node (`0..=height`, `0..=width`).
+    pub fn node(&self, row: u32, col: u32) -> Option<Vec2> {
+        if row > self.height || col > self.width || self.node_positions.is_empty() {
+            return None;
+        }
+        self.node_positions
+            .get((row * (self.width + 1) + col) as usize)
+            .copied()
+    }
 }
 
 impl WorldGrid {
@@ -48,6 +67,7 @@ impl WorldGrid {
                 };
                 (width * height) as usize
             ],
+            node_positions: Vec::new(),
         }
     }
 

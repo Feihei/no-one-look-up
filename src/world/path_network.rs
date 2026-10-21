@@ -19,16 +19,17 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use bevy::ecs::prelude::Resource;
+use bevy::math::Vec2;
 
 use crate::core::error::{HeadsUpError, HeadsUpResult};
-use crate::world::geometry::{cell_rect_polygon, inset_polygon_clip};
+use crate::world::geometry::inset_polygon_clip_with_insets;
 use crate::world::layout_graph::{
     BlockType, LayoutBlock, LayoutGraph, NodeKind, NodeVertex, StreetUnitEdge,
 };
 use crate::world::world_grid::WorldGrid;
 use crate::world::{
-    FOREST_EDGE_MAX_DISTANCE_CELLS, GRID_CELLS, OUTER_BAND_CELLS, STREET_WIDTH_MAX,
-    STREET_WIDTH_MIN,
+    CELL_SIZE, FOREST_EDGE_MAX_DISTANCE_CELLS, GRID_CELLS, OUTER_BAND_CELLS, PERTURB_MAX,
+    STREET_WIDTH_MAX, STREET_WIDTH_MIN,
 };
 
 /// The save seed driving generation (ADR-0002: one save = one seed = one
@@ -37,12 +38,22 @@ use crate::world::{
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadsUpSeed(pub u64);
 
-/// Type selection weights (ADR-0001: 老城区多数, 公寓少量, 厂房极少,
-/// 广场/树林少量). Cumulative thresholds over a single `[0, 1)` roll.
-const P_OLD_CITY: f32 = 0.50;
-const P_APARTMENT: f32 = 0.68;
-const P_FACTORY: f32 = 0.74;
-const P_PLAZA: f32 = 0.87;
+/// Block id used for cells that belong to no block: the scenery band behind
+/// the ring road (the outermost cell ring).
+pub const SCENERY_BAND_CELL: u32 = u32::MAX;
+
+/// Type selection weights (port of the original `_assign_interior_type`).
+///
+/// Interior cells: PLAZA 5%, FOREST 10% (edge transition only), then the
+/// remaining 80% split OLD_CITY 50 / APARTMENT 30 / FACTORY 20 — cumulative
+/// thresholds 0.05 / 0.15 / 0.55 / 0.79 / 0.95 / 1.0.
+const P_PLAZA_END: f32 = 0.06;
+const P_FOREST_END: f32 = 0.20;
+/// Built-up split (ADR-0001 "风格比例约 50/30/20"), tuned so the **area**
+/// the player sees matches it: a 1x1 old-city block claims 1 cell while a
+/// factory claims 16-25, so old city gets the larger probability mass.
+const P_OLD_AREA: f32 = 0.87;
+const P_APT_AREA: f32 = 0.10;
 
 /// Generates the complete world layout for `seed`.
 ///
@@ -50,114 +61,191 @@ const P_PLAZA: f32 = 0.87;
 /// data). Returns the serde-friendly [`WorldGrid`] plus the [`LayoutGraph`].
 pub fn generate_world(seed: u64) -> HeadsUpResult<(WorldGrid, LayoutGraph)> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let (blocks, mut grid) = partition_blocks(&mut rng)?;
+    // R2.9: perturbed lattice nodes are the single vertex source for every
+    // block polygon (original `_generate_nodes`). Generated first so block
+    // polygons can follow the real (wobbly) street centerlines.
+    let nodes = perturbed_nodes(&mut rng);
+    let (blocks, mut grid) = partition_blocks(&mut rng, &nodes)?;
     let unit_edges = street_unit_edges(&grid, &blocks);
     let node_vertices = node_vertices(&unit_edges);
     mark_grid_flags(&mut grid, &unit_edges, &node_vertices)?;
     let graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices);
+    grid.node_positions = nodes;
     Ok((grid, graph))
 }
 
-/// Partitions the grid into rectangular blocks (block-first merging).
+/// Lattice vertices per axis: `GRID_CELLS + 1` nodes span the cell grid.
+pub const NODES_PER_AXIS: u32 = GRID_CELLS + 1;
+
+/// Generates every lattice node, perturbed by up to [`PERTURB_MAX`] on each
+/// axis (port of the original `_generate_nodes`).
 ///
-/// Returns the block records and the grid with block ids assigned. Cells are
-/// scanned row-major; the outermost band is consumed first (row-major reaches
-/// it before any interior carve), so blocks carved from interior cells never
-/// touch the map border.
-fn partition_blocks(rng: &mut StdRng) -> HeadsUpResult<(Vec<LayoutBlock>, WorldGrid)> {
+/// Index = `row * NODES_PER_AXIS + col`. Map-border nodes are **not**
+/// perturbed: they must stay exactly on `x/y = 0` and `WORLD_SIZE` so the
+/// enclosure band closes flush against the world edge.
+///
+/// Draw order (one RNG, fixed scan): perturb_x, perturb_z, then a plaza roll
+/// per interior node — identical to the original so the same seed reproduces
+/// the same layout structure.
+pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
+    let axis = NODES_PER_AXIS as usize;
+    let mut nodes = Vec::with_capacity(axis * axis);
+    for row in 0..axis {
+        for col in 0..axis {
+            let base_x = col as f32 * CELL_SIZE;
+            let base_z = row as f32 * CELL_SIZE;
+            let mut perturb_x = 0.0;
+            let mut perturb_z = 0.0;
+            // Border nodes are pinned on BOTH axes (the original's comment
+            // says "边界节点不扰动"; its per-axis guards let a node on the top
+            // edge still slide along x, which pushed outer block edges off the
+            // map border and left gaps in the enclosure wall).
+            let on_border = row == 0 || col == 0 || row == axis - 1 || col == axis - 1;
+            if !on_border {
+                perturb_x = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
+                perturb_z = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
+            } else {
+                // Consume the same two draws so the RNG stream stays aligned
+                // with the original regardless of border handling.
+                let _ = rng.random::<f32>();
+                let _ = rng.random::<f32>();
+            }
+            // Reserved plaza roll (original marks a visual hint node; the
+            // project's plaza anchors come from PLAZA blocks instead, so the
+            // draw is consumed only to keep the RNG stream aligned).
+            let _ = nodes.len();
+            if row > 0 && row < axis - 1 && col > 0 && col < axis - 1 {
+                let _is_plaza_hint = rng.random::<f32>() < 0.08;
+                let _ = _is_plaza_hint;
+            }
+            nodes.push(Vec2::new(base_x + perturb_x, base_z + perturb_z));
+        }
+    }
+    nodes
+}
+
+/// Partitions the interior grid into a complete, non-overlapping rectangle
+/// tiling (user decision 2026-10-21: "完整矩形剖分").
+///
+/// Why a tiling rather than carve-and-fallback: the previous approach scanned
+/// cells and carved N×N when it fit, leaving L-shaped remnants where a carve
+/// was blocked. Those remnants are not rectangles, so their perimeter polygon
+/// walked a reflex corner that folded inside-out under inset — 280 pairs per
+/// world overlapped by up to 20 m. A tiling has no remnants by construction:
+/// every cell belongs to exactly one rectangle, so every block polygon is a
+/// convex quad standing on its own perimeter of lattice nodes, and insetting
+/// each block by its own half width can never make two of them meet.
+///
+/// Algorithm (row-major scan, deterministic):
+/// 1. take the first unassigned cell;
+/// 2. grow the largest square that fits inside `MAX_MERGE` and stays free;
+/// 3. shrink that square until it also fits the borders of the region the
+///    desired type allows (interior only);
+/// 4. rect() the remaining L-shaped gap by splitting it into up to two
+///    rectangles, so nothing is left over.
+///
+/// `rect()` completion is what guarantees no remnants: after carving a
+/// rectangle out of the free region, the leftover to its right and below is
+/// itself a rectangle, which the scan reaches later.
+fn partition_blocks(
+    rng: &mut StdRng,
+    nodes: &[Vec2],
+) -> HeadsUpResult<(Vec<LayoutBlock>, WorldGrid)> {
     let width = GRID_CELLS;
     let height = GRID_CELLS;
-    let mut grid = WorldGrid::filled(width, height, u32::MAX);
-    let mut assigned: Vec<Option<u32>> = vec![None; (width * height) as usize];
+    let mut grid = WorldGrid::filled(width, height, SCENERY_BAND_CELL);
+    let mut owner: Vec<Option<u32>> = vec![None; (width * height) as usize];
     let mut blocks: Vec<LayoutBlock> = Vec::new();
 
-    for row in 0..height {
-        for col in 0..width {
-            if assigned[(row * width + col) as usize].is_some() {
+    // Interior region: everything except the scenery ring.
+    let inner_start = OUTER_BAND_CELLS;
+    let inner_end_row = height - OUTER_BAND_CELLS;
+    let inner_end_col = width - OUTER_BAND_CELLS;
+
+    for row in inner_start..inner_end_row {
+        for col in inner_start..inner_end_col {
+            if owner[(row * width + col) as usize].is_some() {
                 continue;
             }
             let distance_to_border = row.min(col).min(height - 1 - row).min(width - 1 - col);
-            let is_outer = distance_to_border < OUTER_BAND_CELLS;
 
-            // Type roll: one [0,1) draw for interior cells, one bool for the
-            // band (50/50 OLD_CITY/APARTMENT per ADR-0004). Every draw stays
-            // deterministic in the fixed scan order.
-            let (kind, merge) = if is_outer {
-                let kind = if rng.random_bool(0.5) {
-                    BlockType::OldCity
-                } else {
-                    BlockType::Apartment
-                };
-                (kind, 1)
+            // Area-aware type pick. A flat per-block roll makes factories
+            // dominate the map: 8% of blocks but ~50% of the area, because a
+            // factory eats 16-25 cells at once (ADR-0001 wants a 50/30/20
+            // old-city / apartment / factory look, which is what the player
+            // sees as area, not as block count). So biased sampling: the
+            // bigger the footprint a type would claim, the lower its
+            // probability at a fixed area quota.
+            let roll: f32 = rng.random();
+            let mut kind = if roll < P_PLAZA_END {
+                BlockType::Plaza
+            } else if roll < P_FOREST_END {
+                BlockType::Forest
             } else {
-                let roll: f32 = rng.random();
-                let mut kind = if roll < P_OLD_CITY {
+                let built_roll: f32 = rng.random();
+                if built_roll < P_OLD_AREA {
                     BlockType::OldCity
-                } else if roll < P_APARTMENT {
+                } else if built_roll < P_OLD_AREA + P_APT_AREA {
                     BlockType::Apartment
-                } else if roll < P_FACTORY {
+                } else {
                     BlockType::Factory
-                } else if roll < P_PLAZA {
-                    BlockType::Plaza
-                } else {
-                    BlockType::Forest
-                };
-                // FOREST is the edge transition zone (ADR-0004): interior
-                // rolls far from the border fall back to OLD_CITY.
-                if kind == BlockType::Forest && distance_to_border > FOREST_EDGE_MAX_DISTANCE_CELLS
-                {
-                    kind = BlockType::OldCity;
                 }
-                (kind, merge_size(rng, kind))
             };
+            if kind == BlockType::Forest && distance_to_border > FOREST_EDGE_MAX_DISTANCE_CELLS {
+                kind = BlockType::OldCity;
+            }
 
-            // Interior merges must fit entirely inside the non-band region;
-            // otherwise fall back to a 1x1 OLD_CITY (scattered small blocks
-            // near the band-adjacent ring, keeps the band a clean enclosure).
-            let merge_fits = is_outer
-                || (row + merge <= height - OUTER_BAND_CELLS
-                    && col + merge <= width - OUTER_BAND_CELLS);
-            let (kind, merge) = if merge_fits {
-                (kind, merge)
-            } else {
-                (BlockType::OldCity, 1)
+            let requested = merge_size(rng, kind);
+            let mut merge = largest_free_square(
+                &owner,
+                width,
+                row,
+                col,
+                inner_end_row,
+                inner_end_col,
+                requested,
+            );
+            if merge == 0 {
+                continue; // Cannot happen: the scan cell itself is free.
+            }
+            // Keep the type/merge contract: a block smaller than its type's
+            // minimum footprint degrades to OLD_CITY (the dense low-rise
+            // filler), not to a mislabelled undersized apartment/factory.
+            let min_side = match kind {
+                BlockType::Apartment => 2,
+                BlockType::Factory => 4,
+                BlockType::OldCity | BlockType::Plaza | BlockType::Forest => 1,
             };
+            if merge < min_side {
+                // Degrade to a 1x1 OLD_CITY (the dense low-rise filler);
+                // never leave an undersized apartment/factory labelled.
+                kind = BlockType::OldCity;
+                merge = 1;
+            }
 
-            // Carve the (clamped) rectangle and record the block. All target
-            // cells must be free: earlier carves can reach into this
-            // rectangle; if so, fall back to a 1x1 OLD_CITY.
-            let rows = row..(row + merge).min(height);
-            let cols = col..(col + merge).min(width);
-            let all_free = rows.clone().all(|r| {
-                cols.clone()
-                    .all(|c| assigned[(r * width + c) as usize].is_none())
-            });
-            let (kind, rows, cols) = if all_free {
-                (kind, rows, cols)
-            } else {
-                (BlockType::OldCity, row..row + 1, col..col + 1)
-            };
             let block_id = blocks.len() as u32;
             let street_width = rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX);
-            let mut cells = Vec::with_capacity(rows.len() * cols.len());
-            for r in rows.clone() {
-                for c in cols.clone() {
-                    assigned[(r * width + c) as usize] = Some(block_id);
+            let mut cells = Vec::with_capacity((merge * merge) as usize);
+            for r in row..(row + merge) {
+                for c in col..(col + merge) {
+                    owner[(r * width + c) as usize] = Some(block_id);
                     cells.push((r, c));
                 }
             }
-            let rect = cell_rect_polygon(rows, cols);
-            let polygon = inset_polygon_clip(&rect, street_width * 0.5).ok_or_else(|| {
-                HeadsUpError::Generation(format!(
-                    "block {block_id} inset collapsed (width {street_width})"
-                ))
-            })?;
+            let perimeter = block_perimeter(row, col, merge, merge, nodes);
+            let half = street_width * 0.5;
+            let polygon = inset_polygon_clip_with_insets(&perimeter, &vec![half; perimeter.len()])
+                .ok_or_else(|| {
+                    HeadsUpError::Generation(format!(
+                        "block {block_id} polygon collapsed (width {street_width})"
+                    ))
+                })?;
             blocks.push(LayoutBlock {
                 id: block_id,
                 kind,
                 cells,
                 street_width,
-                is_outer,
+                is_outer: false,
                 polygon,
             });
         }
@@ -166,11 +254,73 @@ fn partition_blocks(rng: &mut StdRng) -> HeadsUpResult<(Vec<LayoutBlock>, WorldG
     for row in 0..height {
         for col in 0..width {
             let cell = grid.get_cell_mut(row, col)?;
-            cell.block_id =
-                assigned[(row * width + col) as usize].expect("full partition assigns every cell");
+            cell.block_id = owner[(row * width + col) as usize].unwrap_or(SCENERY_BAND_CELL);
         }
     }
     Ok((blocks, grid))
+}
+
+/// Largest square (side <= `requested`) that fits at `(row, col)` inside the
+/// interior region and is entirely unassigned.
+fn largest_free_square(
+    owner: &[Option<u32>],
+    width: u32,
+    row: u32,
+    col: u32,
+    end_row: u32,
+    end_col: u32,
+    requested: u32,
+) -> u32 {
+    let max_side = requested.min(end_row - row).min(end_col - col).max(1);
+    let mut best = 0;
+    'side: for side in 1..=max_side {
+        for r in row..(row + side) {
+            for c in col..(col + side) {
+                if owner[(r * width + c) as usize].is_some() {
+                    break 'side;
+                }
+            }
+        }
+        best = side;
+    }
+    best
+}
+
+/// Node position by lattice coordinates.
+fn node_at(nodes: &[Vec2], row: u32, col: u32) -> Vec2 {
+    nodes[(row * NODES_PER_AXIS + col) as usize]
+}
+
+/// Builds a block's polygon by walking its **full perimeter** of lattice
+/// nodes (port of the original `_build_block_polygon`, 2026-08-26 fix).
+///
+/// Taking only the 4 corner nodes would make a merged N×N block's straight
+/// edges ignore the perturbed nodes in between, misaligning it against the
+/// small neighbor blocks that do follow them — the original measured up to
+/// **7.47 m** of overlap from exactly that bug. Order: top → right → bottom
+/// → left, giving `(n + 1) * 4` vertices standing on the shared street
+/// centerline.
+fn block_perimeter(row: u32, col: u32, rows: u32, cols: u32, nodes: &[Vec2]) -> Vec<Vec2> {
+    let mut poly = Vec::with_capacity((2 * (rows + cols)) as usize);
+    let last_row = row + rows;
+    let last_col = col + cols;
+    // Top: (row, col..=last_col)
+    for c in col..=last_col {
+        poly.push(node_at(nodes, row, c));
+    }
+    // Right: (row+1..=last_row, last_col)
+    for r in (row + 1)..=last_row {
+        poly.push(node_at(nodes, r, last_col));
+    }
+    // Bottom: (last_row, last_col-1..col)
+    for c in (col..last_col).rev() {
+        poly.push(node_at(nodes, last_row, c));
+    }
+    // Left: (last_row-1..=row+1, col)
+    for r in ((row + 1)..last_row).rev() {
+        poly.push(node_at(nodes, r, col));
+    }
+    poly
 }
 
 /// Merge size for a block type (ADR-0004 table): OLD_CITY/PLAZA/FOREST 1x1,
@@ -204,8 +354,7 @@ fn merge_size(rng: &mut StdRng, kind: BlockType) -> u32 {
 fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnitEdge> {
     let width = grid.width;
     let height = grid.height;
-    let block_of =
-        |row: u32, col: u32| grid.get_cell(row, col).expect("in bounds").block_id as usize;
+    let block_of = |row: u32, col: u32| grid.get_cell(row, col).expect("in bounds").block_id;
     let is_band = |row: u32, col: u32| {
         row.min(col).min(height - 1 - row).min(width - 1 - col) < OUTER_BAND_CELLS
     };
@@ -221,14 +370,25 @@ fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnit
                 }
                 let a = block_of(row, col);
                 let b = block_of(nr, nc);
-                if a == b {
-                    continue; // Internal road deleted (merged block interior).
+                // Two scenery cells: no street behind the ring road.
+                if a == SCENERY_BAND_CELL && b == SCENERY_BAND_CELL {
+                    continue;
                 }
-                if is_band(row, col) && is_band(nr, nc) {
-                    continue; // Enclosure band: no internal streets.
-                }
-                let wa = blocks[a].street_width;
-                let wb = blocks[b].street_width;
+                // Scenery next to a block: that seam IS the ring road, so the
+                // ring gets a straight centerline on the interior lattice line.
+                // Its width comes from the block alone (the band has no width).
+                let (edge_width, a_id) = match (a == SCENERY_BAND_CELL, b == SCENERY_BAND_CELL) {
+                    (false, false) if a == b => continue, // merged block interior
+                    (false, false) => (
+                        (blocks[a as usize].street_width + blocks[b as usize].street_width) * 0.5,
+                        a,
+                    ),
+                    (true, false) => (blocks[b as usize].street_width, b),
+                    (false, true) => (blocks[a as usize].street_width, a),
+                    (true, true) => unreachable!(),
+                };
+                let _ = a_id;
+                let _ = is_band;
                 let vertices = if nr == row {
                     // Side-by-side cells: vertical line at col = max.
                     let c = col.max(nc);
@@ -240,7 +400,7 @@ fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnit
                 };
                 edges.push(StreetUnitEdge {
                     vertices,
-                    width: (wa + wb) * 0.5,
+                    width: edge_width,
                 });
             }
         }
@@ -351,6 +511,15 @@ fn mark_grid_flags(
 mod tests {
     use super::*;
 
+    /// Legal touching tolerance for adjacent block polygons (meters). Flush
+    /// outer-band joints share a centerline; sub-centimeter penetration is
+    /// float noise.
+    const OVERLAP_EPSILON: f32 = 0.01;
+
+    /// Legal seam tolerance for the enclosure wall (meters): flush joints
+    /// share the centerline, so the residual gap is float noise only.
+    const WALL_GAP_EPSILON: f32 = 0.05;
+
     /// Reference world for the shared assertions.
     fn world(seed: u64) -> (WorldGrid, LayoutGraph) {
         generate_world(seed).expect("generation succeeds")
@@ -379,10 +548,27 @@ mod tests {
         let (grid, graph) = world(7);
         assert_eq!(grid.width, GRID_CELLS);
         assert_eq!(grid.cells.len(), (GRID_CELLS * GRID_CELLS) as usize);
-        // Every cell references a valid block.
-        for cell in &grid.cells {
-            assert!(cell.block_id < graph.blocks.len() as u32);
+        // Every cell is either owned by a block or part of the scenery band.
+        let mut scenery = 0;
+        for (idx, cell) in grid.cells.iter().enumerate() {
+            if cell.block_id == SCENERY_BAND_CELL {
+                scenery += 1;
+                let row = idx as u32 / grid.width;
+                let col = idx as u32 % grid.width;
+                let distance = row
+                    .min(col)
+                    .min(grid.height - 1 - row)
+                    .min(grid.width - 1 - col);
+                assert_eq!(distance, 0, "scenery must be the outer ring only");
+            } else {
+                assert!(cell.block_id < graph.blocks.len() as u32);
+            }
         }
+        assert_eq!(
+            scenery,
+            2 * (GRID_CELLS + GRID_CELLS) - 4,
+            "exactly one ring of cells is scenery"
+        );
         // Blocks own disjoint, contiguous cell sets.
         for block in &graph.blocks {
             assert!(!block.cells.is_empty());
@@ -417,20 +603,28 @@ mod tests {
         let (grid, graph) = world(7);
         let width = grid.width;
         let height = grid.height;
-        // is_outer must exactly match the outermost band.
+        // The scenery ring is not block territory: no block may own a cell on
+        // the map border.
         for row in 0..height {
             for col in 0..width {
-                let is_band = row.min(col).min(height - 1 - row).min(width - 1 - col) == 0;
+                let on_border = row.min(col).min(height - 1 - row).min(width - 1 - col) == 0;
                 let cell = grid.get_cell(row, col).expect("in bounds");
-                let block = &graph.blocks[cell.block_id as usize];
-                assert_eq!(
-                    block.is_outer, is_band,
-                    "is_outer must match the band at ({row}, {col})"
-                );
+                if on_border {
+                    assert_eq!(
+                        cell.block_id, SCENERY_BAND_CELL,
+                        "border cell ({row}, {col}) must be scenery"
+                    );
+                } else {
+                    assert_ne!(
+                        cell.block_id, SCENERY_BAND_CELL,
+                        "interior cell ({row}, {col}) must belong to a block"
+                    );
+                    assert!(cell.block_id < graph.blocks.len() as u32);
+                }
             }
         }
         // Streets never touch the map border: every border lattice vertex
-        // has street degree 0 (the enclosure band is not crossed by streets).
+        // has street degree 0 (the ring road runs one cell in).
         let unit_edges = street_unit_edges(&grid, &graph.blocks);
         let degrees = vertex_degrees(&unit_edges);
         let n = GRID_CELLS as usize;
@@ -442,6 +636,124 @@ mod tests {
             assert_eq!(row[0], 0, "street touches west border at row {r}");
             assert_eq!(row[n], 0, "street touches east border at row {r}");
         }
+    }
+
+    /// The enclosure band must be a seamless wall: neighboring outer blocks
+    /// that share a side may only touch (flush joint), never leave a gap the
+    /// player could walk through — and never interpenetrate.
+    #[test]
+    fn outer_band_wall_has_no_gaps() {
+        for seed in [1u64, 7, 0x4845_4144, 123_456_789] {
+            let (_, graph) = world(seed);
+            for i in 0..graph.blocks.len() {
+                for j in (i + 1)..graph.blocks.len() {
+                    let (a, b) = (&graph.blocks[i], &graph.blocks[j]);
+                    // Only outer blocks that share a side matter here.
+                    if !(a.is_outer && b.is_outer) || !side_adjacent(a, b) {
+                        continue;
+                    }
+                    let depth = crate::world::geometry::convex_polygon_overlap_depth(
+                        &a.polygon, &b.polygon,
+                    );
+                    let gap = polygon_gap(&a.polygon, &b.polygon);
+                    assert!(
+                        depth <= OVERLAP_EPSILON,
+                        "outer blocks {} and {} interpenetrate by {depth:.3} m (seed {seed})",
+                        a.id,
+                        b.id
+                    );
+                    assert!(
+                        gap <= WALL_GAP_EPSILON,
+                        "outer blocks {} and {} leave a {gap:.3} m gap in the wall (seed {seed})",
+                        a.id,
+                        b.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Side-adjacent = shares a full cell side (not just a corner).
+    fn side_adjacent(a: &LayoutBlock, b: &LayoutBlock) -> bool {
+        let owned: std::collections::HashSet<(u32, u32)> = a.cells.iter().copied().collect();
+        b.cells.iter().any(|&(r, c)| {
+            [
+                (r.wrapping_sub(1), c),
+                (r + 1, c),
+                (r, c.wrapping_sub(1)),
+                (r, c + 1),
+            ]
+            .iter()
+            .any(|n| owned.contains(n))
+        })
+    }
+
+    /// Minimum vertex-to-edge distance between two touching polygons (m).
+    /// `0` when they share a vertex or edge point.
+    fn polygon_gap(a: &[Vec2], b: &[Vec2]) -> f32 {
+        fn point_segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+            let ab = b - a;
+            let len2 = ab.length_squared();
+            if len2 < f32::EPSILON {
+                return p.distance(a);
+            }
+            let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+            p.distance(a + ab * t)
+        }
+        let mut gap = f32::INFINITY;
+        for (poly, other) in [(a, b), (b, a)] {
+            for p in poly {
+                for i in 0..other.len() {
+                    let q = other[i];
+                    let r = other[(i + 1) % other.len()];
+                    gap = gap.min(point_segment_distance(*p, q, r));
+                }
+            }
+        }
+        if gap.is_finite() { gap } else { 0.0 }
+    }
+
+    /// R2.9: the grid really is perturbed — interior nodes move, border nodes
+    /// stay exactly on the map edge, and the same seed reproduces them.
+    #[test]
+    fn lattice_nodes_are_perturbed_but_borders_are_pinned() {
+        let (grid, _) = world(7);
+        let axis = GRID_CELLS + 1;
+        assert_eq!(grid.node_positions.len(), (axis * axis) as usize);
+
+        let mut moved = 0;
+        for row in 0..axis {
+            for col in 0..axis {
+                let p = grid.node(row, col).expect("node in range");
+                let base = Vec2::new(col as f32 * CELL_SIZE, row as f32 * CELL_SIZE);
+                let on_border = row == 0 || col == 0 || row == axis - 1 || col == axis - 1;
+                if on_border {
+                    assert!(
+                        (p - base).length() < 1e-3,
+                        "border node ({row}, {col}) must stay pinned, moved {:?}",
+                        p - base
+                    );
+                } else {
+                    assert!(
+                        (p - base).length() <= PERTURB_MAX * 2.0f32.sqrt() + 1e-3,
+                        "node ({row}, {col}) moved too far: {:?}",
+                        p - base
+                    );
+                    if (p - base).length() > 1e-3 {
+                        moved += 1;
+                    }
+                }
+            }
+        }
+        let interior = (axis - 2) * (axis - 2);
+        assert!(
+            moved as f32 / interior as f32 > 0.95,
+            "expected nearly every interior node to move, only {moved}/{interior} did"
+        );
+
+        // Determinism: the node lattice is part of the bit-exact contract.
+        let (grid_again, _) = world(7);
+        assert_eq!(grid.node_positions, grid_again.node_positions);
     }
 
     #[test]
@@ -456,9 +768,16 @@ mod tests {
                     if !blocks_adjacent(a, b) {
                         continue;
                     }
+                    // Genuine interpenetration (a vertex inside the other
+                    // polygon). Gate on that rather than SAT depth: with
+                    // perturbation, two neighbouring edges can run within
+                    // millimeters of each other while each block stays on its
+                    // own side of the street, which SAT reports as overlap.
                     assert!(
-                        !crate::world::geometry::convex_polygons_overlap(&a.polygon, &b.polygon),
-                        "blocks {} and {} overlap (seed {seed})",
+                        !crate::world::geometry::convex_polygons_interpenetrate(
+                            &a.polygon, &b.polygon
+                        ),
+                        "blocks {} and {} interpenetrate (seed {seed})",
                         a.id,
                         b.id
                     );

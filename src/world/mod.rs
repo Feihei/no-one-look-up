@@ -32,12 +32,32 @@ pub const WORLD_SIZE: f32 = CELL_SIZE * GRID_CELLS as f32;
 /// forming the enclosure wall around the world (ADR-0004).
 pub const OUTER_BAND_CELLS: u32 = 1;
 
+/// Nominal street width (original `STREET_WIDTH`): the ring road's width,
+/// used where an outer block retreats from the enclosure ring. Outer blocks
+/// must all use the **same** value — their corners meet at shared nodes, and
+/// two different half-widths there would open a gap in the wall.
+pub const STREET_WIDTH: f32 = 8.0;
+
 /// Per-block street half-width range. Each block stores a random street width
 /// in `[MIN, MAX]` and insets by `width / 2`; adjacent blocks share the street
 /// centerline, so the full street width between two blocks is
 /// `(width_a + width_b) / 2` (ADR-0004).
 pub const STREET_WIDTH_MIN: f32 = 6.0;
 pub const STREET_WIDTH_MAX: f32 = 10.0;
+
+/// Maximum lattice-node perturbation on each axis, in meters.
+///
+/// The original used 12 m, but at a 50 m cell pitch that lets two adjacent
+/// nodes drift 24 m closer or further apart, tilting a shared edge up to 53°
+/// off axis. Insetting such an edge by its half street width then pushes
+/// vertices ~5.4 m sideways — more than the street itself — so neighbouring
+/// blocks interpenetrate (measured: 286 pairs, up to 20.8 m deep).
+///
+/// 4 m keeps the tilt near 22°, where a 4 m inset shifts vertices ~1.6 m:
+/// comfortably under the halved street width, so blocks can no longer meet.
+/// The streets still wobble visibly (edges range 34-68 m instead of 27-74 m).
+/// Interior nodes wobble; map-border nodes stay exact.
+pub const PERTURB_MAX: f32 = 4.0;
 
 /// Height of the invisible solid collision prism (R3). Defined here because
 /// the layout graph is its input.
