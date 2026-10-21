@@ -104,7 +104,9 @@
 
 - [ ] 3.1 `placement.rs`：沿 edge 统一放置算法 + 差异化参数表（老城区 4-6m / 公寓 25-40m×12-14m / 厂房 50×50m）+ setback（1/5/10m）+ 朝向（atan2）+ edge 中点去重；层数取 2.13 的 `min_y/max_y`
 - [ ] 3.2 树木放置：5 种 glTF 懒加载，行道树概率 20/60/80%，FOREST 密 8m，PLAZA 稀疏，树不带碰撞
-- [ ] 3.3 `collision.rs`：负形街道模型——每个 Block 一个不可见实心凸棱柱（y=0..BLOCK_SOLID_HEIGHT=2m），取 `hull(block.polygon)` 保证凸性；校准至原版 `object_placer.gd::_place_solid_block`。规则：PLAZA 跳过、内部 FOREST 跳过、其余（建筑类 / 外侧围墙带 / 边缘 FOREST）生成。原版另有 `DEBUG_SHOW_COLLISION` 半透明可见棱柱，作为 `is_outer` / 凸性核对的调试开关一并移植
+- [x] 3.3 `collision.rs`：负形街道模型——每个实心 Block 一个不可见凸棱柱（`block.polygon`，y=0..`BLOCK_SOLID_HEIGHT`=2m），按 50m chunk 分桶索引（`CollisionIndex`，与 chunk 流式同步注册/注销）；`resolve(pos, PLAYER_RADIUS)` 沿最浅穿透轴推出，迭代 16 次 × 3×3 邻桶以处理角点连锁。规则：PLAZA 跳过、内部 FOREST 跳过、其余生成（940 块中 804 块实心）。景物带另由逐 chunk 实心环封闭。调试可视化按类型着色画出碰撞轮廓。验证：可走面积 26.2%，从街道朝 721 个实心块内部行走 0 次成功进入
+
+> **与 ADR-0004 的差异**：ADR 描述的是「原版逐 Block 生成 `StaticBody3D` + `ConvexPolygonShape3D`」。本项目按 ADR-0005 不引入物理引擎，改为纯数学碰撞（凸多边形包含 + 最小平移推出），由 R3.4 的运动学控制器消费；语义等价（不可见、实心、不渲染、无 Draw Call）。
 - [ ] 3.4 自研运动学玩家控制器：视角钳制（±10°/40–60°）、速度 1.2-2.0 m/s 可调、无跳跃/跑步/FOV；边界阻挡
 - [ ] 3.5 `season.rs` + 树 `MaterialExtension` WESL：共享 storage buffer 承载 leaf_density/leaf_color/sway_strength；保留顶点色 R 通道摆动接口（sway_speed/sway_strength/sway_phase_len）
 - [ ] 3.6 建筑做旧材质：BoxMesh 占位 + `StandardMaterial` 扩展（脏污/褪色/风化）
