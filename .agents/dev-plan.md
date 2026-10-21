@@ -107,7 +107,9 @@
 - [x] 3.3 `collision.rs`：负形街道模型——每个实心 Block 一个不可见凸棱柱（`block.polygon`，y=0..`BLOCK_SOLID_HEIGHT`=2m），按 50m chunk 分桶索引（`CollisionIndex`，与 chunk 流式同步注册/注销）；`resolve(pos, PLAYER_RADIUS)` 沿最浅穿透轴推出，迭代 16 次 × 3×3 邻桶以处理角点连锁。规则：PLAZA 跳过、内部 FOREST 跳过、其余生成（940 块中 804 块实心）。景物带另由逐 chunk 实心环封闭。调试可视化按类型着色画出碰撞轮廓。验证：可走面积 26.2%，从街道朝 721 个实心块内部行走 0 次成功进入
 
 > **与 ADR-0004 的差异**：ADR 描述的是「原版逐 Block 生成 `StaticBody3D` + `ConvexPolygonShape3D`」。本项目按 ADR-0005 不引入物理引擎，改为纯数学碰撞（凸多边形包含 + 最小平移推出），由 R3.4 的运动学控制器消费；语义等价（不可见、实心、不渲染、无 Draw Call）。
-- [ ] 3.4 自研运动学玩家控制器：视角钳制（±10°/40–60°）、速度 1.2-2.0 m/s 可调、无跳跃/跑步/FOV；边界阻挡
+- [x] 3.4 自研运动学玩家控制器（`src/player/mod.rs`）：A/D 以 60°/s 转身（相机 ±10° 偏移不改变行进方向）、鼠标纵向钳制仰角 40–60°、W/S 沿朝向行走、E/Q 调速 1.2–2.0（0.1 步进，加速 8 m/s²）、视高 1.65m、无跳跃/跑步/FOV。运动按 ½ 半径细分子步后交 `CollisionIndex::resolve`，高速不穿墙。Esc 释放/重新捕获鼠标。替换 R2 临时调试移动；删除 R1 的 `aim_at_sun_once`（两个系统写同一 Transform 会构成隐式排序）
+
+> **碰撞修复**：合并块内缩后的周长会出现轻微凹陷（实测顶点 3/5/7 的叉积为负），`push_out` 依赖凸性，导致 770 次高速穿墙尝试中有 13 次进入块内。改为对 `convex_hull(polygon)` 做碰撞后降为 0 次；代价是碰撞体比可见轮廓大出凹陷深度（±4m 扰动下可忽略）。已加回归测试。
 - [ ] 3.5 `season.rs` + 树 `MaterialExtension` WESL：共享 storage buffer 承载 leaf_density/leaf_color/sway_strength；保留顶点色 R 通道摆动接口（sway_speed/sway_strength/sway_phase_len）
 - [ ] 3.6 建筑做旧材质：BoxMesh 占位 + `StandardMaterial` 扩展（脏污/褪色/风化）
 - [ ] 3.7 季节切换快捷键（1/2/3/4，开发期）
