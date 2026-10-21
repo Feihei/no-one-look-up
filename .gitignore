@@ -7,7 +7,14 @@
 # Agent/session housekeeping
 /.box-agent/
 /.box-agent-scratch/
-.AGENTS.md.artifact.json
+# Per-file chat-retention markers the editor writes next to files it has
+# referenced in a conversation (`{"retain_for_chat": true}`). Runtime
+# bookkeeping, not project content.
+*.artifact.json
+
+# Local-only diagnostics / screenshots
+/examples/_stats.rs
+/image*.png
 
 # OS
 .DS_Store
