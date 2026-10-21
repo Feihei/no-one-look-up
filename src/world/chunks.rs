@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bevy::prelude::*;
 
 use crate::core::input::{MOVE_BACKWARD, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT};
+use crate::world::collision::{CollisionIndex, PLAYER_RADIUS};
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
@@ -152,6 +153,7 @@ fn generate_layout(mut commands: Commands, seed: Option<Res<HeadsUpSeed>>) {
             commands.insert_resource(grid);
             commands.insert_resource(graph);
             commands.insert_resource(ChunkManager::default());
+            commands.init_resource::<CollisionIndex>();
         }
         Err(err) => error!("world generation failed: {err}"),
     }
@@ -162,6 +164,8 @@ fn generate_layout(mut commands: Commands, seed: Option<Res<HeadsUpSeed>>) {
 pub(crate) fn update_chunk_streaming(
     cameras: Query<&Transform, With<Camera3d>>,
     mut manager: ResMut<ChunkManager>,
+    mut collision: ResMut<CollisionIndex>,
+    graph: Option<Res<LayoutGraph>>,
     mut commands: Commands,
     mut meshes: Option<ResMut<Assets<Mesh>>>,
     mut materials: Option<ResMut<Assets<StandardMaterial>>>,
@@ -212,6 +216,7 @@ pub(crate) fn update_chunk_streaming(
             break;
         };
         if let Some(root) = manager.active.remove(&key) {
+            collision.unregister_chunk(key);
             commands.entity(root).try_despawn();
         }
     }
@@ -249,6 +254,12 @@ pub(crate) fn update_chunk_streaming(
                 ));
             });
         }
+        // Collision prisms travel with the chunk: R3.3 keeps the solid set in
+        // step with what is actually spawned, so a walker can never slip
+        // through a block whose collision was registered for another chunk.
+        if let Some(graph) = graph.as_deref() {
+            collision.register_chunk(graph, key);
+        }
         manager.active.insert(key, root);
     }
 }
@@ -259,6 +270,7 @@ pub(crate) fn update_chunk_streaming(
 pub(crate) fn debug_walk_camera(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    collision: Res<CollisionIndex>,
     mut cameras: Query<&mut Transform, With<Camera3d>>,
 ) {
     let Ok(mut transform) = cameras.single_mut() else {
@@ -283,7 +295,13 @@ pub(crate) fn debug_walk_camera(
         step -= forward;
     }
     if step != Vec3::ZERO {
-        transform.translation += step.normalize() * 1.5 * time.delta_secs();
+        let next = transform.translation + step.normalize() * 1.5 * time.delta_secs();
+        // Negative-space collision (R3.3): the walkable area is the gap
+        // between solid blocks, so move in the XZ plane only and let the
+        // resolver slide the walker along the walls.
+        let resolved = collision.resolve(Vec2::new(next.x, next.z), PLAYER_RADIUS);
+        transform.translation.x = resolved.x;
+        transform.translation.z = resolved.y;
     }
 }
 

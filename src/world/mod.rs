@@ -10,6 +10,7 @@
 //! ```
 
 pub mod chunks;
+pub mod collision;
 pub mod debug_viz;
 pub mod geometry;
 pub mod layout_graph;

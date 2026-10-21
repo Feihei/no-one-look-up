@@ -10,6 +10,7 @@ use bevy::prelude::*;
 use crate::core::input::DEV_TOGGLE_GIZMOS;
 use crate::world::CHUNK_SIZE;
 use crate::world::chunks::{ChunkManager, WorldSystems};
+use crate::world::collision::{CollisionIndex, PrismKind};
 use crate::world::layout_graph::{BlockType, LayoutGraph};
 
 /// Whether debug visualization is on (toggled with G).
@@ -78,6 +79,7 @@ pub(crate) fn draw_debug_viz(
     enabled: Res<DebugVizEnabled>,
     manager: Option<Res<ChunkManager>>,
     graph: Option<Res<LayoutGraph>>,
+    collision: Option<Res<CollisionIndex>>,
     mut gizmos: Gizmos,
 ) {
     if !enabled.0 {
@@ -132,6 +134,31 @@ pub(crate) fn draw_debug_viz(
                 .collect();
             points.push(points[0]);
             gizmos.linestrip(points, color);
+        }
+    }
+
+    // Solid prisms (R3.3): what actually blocks the walker. Drawn just above
+    // the block outlines so a walk test reads "this is where I bounce off".
+    if let (Some(manager), Some(collision)) = (&manager, &collision) {
+        for key in manager.active.keys() {
+            for prism in collision.prisms_in(*key) {
+                if prism.polygon.len() < 3 {
+                    continue;
+                }
+                let color = match prism.kind {
+                    PrismKind::OldCity => Color::srgba(1.0, 0.25, 0.25, 0.9),
+                    PrismKind::Apartment => Color::srgba(0.3, 0.6, 1.0, 0.9),
+                    PrismKind::Factory => Color::srgba(1.0, 0.9, 0.2, 0.9),
+                    PrismKind::SceneryRing => Color::srgba(0.6, 0.6, 0.65, 0.55),
+                };
+                let mut points: Vec<Vec3> = prism
+                    .polygon
+                    .iter()
+                    .map(|p| Vec3::new(p.x, prism.height, p.y))
+                    .collect();
+                points.push(points[0]);
+                gizmos.linestrip(points, color);
+            }
         }
     }
 }
