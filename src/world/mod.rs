@@ -101,7 +101,8 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
-    use crate::world::chunks::{WorldSystems, debug_walk_camera, update_chunk_streaming};
+    use crate::player::{PlayerSystems, walk_and_collide};
+    use crate::world::chunks::{WorldSystems, update_chunk_streaming};
     use crate::world::debug_viz::{
         DebugVizEnabled, draw_debug_viz, spawn_block_labels, toggle_debug_viz,
     };
@@ -125,14 +126,14 @@ mod tests {
             // Register the systems in the shuffled order, with the explicit
             // ordering contract attached to the systems themselves:
             // spawn_block_labels -> toggle_debug_viz -> draw_debug_viz and
-            // debug_walk_camera -> update_chunk_streaming -> draw_debug_viz.
+            // walk_and_collide -> update_chunk_streaming -> draw_debug_viz.
             for index in order {
                 match index {
-                    0 => schedule.add_systems(debug_walk_camera),
+                    0 => schedule.add_systems(walk_and_collide.in_set(PlayerSystems::Move)),
                     1 => schedule.add_systems(
                         update_chunk_streaming
                             .in_set(WorldSystems::Streaming)
-                            .after(debug_walk_camera),
+                            .after(PlayerSystems::Move),
                     ),
                     2 => schedule.add_systems(spawn_block_labels),
                     3 => schedule.add_systems(toggle_debug_viz.after(spawn_block_labels)),

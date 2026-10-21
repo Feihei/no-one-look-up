@@ -4,5 +4,6 @@
 //! live here so integration tests can drive them headless.
 
 pub mod core;
+pub mod player;
 pub mod plugins;
 pub mod world;

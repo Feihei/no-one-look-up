@@ -2,12 +2,14 @@
 //! golden-hour sky. Bevy 0.20 migration of the original Godot 4.7 project.
 //!
 //! R2: world generation + chunk streaming (ground tiles stream around the
-//! camera; debug gizmos toggle with G). Sky per R1; placement/seasons (R3)
-//! and save/menu (R4) per milestone.
+//! camera; debug gizmos toggle with G). R3.4: kinematic player controller
+//! (A/D turn, W/S walk, mouse look clamped to 40-60° up, E/Q speed).
+//! Placement/seasons (R3) and save/menu (R4) per milestone.
 
 use bevy::camera::Exposure;
 use bevy::prelude::*;
 
+use heads_up_bevy::player::{EYE_HEIGHT, PlayerBody, PlayerPlugin};
 use heads_up_bevy::plugins::{GoldenHourCamera, HeadsUpPlugins, sky::HeadsUpSky};
 
 fn main() -> AppExit {
@@ -21,25 +23,23 @@ fn main() -> AppExit {
                 ..default()
             }),
             HeadsUpPlugins,
+            PlayerPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_sky_state.after(setup_scene)))
-        // PostUpdate, not Update: the aim must run AFTER bevy_elements'
-        // `update_sun_state` (ElementsSystems::Celestial, in Update) so the
-        // first aim reads the settled ephemeris instead of the default
-        // overhead-sun state. Same pattern as the day_night example.
-        .add_systems(PostUpdate, aim_at_sun_once)
         .run()
 }
 
-/// R2 scene: the golden-hour sky camera at street level over the streamed
-/// world (chunk ground tiles spawn around the camera). The R1 verification
-/// ground plane is gone — the world provides the floor. Replaced by the
-/// player controller in R3.
+/// The player: one entity carrying both the camera and the kinematic body
+/// (R3.4), spawned at the world centre on street level.
+///
+/// `PlayerBody` owns the camera's rotation from now on — the R1 `aim_at_sun`
+/// helper is gone, because two systems writing one Transform is exactly the
+/// implicit-ordering trap the project forbids. The controller starts pitched
+/// at the top of the allowed band (60°) so the golden-hour sky fills the view
+/// the way ADR-0001 describes.
 fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
-    // Spawn level at the world center; `aim_at_sun_once` turns the camera
-    // toward the sun after the ephemeris settles.
     commands.spawn((
-        Name::new("PlayerCamera"),
+        Name::new("Player"),
         Camera3d::default(),
         GoldenHourCamera {
             exposure: Exposure {
@@ -47,7 +47,8 @@ fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
             },
             ..default()
         },
-        Transform::from_xyz(1000.0, 1.6, 1000.0),
+        PlayerBody::default(),
+        Transform::from_xyz(1000.0, EYE_HEIGHT, 1000.0),
     ));
 }
 
@@ -63,31 +64,4 @@ fn log_sky_state(sky: Res<HeadsUpSky>) {
         sky.location.longitude_deg,
         sky.location.utc_offset_hours
     );
-}
-
-/// Aims the camera at the sun once the ephemeris settles (first frame's
-/// `SunState` is still the default), keeping the golden horizon band and sun
-/// disc in frame. Replaced by the player controller in R3.
-fn aim_at_sun_once(
-    sun: Res<bevy_elements::SunState>,
-    mut cameras: Query<&mut Transform, With<Camera3d>>,
-    mut framed: Local<bool>,
-) {
-    if *framed {
-        return;
-    }
-    let Ok(mut transform) = cameras.single_mut() else {
-        return;
-    };
-    *framed = true;
-    let dir = sun.direction.normalize_or(Vec3::NEG_Z);
-    let yaw = (-dir.x).atan2(-dir.z);
-    // Keep the horizon in frame: aim at the sun but never above 15°.
-    let pitch = dir.y.clamp(-1.0, 1.0).asin().max(10f32.to_radians());
-    *transform = Transform::from_xyz(1000.0, 1.6, 1000.0).with_rotation(Quat::from_euler(
-        EulerRot::YXZ,
-        yaw,
-        pitch,
-        0.0,
-    ));
 }

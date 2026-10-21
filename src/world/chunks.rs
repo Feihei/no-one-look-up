@@ -15,8 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::prelude::*;
 
-use crate::core::input::{MOVE_BACKWARD, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT};
-use crate::world::collision::{CollisionIndex, PLAYER_RADIUS};
+use crate::world::collision::CollisionIndex;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
@@ -264,47 +263,6 @@ pub(crate) fn update_chunk_streaming(
     }
 }
 
-/// Temporary debug movement for R2 verification (no player controller yet;
-/// R3.4 replaces this with the kinematic controller): W/S walk along the
-/// facing direction, A/D turn, 1.5 m/s.
-pub(crate) fn debug_walk_camera(
-    input: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    collision: Res<CollisionIndex>,
-    mut cameras: Query<&mut Transform, With<Camera3d>>,
-) {
-    let Ok(mut transform) = cameras.single_mut() else {
-        return;
-    };
-    let turn = if input.pressed(TURN_LEFT) {
-        1.0
-    } else if input.pressed(TURN_RIGHT) {
-        -1.0
-    } else {
-        0.0
-    };
-    if turn != 0.0 {
-        transform.rotate_y(turn * time.delta_secs());
-    }
-    let forward: Vec3 = *transform.forward();
-    let mut step = Vec3::ZERO;
-    if input.pressed(MOVE_FORWARD) {
-        step += forward;
-    }
-    if input.pressed(MOVE_BACKWARD) {
-        step -= forward;
-    }
-    if step != Vec3::ZERO {
-        let next = transform.translation + step.normalize() * 1.5 * time.delta_secs();
-        // Negative-space collision (R3.3): the walkable area is the gap
-        // between solid blocks, so move in the XZ plane only and let the
-        // resolver slide the walker along the walls.
-        let resolved = collision.resolve(Vec2::new(next.x, next.z), PLAYER_RADIUS);
-        transform.translation.x = resolved.x;
-        transform.translation.z = resolved.y;
-    }
-}
-
 /// Registers the world generation and chunk streaming systems.
 ///
 /// Ordering contract (R2.8): explicit chains only — the debug walk (writes
@@ -315,14 +273,15 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, generate_layout)
-            .add_systems(
-                Update,
-                update_chunk_streaming
-                    .in_set(WorldSystems::Streaming)
-                    .after(debug_walk_camera),
-            )
-            .add_systems(Update, debug_walk_camera);
+        app.add_systems(Startup, generate_layout).add_systems(
+            Update,
+            update_chunk_streaming
+                .in_set(WorldSystems::Streaming)
+                // The controller writes the camera Transform; streaming
+                // reads it, so the window is computed from the settled
+                // position (explicit, per root AGENTS.md).
+                .after(crate::player::PlayerSystems::Move),
+        );
     }
 }
 

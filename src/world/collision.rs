@@ -113,12 +113,24 @@ impl CollisionIndex {
             if !is_solid(block.kind, block.is_outer) || block.polygon.len() < 3 {
                 continue;
             }
+            // Inset can make a merged block's perimeter slightly concave:
+            // its middle lattice vertices are inset along their own edge
+            // normals, so the corner between two segments can dip inward
+            // (measured: cross products go negative at alternating vertices).
+            // `push_out` assumes convexity, so collide against the hull.
+            // Shrinking to the hull only makes the block slightly *larger*
+            // than its visual outline by the dip depth — imperceptible at
+            // ±4 m perturbation, and far safer than mis-resolving a reflex
+            // corner and letting the player through.
             let prism = SolidPrism {
                 block_id: block.id,
-                polygon: block.polygon.clone(),
+                polygon: convex_hull(&block.polygon),
                 height: BLOCK_SOLID_HEIGHT,
                 kind: prism_kind(block.kind),
             };
+            if prism.polygon.len() < 3 {
+                continue;
+            }
             if prism_touches_chunk(&prism, key) {
                 prisms.push(prism);
             }
@@ -135,6 +147,14 @@ impl CollisionIndex {
     pub fn unregister_chunk(&mut self, key: (i32, i32)) {
         self.buckets.remove(&key);
         self.populated.remove(&key);
+    }
+
+    /// Replaces one chunk's bucket verbatim. Test/benchmark hook: lets a test
+    /// place a single controlled prism without building a whole world.
+    #[cfg(test)]
+    pub fn debug_set_chunk(&mut self, key: (i32, i32), prisms: Vec<SolidPrism>) {
+        self.buckets.insert(key, prisms);
+        self.populated.insert(key);
     }
 
     /// True if chunk `key` has been registered.
