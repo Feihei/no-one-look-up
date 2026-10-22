@@ -16,8 +16,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bevy::prelude::*;
 
 use crate::world::collision::CollisionIndex;
+use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
+use crate::world::placement;
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
 
 /// Default seed until the R4 menu provides one (dev builds).
@@ -160,11 +162,14 @@ fn generate_layout(mut commands: Commands, seed: Option<Res<HeadsUpSeed>>) {
 
 /// Updates the active chunk set from the camera position and facing, spawning
 /// missing chunk groups and despawning the ones the player walked away from.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_chunk_streaming(
     cameras: Query<&Transform, With<Camera3d>>,
     mut manager: ResMut<ChunkManager>,
     mut collision: ResMut<CollisionIndex>,
     graph: Option<Res<LayoutGraph>>,
+    assets: Option<Res<PlacementAssets>>,
+    seed: Option<Res<HeadsUpSeed>>,
     mut commands: Commands,
     mut meshes: Option<ResMut<Assets<Mesh>>>,
     mut materials: Option<ResMut<Assets<StandardMaterial>>>,
@@ -172,6 +177,7 @@ pub(crate) fn update_chunk_streaming(
     let Ok(camera) = cameras.single() else {
         return;
     };
+    let seed_value = seed.map(|s| s.0).unwrap_or(DEFAULT_SEED);
     let pos = Vec2::new(camera.translation.x, camera.translation.z);
     let forward = Vec2::new(camera.forward().x, camera.forward().z);
 
@@ -235,7 +241,7 @@ pub(crate) fn update_chunk_streaming(
                 coords,
             ))
             .id();
-        // Ground tile: real streaming feedback; R3 adds placement content.
+        // Ground tile: real streaming feedback; placement content follows.
         if let (Some(meshes), Some(materials)) = (meshes.as_deref_mut(), materials.as_deref_mut()) {
             let mesh = meshes.add(Plane3d::default().mesh().size(CHUNK_SIZE, CHUNK_SIZE));
             let material = materials.add(StandardMaterial {
@@ -258,30 +264,158 @@ pub(crate) fn update_chunk_streaming(
         // through a block whose collision was registered for another chunk.
         if let Some(graph) = graph.as_deref() {
             collision.register_chunk(graph, key);
+            // R3 placement: plan this chunk's buildings/trees and spawn them
+            // under the chunk root, so despawning the root removes them all.
+            if let Some(assets) = assets.as_deref() {
+                let plan = placement::plan_chunk(
+                    graph,
+                    seed_value,
+                    key,
+                    assets.tree_scenes.len().min(u8::MAX as usize) as u8,
+                );
+                if let Some(meshes) = meshes.as_deref_mut() {
+                    spawn_chunk_content(&mut commands, meshes, assets, root, &plan);
+                }
+            }
         }
         manager.active.insert(key, root);
     }
 }
 
-/// Registers the world generation and chunk streaming systems.
-///
-/// Ordering contract (R2.8): explicit chains only — the debug walk (writes
-/// camera `Transform`) runs before streaming (reads it) so the active set is
-/// computed from the settled position; `GlobalTransform` propagation then
-/// happens in Bevy's transform systems.
+/// Shared placeholder materials + tree scenes, built once (Draw Call
+/// control, ADR-0004).
+#[derive(Resource)]
+pub(crate) struct PlacementAssets {
+    building_materials: HashMap<BlockType, Handle<StandardMaterial>>,
+    plaza_material: Handle<StandardMaterial>,
+    /// Tree glTF scenes (`aspen_1` / `tree_2` / `tree_3`; tree_3_1 / tree_3_3
+    /// arrive when their .blend files do — dev-plan R0.5).
+    tree_scenes: Vec<Handle<bevy::world_serialization::WorldAsset>>,
+}
+
+/// Builds the placement assets on first chunk spawn (lazy: `Mesh3d` handles
+/// need the render `Assets` stores, which headless tests do not run).
+fn build_placement_assets(
+    mut commands: Commands,
+    meshes: Option<ResMut<Assets<Mesh>>>,
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
+    server: Option<Res<AssetServer>>,
+) {
+    // Headless tests run without the asset plugins: no server, no placement
+    // assets (plan_chunk still works, trees just stay disabled).
+    let (Some(_meshes), Some(mut materials), Some(server)) = (meshes, materials, server) else {
+        // Headless tests run without the asset plugins: no placement assets
+        // (plan_chunk still works, trees just stay disabled).
+        return;
+    };
+    let palette = placement::StylePalette::default();
+    let mut color = |rgb: [f32; 3]| {
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(rgb[0], rgb[1], rgb[2]),
+            perceptual_roughness: 0.9,
+            ..default()
+        })
+    };
+    let building_materials = HashMap::from([
+        (BlockType::OldCity, color(palette.old_city)),
+        (BlockType::Apartment, color(palette.apartment)),
+        (BlockType::Factory, color(palette.factory)),
+    ]);
+    let plaza_material = color(palette.plaza);
+    let tree_scenes: Vec<_> = [
+        "models/aspen_1.glb",
+        "models/tree_2.glb",
+        "models/tree_3.glb",
+    ]
+    .iter()
+    .map(|p| server.load::<bevy::world_serialization::WorldAsset>(*p))
+    .collect();
+    commands.insert_resource(PlacementAssets {
+        building_materials,
+        plaza_material,
+        tree_scenes,
+    });
+}
+
+/// Spawns a chunk's planned content under its root: buildings as BoxMesh
+/// placeholders (ADR-0004 §4; R3.6 adds wear materials), trees as glTF
+/// scenes, the plaza pad as a thin box. Called inside the streaming system so
+/// a chunk's contents exist in the same frame its collision is registered.
+fn spawn_chunk_content(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    assets: &PlacementAssets,
+    root: Entity,
+    plan: &placement::ChunkPlan,
+) {
+    for object in &plan.objects {
+        match object.kind {
+            placement::PlacedKind::Building(kind) => {
+                let Some(material) = assets.building_materials.get(&kind) else {
+                    continue;
+                };
+                let mesh = meshes.add(Cuboid::new(object.size.x, object.size.y, object.size.z));
+                let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
+                let rotation = Quat::from_rotation_y(object.yaw);
+                commands.entity(root).with_children(|parent| {
+                    parent.spawn((
+                        Name::new(format!("Building@{:?}", object.position)),
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material.clone()),
+                        Transform::from_translation(position).with_rotation(rotation),
+                    ));
+                });
+            }
+            placement::PlacedKind::PlazaPad => {
+                let mesh = meshes.add(Cuboid::new(object.size.x, object.size.y, object.size.z));
+                let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
+                commands.entity(root).with_children(|parent| {
+                    parent.spawn((
+                        Name::new("PlazaPad"),
+                        Mesh3d(mesh),
+                        MeshMaterial3d(assets.plaza_material.clone()),
+                        Transform::from_translation(position),
+                    ));
+                });
+            }
+            _ => {
+                // Trees (street/forest/plaza): the glTF scene root. The
+                // loader spawns the whole model, so the transform applies to
+                // the instance.
+                let Some(tree) = object.tree else { continue };
+                let Some(scene) = assets.tree_scenes.get(tree.asset as usize) else {
+                    continue;
+                };
+                let scene = scene.clone();
+                commands.entity(root).with_children(|parent| {
+                    parent.spawn((
+                        Name::new("Tree"),
+                        bevy::world_serialization::WorldAssetRoot(scene),
+                        Transform::from_xyz(object.position.x, 0.0, object.position.y)
+                            .with_rotation(Quat::from_rotation_y(tree.yaw))
+                            .with_scale(Vec3::splat(tree.scale)),
+                    ));
+                });
+            }
+        }
+    }
+}
+
 pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, generate_layout).add_systems(
-            Update,
-            update_chunk_streaming
-                .in_set(WorldSystems::Streaming)
-                // The controller writes the camera Transform; streaming
-                // reads it, so the window is computed from the settled
-                // position (explicit, per root AGENTS.md).
-                .after(crate::player::PlayerSystems::Move),
-        );
+        app.add_systems(Startup, generate_layout)
+            .add_systems(PreUpdate, build_placement_assets)
+            .add_systems(
+                Update,
+                update_chunk_streaming
+                    .in_set(WorldSystems::Streaming)
+                    // The controller writes the camera Transform; streaming
+                    // reads it, so the window is computed from the settled
+                    // position (explicit, per root AGENTS.md).
+                    .after(crate::player::PlayerSystems::Move),
+            );
     }
 }
 

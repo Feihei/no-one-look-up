@@ -67,6 +67,13 @@ pub struct LayoutEdge {
     pub to: u32,
     /// Effective street width (m): average over the merged unit edges.
     pub width: f32,
+    /// Block on the "left" side of `from -> to` (the original's
+    /// `edge.left_block`): `None` when that side is the scenery band.
+    #[serde(default)]
+    pub left_block: Option<u32>,
+    /// Block on the "right" side (the original's `edge.right_block`).
+    #[serde(default)]
+    pub right_block: Option<u32>,
 }
 
 /// One block of the world: a merged cell group with a style label.
@@ -180,7 +187,13 @@ impl LayoutGraph {
                 // defensively instead of corrupting the graph.
                 continue;
             };
-            graph.edges.push(LayoutEdge { from, to, width });
+            graph.edges.push(LayoutEdge {
+                from,
+                to,
+                width,
+                left_block: None,
+                right_block: None,
+            });
         }
         graph
     }
@@ -290,11 +303,13 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
                 }
             }
             let count = (run.len() - 1) as f32;
-            segments.push((
-                *run.first().expect("run holds vertices"),
-                *run.last().expect("run holds vertices"),
-                total_width / count,
-            ));
+            // Emit one segment per unit edge (original `_generate_edges_from_grid`
+            // does the same). A merged 1900 m run would give placement and chunk
+            // ownership a single anchor in the middle of the map, so whole
+            // street frontages would never be placed.
+            for pair in run.windows(2) {
+                segments.push((pair[0], pair[1], total_width / count));
+            }
         }
     }
     segments
@@ -347,6 +362,8 @@ mod tests {
                 from: 0,
                 to: 0,
                 width: 8.0,
+                left_block: None,
+                right_block: None,
             }],
             blocks: vec![LayoutBlock {
                 id: 0,
@@ -367,18 +384,22 @@ mod tests {
     }
 
     #[test]
-    fn collinear_unit_edges_merge_into_one_segment() {
+    fn collinear_run_emits_one_segment_per_unit() {
         // One vertical street of three unit edges (cells stacked in col 1).
+        // Runs stay per-unit (R3.1): a merged 150 m segment would give
+        // placement a single anchor at its middle, so the frontages on either
+        // side of the seam would never be placed.
         let unit = |row: u32| StreetUnitEdge {
             vertices: ((row, 1), (row + 1, 1)),
             width: 8.0,
         };
         let segments = street_segments(&[unit(0), unit(1), unit(2)]);
-        assert_eq!(segments.len(), 1, "collinear run merges: {segments:?}");
-        let ((r0, c0), (r1, c1), w) = segments[0];
-        assert_eq!((r0, c0), (0, 1));
-        assert_eq!((r1, c1), (3, 1));
-        assert_eq!(w, 8.0);
+        assert_eq!(segments.len(), 3, "one segment per unit edge: {segments:?}");
+        for (i, ((r0, c0), (r1, c1), w)) in segments.iter().enumerate() {
+            assert_eq!((*r0, *c0), (i as u32, 1));
+            assert_eq!((*r1, *c1), (i as u32 + 1, 1));
+            assert_eq!(*w, 8.0);
+        }
     }
 
     #[test]

@@ -69,7 +69,8 @@ pub fn generate_world(seed: u64) -> HeadsUpResult<(WorldGrid, LayoutGraph)> {
     let unit_edges = street_unit_edges(&grid, &blocks);
     let node_vertices = node_vertices(&unit_edges);
     mark_grid_flags(&mut grid, &unit_edges, &node_vertices)?;
-    let graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices);
+    let mut graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices);
+    associate_edges_with_blocks(&mut graph, &unit_edges, &grid);
     grid.node_positions = nodes;
     Ok((grid, graph))
 }
@@ -505,6 +506,106 @@ fn mark_grid_flags(
         }
     }
     Ok(())
+}
+
+/// Associates every street segment with the block on each side (port of the
+/// original `_associate_edges_with_blocks`).
+///
+/// The merged runs in [`LayoutGraph`] are made of unit edges; each unit edge
+/// knows its flanking cells, and their `block_id` names the block whose mitred
+/// polygon ends on this very centerline. The first unit edge of a run fixes
+/// the assignment: run "left" is the plane whose normal is `(-dy, dx)` of the
+/// `from -> to` direction, which is the same left the player sees walking
+/// from `from` to `to`. Flanks in the scenery band yield `None`.
+fn associate_edges_with_blocks(
+    graph: &mut LayoutGraph,
+    unit_edges: &[StreetUnitEdge],
+    grid: &WorldGrid,
+) {
+    for index in 0..graph.edges.len() {
+        let a = graph.nodes[graph.edges[index].from as usize].pos;
+        let b = graph.nodes[graph.edges[index].to as usize].pos;
+        let dir = b - a;
+        if dir.length_squared() < 1e-6 {
+            continue;
+        }
+        let dir = dir.normalize();
+        let left_normal = Vec2::new(-dir.y, dir.x);
+        let length = (b - a).length();
+        for unit in unit_edges {
+            let point = unit_center(unit);
+            let along = (point - a).dot(dir);
+            let perp = (point - a).dot(left_normal);
+            if perp.abs() > 1e-3 || along < -1e-3 || along > length + 1e-3 {
+                continue;
+            }
+            let Some((units_left, units_right)) = flanking_blocks(unit, grid) else {
+                continue;
+            };
+            // Which of the unit edge's two flanks is on the run's left?
+            let west_or_above = flank_side(unit);
+            let (left, right) = if west_or_above == 1.0 {
+                (units_left, units_right)
+            } else {
+                (units_right, units_left)
+            };
+            let edge = &mut graph.edges[index];
+            edge.left_block = edge.left_block.or(left);
+            edge.right_block = edge.right_block.or(right);
+        }
+    }
+}
+
+/// Center of a unit street edge, in world coordinates.
+fn unit_center(unit: &StreetUnitEdge) -> Vec2 {
+    let ((r0, c0), (r1, c1)) = unit.vertices;
+    Vec2::new(
+        (c0 + c1) as f32 * 0.5 * CELL_SIZE,
+        (r0 + r1) as f32 * 0.5 * CELL_SIZE,
+    )
+}
+
+/// Whether the `-Z / -X` flank of a unit edge (returned as `1.0`) or the
+/// `+Z / +X` flank (`-1.0`) is on the run's left. Unit edges always point
+/// `+Z` or `+X`, so this is a constant per orientation.
+fn flank_side(unit: &StreetUnitEdge) -> f32 {
+    let ((r0, c0), (r1, c1)) = unit.vertices;
+    if r0 == r1 {
+        // Pointing +X: left = -Z = the "above" cell.
+        1.0
+    } else {
+        // Pointing +Z: left = -X = the "west" cell.
+        let _ = (c0, c1);
+        1.0
+    }
+}
+
+/// Blocks on both sides of a unit street edge, as `(west_or_above,
+/// east_or_below)`.
+fn flanking_blocks(unit: &StreetUnitEdge, grid: &WorldGrid) -> Option<(Option<u32>, Option<u32>)> {
+    let ((r0, c0), (r1, c1)) = unit.vertices;
+    let block = |r: Option<u32>, c: Option<u32>| -> Option<u32> {
+        let (r, c) = (r?, c?);
+        let id = grid.get_cell(r, c).ok()?.block_id;
+        (id != SCENERY_BAND_CELL).then_some(id)
+    };
+    let (first, second) = if r0 == r1 {
+        // Horizontal edge spanning columns c0..c1: cells above (−Z) and below
+        // (+Z) of the line at row r0.
+        let _ = c1;
+        (
+            block(r0.checked_sub(1), Some(c0)),
+            block(Some(r0), Some(c0)),
+        )
+    } else {
+        // Vertical edge spanning rows r0..r1: cells west (−X) and east (+X)
+        // of the line at column c0.
+        (
+            block(Some(r0), c0.checked_sub(1)),
+            block(Some(r0), Some(c0)),
+        )
+    };
+    (first.is_some() || second.is_some()).then_some((first, second))
 }
 
 #[cfg(test)]

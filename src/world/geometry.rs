@@ -196,6 +196,134 @@ pub fn inset_polygon_clip(polygon: &[Vec2], inset: f32) -> Option<Vec<Vec2>> {
     Some(current)
 }
 
+/// Shortest distance from point `p` to the segment `a..b` (m).
+pub fn dist_point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    if ab.length_squared() < 1e-12 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// Shortest distance between two segments `p1..p2` and `q1..q2` (m).
+///
+/// `0` when they cross. Used by placement to reject a footprint that grazes a
+/// street centerline without any corner landing in it.
+pub fn dist_segment_to_segment(p1: Vec2, p2: Vec2, q1: Vec2, q2: Vec2) -> f32 {
+    if segments_intersect(p1, p2, q1, q2) {
+        return 0.0;
+    }
+    dist_point_to_segment(p1, q1, q2)
+        .min(dist_point_to_segment(p2, q1, q2))
+        .min(dist_point_to_segment(q1, p1, p2))
+        .min(dist_point_to_segment(q2, p1, p2))
+}
+
+/// Crossing-number test in world coordinates: `true` for a point inside a
+/// simple polygon of any winding (the original `_is_point_in_polygon`).
+pub fn point_in_polygon(p: Vec2, polygon: &[Vec2]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (polygon[i], polygon[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Distance floor (m) below which the footprint is rejected outright, so
+/// float noise on a shared edge cannot flip a decision.
+const ROUNDING_FLOOR: f32 = 1e-4;
+
+/// Proper or touching intersection of two segments (endpoints count).
+pub fn segments_intersect(p1: Vec2, p2: Vec2, q1: Vec2, q2: Vec2) -> bool {
+    let cross = |a: Vec2, b: Vec2, c: Vec2| (b - a).perp_dot(c - a);
+    let d1 = cross(q1, q2, p1);
+    let d2 = cross(q1, q2, p2);
+    let d3 = cross(p1, p2, q1);
+    let d4 = cross(p1, p2, q2);
+    let straddle = |a: f32, b: f32| {
+        (a > ROUNDING_FLOOR && b < -ROUNDING_FLOOR) || (a < -ROUNDING_FLOOR && b > ROUNDING_FLOOR)
+    };
+    if straddle(d1, d2) && straddle(d3, d4) {
+        return true;
+    }
+    let on_segment = |a: Vec2, b: Vec2, c: Vec2| {
+        c.x >= a.x.min(b.x) - ROUNDING_FLOOR
+            && c.x <= a.x.max(b.x) + ROUNDING_FLOOR
+            && c.y >= a.y.min(b.y) - ROUNDING_FLOOR
+            && c.y <= a.y.max(b.y) + ROUNDING_FLOOR
+    };
+    (d1.abs() <= ROUNDING_FLOOR && on_segment(q1, q2, p1))
+        || (d2.abs() <= ROUNDING_FLOOR && on_segment(q1, q2, p2))
+        || (d3.abs() <= ROUNDING_FLOOR && on_segment(p1, p2, q1))
+        || (d4.abs() <= ROUNDING_FLOOR && on_segment(p1, p2, q2))
+}
+
+/// True if an axis-aligned footprint (center + half extents) lies entirely
+/// inside a simple polygon and never crosses its boundary.
+///
+/// This is the convex-hull companion to [`point_in_convex_polygon`]: the
+/// visible block outline can be slightly concave (R3.4), while collision uses
+/// the hull, so a footprint must stay inside *both*.
+pub fn rect_inside_polygon(center: Vec2, half: Vec2, polygon: &[Vec2]) -> bool {
+    let corners = [
+        Vec2::new(center.x - half.x, center.y - half.y),
+        Vec2::new(center.x + half.x, center.y - half.y),
+        Vec2::new(center.x + half.x, center.y + half.y),
+        Vec2::new(center.x - half.x, center.y + half.y),
+    ];
+    if !corners
+        .iter()
+        .all(|c| point_in_polygon(*c, polygon) || point_in_convex_inclusive(*c, polygon))
+    {
+        return false;
+    }
+    let n = polygon.len();
+    (0..4).all(|i| {
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        (0..n).all(|j| !segments_intersect(a, b, polygon[j], polygon[(j + 1) % n]))
+    })
+}
+
+/// True if a point lies inside or on the boundary of a convex polygon.
+///
+/// Placement rejects a footprint whose corner sits exactly on a curb, so the
+/// boundary must count as inside. The half-plane test uses a signed margin:
+/// with CCW winding every edge must satisfy `cross(edge, p) >= -eps`.
+pub fn point_in_convex_inclusive(p: Vec2, polygon: &[Vec2]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    // Resolve winding from the signed area so CW input works too.
+    let area: f32 = (0..n)
+        .map(|i| {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % n];
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    let sign = if area >= 0.0 { 1.0 } else { -1.0 };
+    (0..n).all(|i| {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % n];
+        let edge = b - a;
+        edge.perp_dot(p - a) * sign >= -ON_EDGE_EPSILON * edge.length()
+    })
+}
+
+/// Distance from the boundary that still counts as "inside" (m).
+const ON_EDGE_EPSILON: f32 = 1e-4;
+
 /// True if a point lies strictly inside a convex polygon (ray casting).
 pub fn point_in_convex_polygon(p: Vec2, polygon: &[Vec2]) -> bool {
     let n = polygon.len();

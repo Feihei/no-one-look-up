@@ -15,6 +15,7 @@ pub mod debug_viz;
 pub mod geometry;
 pub mod layout_graph;
 pub mod path_network;
+pub mod placement;
 pub mod world_grid;
 
 /// Base grid cell edge, in meters. The world is `GRID_CELLS` x `GRID_CELLS`
