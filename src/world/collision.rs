@@ -503,6 +503,37 @@ mod tests {
     }
 
     #[test]
+    fn fast_walk_does_not_tunnel_through_a_wall() {
+        let prism = SolidPrism {
+            block_id: 0,
+            polygon: vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(10.0, 0.0),
+                Vec2::new(10.0, 10.0),
+                Vec2::new(0.0, 10.0),
+            ],
+            height: BLOCK_SOLID_HEIGHT,
+            kind: PrismKind::OldCity,
+        };
+        let mut index = CollisionIndex::default();
+        index
+            .buckets
+            .insert(chunk_key(Vec2::new(5.0, 5.0)), vec![prism]);
+
+        // A 4 m step straight through the middle of the prism must land on
+        // its far side, never inside (regression for the concave-polygon
+        // tunnel found in R3.4).
+        for frac in [0.0, 0.25, 0.5, 0.75] {
+            let start = Vec2::new(-1.0, 1.0 + frac * 8.0);
+            let resolved = index.resolve(start + Vec2::new(4.0, 0.0), PLAYER_RADIUS);
+            assert!(
+                !index.is_blocked(resolved),
+                "fast step from {start:?} tunneled: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ring_is_registered_per_chunk() {
         let graph = LayoutGraph::default();
         let mut index = CollisionIndex::default();
@@ -514,6 +545,92 @@ mod tests {
         index.unregister_chunk((20, 20));
         assert!(!index.is_populated((20, 20)));
         assert!(index.prisms_in((20, 20)).is_empty());
+    }
+
+    /// R3.8 (collision half): walking every street edge of the graph, with
+    /// the full collision index registered, must reach each far node and
+    /// never leave the world. This is the dynamic form of the enclosure
+    /// guarantee the point tests check statically: no seam blocks a walker,
+    /// and the scenery ring keeps them inside the map.
+    #[test]
+    fn walking_every_street_reaches_the_far_end() {
+        for seed in [7_u64, 0x4845_4144] {
+            let (_, graph) = world(seed);
+            let mut index = CollisionIndex::default();
+            let world_size = GRID_CELLS as f32 * CELL_SIZE;
+            let all_keys: Vec<(i32, i32)> = (0..GRID_CELLS as i32)
+                .flat_map(|x| (0..GRID_CELLS as i32).map(move |z| (x, z)))
+                .collect();
+            for key in &all_keys {
+                index.register_chunk(&graph, *key);
+            }
+
+            let mut walked = 0_usize;
+            for edge in &graph.edges {
+                let (Some(a), Some(b)) = (
+                    graph.nodes.get(edge.from as usize),
+                    graph.nodes.get(edge.to as usize),
+                ) else {
+                    continue;
+                };
+                // Walk the centreline in half-metre steps with collision
+                // resolution, like the kinematic controller does.
+                let dir = b.pos - a.pos;
+                let length = dir.length();
+                if length < f32::EPSILON {
+                    continue;
+                }
+                let dir = dir / length;
+                let mut p = a.pos;
+                let mut progress = 0.0_f32;
+                let steps = (length / 0.5).ceil() as usize;
+                for _ in 0..steps {
+                    let before = (p - a.pos).dot(dir);
+                    p = index.resolve(p + dir * 0.5, PLAYER_RADIUS);
+                    // Never escape the map: the ring must hold.
+                    assert!(
+                        p.x >= PLAYER_RADIUS
+                            && p.y >= PLAYER_RADIUS
+                            && p.x <= world_size - PLAYER_RADIUS
+                            && p.y <= world_size - PLAYER_RADIUS,
+                        "seed {seed}: walker left the world at {p:?} on edge {}->{}",
+                        edge.from,
+                        edge.to
+                    );
+                    // Never end up inside a block: resolve must keep the
+                    // circle on the street.
+                    assert!(
+                        !index.is_blocked(p),
+                        "seed {seed}: walker ended inside a block at {p:?} on edge {}->{}",
+                        edge.from,
+                        edge.to
+                    );
+                    // Forward progress: sliding along a wall is fine, but a
+                    // step that leaves the walker *behind* where it was means
+                    // the street pinches it out.
+                    let after = (p - a.pos).dot(dir);
+                    progress = after;
+                    assert!(
+                        after >= before - 0.25,
+                        "seed {seed}: walker pushed backwards at {p:?} on edge {}->{}                          (progress {before:.2} -> {after:.2})",
+                        edge.from,
+                        edge.to
+                    );
+                }
+                // The walk must cover the edge: end within a small fraction
+                // of its length (junction-corner hulls deflect the walker a
+                // little; a seal stops it well short).
+                let miss = (length - progress).abs();
+                assert!(
+                    miss <= 0.1 * length + 1.0,
+                    "seed {seed}: edge {}->{} not walkable, covered only {progress:.2}/{length:.2} m at {p:?}",
+                    edge.from,
+                    edge.to
+                );
+                walked += 1;
+            }
+            assert!(walked > 500, "seed {seed}: walked only {walked} edges");
+        }
     }
 
     /// Chunks that hold at least one block, so the index can be filled fully.
