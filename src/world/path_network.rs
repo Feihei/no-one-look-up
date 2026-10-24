@@ -69,8 +69,8 @@ pub fn generate_world(seed: u64) -> HeadsUpResult<(WorldGrid, LayoutGraph)> {
     let unit_edges = street_unit_edges(&grid, &blocks);
     let node_vertices = node_vertices(&unit_edges);
     mark_grid_flags(&mut grid, &unit_edges, &node_vertices)?;
-    let mut graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices);
-    associate_edges_with_blocks(&mut graph, &unit_edges, &grid);
+    let mut graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices, &nodes);
+    associate_edges_with_blocks(&mut graph, &unit_edges, &grid, &nodes);
     grid.node_positions = nodes;
     Ok((grid, graph))
 }
@@ -102,7 +102,14 @@ pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
             // edge still slide along x, which pushed outer block edges off the
             // map border and left gaps in the enclosure wall).
             let on_border = row == 0 || col == 0 || row == axis - 1 || col == axis - 1;
-            if !on_border {
+            // The first interior lattice line on each axis is the ring
+            // road's centerline (2026-10-21 boundary decision: the loop runs
+            // straight along lattice points). Perturbing it lets ring-side
+            // blocks inset from a shifted node and encroach on the loop's
+            // inner half — measured down to a 0.3 m free lane and negative
+            // lanes on other seeds (R3.8 walk test).
+            let on_ring_line = row == 1 || col == 1 || row == axis - 2 || col == axis - 2;
+            if !on_border && !on_ring_line {
                 perturb_x = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
                 perturb_z = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
             } else {
@@ -521,6 +528,7 @@ fn associate_edges_with_blocks(
     graph: &mut LayoutGraph,
     unit_edges: &[StreetUnitEdge],
     grid: &WorldGrid,
+    node_positions: &[Vec2],
 ) {
     for index in 0..graph.edges.len() {
         let a = graph.nodes[graph.edges[index].from as usize].pos;
@@ -532,56 +540,44 @@ fn associate_edges_with_blocks(
         let dir = dir.normalize();
         let left_normal = Vec2::new(-dir.y, dir.x);
         let length = (b - a).length();
+        let axis = crate::world::GRID_CELLS as usize + 1;
+        let lattice = |row: u32, col: u32| node_positions[row as usize * axis + col as usize];
         for unit in unit_edges {
-            let point = unit_center(unit);
+            // Unit geometry must follow the *perturbed* lattice: the run's
+            // line does. Matching base-grid centers against perturbed lines
+            // left only ~60 of 2100 edges associated.
+            let ((ur0, uc0), (ur1, uc1)) = unit.vertices;
+            let point = (lattice(ur0, uc0) + lattice(ur1, uc1)) * 0.5;
             let along = (point - a).dot(dir);
             let perp = (point - a).dot(left_normal);
             if perp.abs() > 1e-3 || along < -1e-3 || along > length + 1e-3 {
                 continue;
             }
-            let Some((units_left, units_right)) = flanking_blocks(unit, grid) else {
+            let Some((first, second)) = flanking_blocks(unit, grid) else {
                 continue;
             };
-            // Which of the unit edge's two flanks is on the run's left?
-            let west_or_above = flank_side(unit);
-            let (left, right) = if west_or_above == 1.0 {
-                (units_left, units_right)
-            } else {
-                (units_right, units_left)
-            };
+            // Assign flanks by geometry, not by unit orientation: a merged
+            // run's from→to direction is arbitrary, so "which unit cell is
+            // left" cannot be derived from the unit alone. The flank block
+            // centre sits on one side of the run's line; whichever side that
+            // is decides left/right against this run's own normal.
             let edge = &mut graph.edges[index];
-            edge.left_block = edge.left_block.or(left);
-            edge.right_block = edge.right_block.or(right);
+            for flank in [first, second].into_iter().flatten() {
+                let center = graph.blocks[flank as usize].center();
+                let is_left = (center - a).dot(left_normal) > 0.0;
+                if is_left {
+                    edge.left_block = edge.left_block.or(Some(flank));
+                } else {
+                    edge.right_block = edge.right_block.or(Some(flank));
+                }
+            }
         }
     }
 }
 
-/// Center of a unit street edge, in world coordinates.
-fn unit_center(unit: &StreetUnitEdge) -> Vec2 {
-    let ((r0, c0), (r1, c1)) = unit.vertices;
-    Vec2::new(
-        (c0 + c1) as f32 * 0.5 * CELL_SIZE,
-        (r0 + r1) as f32 * 0.5 * CELL_SIZE,
-    )
-}
-
-/// Whether the `-Z / -X` flank of a unit edge (returned as `1.0`) or the
-/// `+Z / +X` flank (`-1.0`) is on the run's left. Unit edges always point
-/// `+Z` or `+X`, so this is a constant per orientation.
-fn flank_side(unit: &StreetUnitEdge) -> f32 {
-    let ((r0, c0), (r1, c1)) = unit.vertices;
-    if r0 == r1 {
-        // Pointing +X: left = -Z = the "above" cell.
-        1.0
-    } else {
-        // Pointing +Z: left = -X = the "west" cell.
-        let _ = (c0, c1);
-        1.0
-    }
-}
-
-/// Blocks on both sides of a unit street edge, as `(west_or_above,
-/// east_or_below)`.
+/// Blocks on both sides of a unit street edge, as `(north_or_west,
+/// south_or_east)`: the first flank is the cell on the `-Z`/`-X` side of the
+/// unit line, the second the `+Z`/`+X` side.
 fn flanking_blocks(unit: &StreetUnitEdge, grid: &WorldGrid) -> Option<(Option<u32>, Option<u32>)> {
     let ((r0, c0), (r1, c1)) = unit.vertices;
     let block = |r: Option<u32>, c: Option<u32>| -> Option<u32> {
@@ -828,10 +824,11 @@ mod tests {
                 let p = grid.node(row, col).expect("node in range");
                 let base = Vec2::new(col as f32 * CELL_SIZE, row as f32 * CELL_SIZE);
                 let on_border = row == 0 || col == 0 || row == axis - 1 || col == axis - 1;
-                if on_border {
+                let on_ring_line = row == 1 || col == 1 || row == axis - 2 || col == axis - 2;
+                if on_border || on_ring_line {
                     assert!(
                         (p - base).length() < 1e-3,
-                        "border node ({row}, {col}) must stay pinned, moved {:?}",
+                        "pinned node ({row}, {col}) moved {:?}",
                         p - base
                     );
                 } else {
@@ -846,7 +843,8 @@ mod tests {
                 }
             }
         }
-        let interior = (axis - 2) * (axis - 2);
+        // Interior excludes the border AND the pinned ring lines.
+        let interior = (axis - 4) * (axis - 4);
         assert!(
             moved as f32 / interior as f32 > 0.95,
             "expected nearly every interior node to move, only {moved}/{interior} did"

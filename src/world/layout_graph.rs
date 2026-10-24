@@ -146,6 +146,7 @@ impl LayoutGraph {
         blocks: Vec<LayoutBlock>,
         unit_edges: &[StreetUnitEdge],
         node_vertices: &[NodeVertex],
+        node_positions: &[Vec2],
     ) -> Self {
         let mut graph = LayoutGraph {
             bounds: Vec2::splat(crate::world::WORLD_SIZE),
@@ -155,6 +156,13 @@ impl LayoutGraph {
 
         // Nodes: deduplicated per grid vertex, plus one plaza node per plaza
         // block (placement anchors; ADR-0002 lists 广场 among node positions).
+        //
+        // Positions come from the *perturbed* lattice (the same vertices the
+        // block polygons inset from), so a street's centerline and its block
+        // faces share one line. Using the base lattice here made streets
+        // ignore the wobble while blocks followed it: a node perturbed 4 m
+        // south put the block face 1 m from the nominal centerline, sealing
+        // streets down to a 0.3 m free lane (found by the R3.8 walk test).
         let mut node_index: HashMap<(u32, u32), u32> = HashMap::new();
         for v in node_vertices {
             if node_index
@@ -162,7 +170,8 @@ impl LayoutGraph {
                 .is_none()
             {
                 graph.nodes.push(LayoutNode {
-                    pos: Vec2::new(v.col as f32 * CELL_SIZE, v.row as f32 * CELL_SIZE),
+                    pos: node_positions
+                        [v.row as usize * (crate::world::GRID_CELLS as usize + 1) + v.col as usize],
                     kind: v.kind,
                 });
             }
