@@ -162,6 +162,10 @@ pub struct PlacedObject {
     /// Terrain footprint half extents (x, z), used by tests to re-check the
     /// street/block/bounds rules.
     pub footprint_half: bevy::math::Vec2,
+    /// Deterministic wear level 0.0 (fresh) .. 1.0 (heavily worn), baked from
+    /// the placement RNG at plan time so the same seed always produces the
+    /// same weathering per building (R3.6). Unused for trees.
+    pub wear: f32,
     /// Tree variation, `None` for buildings and the plaza pad.
     pub tree: Option<TreeInstance>,
 }
@@ -330,6 +334,7 @@ impl PlazaPadObject {
             yaw: 0.0,
             size: bevy::math::Vec3::new(10.0, 0.2, 10.0),
             footprint_half: bevy::math::Vec2::splat(5.0),
+            wear: 0.0,
             tree: None,
         }
     }
@@ -434,6 +439,7 @@ fn place_buildings(
             yaw: angle,
             size: bevy::math::Vec3::new(building_length, height, building_depth),
             footprint_half: half,
+            wear: rng.random_range(0.0..=1.0),
             tree: None,
         });
     }
@@ -448,6 +454,17 @@ const MIN_FACADE: f32 = 3.0;
 /// footprint (m): the old city's rhythm, applied to any type.
 const MODULE_LENGTH_MAX: f32 = 6.0;
 const MODULE_DEPTH_MAX: f32 = 6.0;
+
+/// Material wear buckets (R3.6). Buildings pick a bucket from their planned
+/// `wear` level; each bucket owns one shared `StandardMaterial` per block
+/// type, so the whole city costs `types × buckets` materials and the meshes
+/// keep batching inside a bucket.
+pub(crate) const WEAR_BUCKETS: usize = 4;
+
+/// Bucket index for a planned wear level (0 = fresh .. 3 = heavily worn).
+pub(crate) fn wear_bucket(wear: f32) -> usize {
+    ((wear.clamp(0.0, 1.0) * WEAR_BUCKETS as f32) as usize).min(WEAR_BUCKETS - 1)
+}
 
 /// Column anchors (fraction along the edge) for a row of `count` buildings.
 fn build_columns(count: usize) -> Vec<f32> {
@@ -624,6 +641,7 @@ fn push_tree(
         yaw,
         size: bevy::math::Vec3::ZERO,
         footprint_half: bevy::math::Vec2::ZERO,
+        wear: 0.0,
         tree: Some(TreeInstance { asset, scale, yaw }),
     });
 }
@@ -932,6 +950,58 @@ mod tests {
         let factory = BuildingParams::of(BlockType::Factory).unwrap();
         assert!(old.street_tree_probability < apt.street_tree_probability);
         assert!(apt.street_tree_probability < factory.street_tree_probability);
+    }
+
+    #[test]
+    fn wear_buckets_cover_the_full_range() {
+        // R3.6: every planned wear level maps into a bucket; the extremes
+        // hit the first and last bucket and the mapping is monotone.
+        assert_eq!(wear_bucket(0.0), 0);
+        assert_eq!(wear_bucket(1.0), WEAR_BUCKETS - 1);
+        assert_eq!(wear_bucket(-0.5), 0, "clamped");
+        assert_eq!(wear_bucket(1.5), WEAR_BUCKETS - 1, "clamped");
+        for i in 0..100 {
+            let w = i as f32 / 99.0;
+            let b = wear_bucket(w);
+            assert!(b < WEAR_BUCKETS);
+            assert!(wear_bucket((w + 0.01).min(1.0)) >= b, "monotone");
+        }
+    }
+
+    #[test]
+    fn building_wear_is_deterministic_and_in_range() {
+        // Same seed -> same wear per building (R3.6 requirement), and the
+        // planned levels actually spread across the range.
+        let graph = crate::world::path_network::generate_world(SEEDS[2])
+            .expect("generation succeeds")
+            .1;
+        let wear_of = |seed: u64| -> Vec<f32> {
+            let mut wear = Vec::new();
+            for cx in 0..4 {
+                for cz in 0..4 {
+                    for o in &plan_chunk(&graph, seed, (cx, cz), 0).objects {
+                        if o.kind == PlacedKind::Building(BlockType::OldCity)
+                            || o.kind == PlacedKind::Building(BlockType::Apartment)
+                            || o.kind == PlacedKind::Building(BlockType::Factory)
+                        {
+                            wear.push(o.wear);
+                        }
+                    }
+                }
+            }
+            wear
+        };
+        let a = wear_of(SEEDS[2]);
+        let b = wear_of(SEEDS[2]);
+        assert_eq!(a, b, "bit-exact wear per seed");
+        assert!(a.len() > 20, "sampled a real neighbourhood: {}", a.len());
+        assert!(a.iter().all(|w| (0.0..=1.0).contains(w)));
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for w in &a {
+            lo = lo.min(*w);
+            hi = hi.max(*w);
+        }
+        assert!(hi - lo > 0.5, "wear spreads across the range: {lo}..{hi}");
     }
 
     #[test]

@@ -286,7 +286,10 @@ pub(crate) fn update_chunk_streaming(
 /// control, ADR-0004).
 #[derive(Resource)]
 pub(crate) struct PlacementAssets {
-    building_materials: HashMap<BlockType, Handle<StandardMaterial>>,
+    /// `building_materials[type][bucket]`: one shared material per (style,
+    /// wear bucket) pair, so per-building weathering costs no extra draw
+    /// state beyond the bucket switch (R3.6).
+    building_materials: [[Handle<StandardMaterial>; placement::WEAR_BUCKETS]; 3],
     plaza_material: Handle<StandardMaterial>,
     /// Preloaded glTF scene handles (`aspen_1` / `tree_2` / `tree_3`;
     /// tree_3_1 / tree_3_3 arrive when their .blend files do — dev-plan
@@ -319,19 +322,28 @@ fn build_placement_assets(
         return;
     };
     let palette = placement::StylePalette::default();
-    let mut color = |rgb: [f32; 3]| {
+    let mut wear_color = |rgb: [f32; 3], bucket: usize| {
+        // Wear grades: pristine keeps the style colour; higher buckets
+        // darken + desaturate (soot/faded paint) and get slightly glossier
+        // grime sheen. Same recipe per bucket so types stay comparable.
+        let t = bucket as f32 / (placement::WEAR_BUCKETS - 1) as f32;
+        let luma = rgb[0] * 0.3 + rgb[1] * 0.6 + rgb[2] * 0.1;
+        let desat = 0.25 * t;
+        let darken = 1.0 - 0.35 * t;
+        let mixed = |c: f32| (luma * desat + c * (1.0 - desat)) * darken;
         materials.add(StandardMaterial {
-            base_color: Color::srgb(rgb[0], rgb[1], rgb[2]),
-            perceptual_roughness: 0.9,
+            base_color: Color::srgb(mixed(rgb[0]), mixed(rgb[1]), mixed(rgb[2])),
+            perceptual_roughness: 0.9 - 0.15 * t,
             ..default()
         })
     };
-    let building_materials = HashMap::from([
-        (BlockType::OldCity, color(palette.old_city)),
-        (BlockType::Apartment, color(palette.apartment)),
-        (BlockType::Factory, color(palette.factory)),
-    ]);
-    let plaza_material = color(palette.plaza);
+    let mut style_wear = |rgb: [f32; 3]| std::array::from_fn(|bucket| wear_color(rgb, bucket));
+    let building_materials = [
+        style_wear(palette.old_city),
+        style_wear(palette.apartment),
+        style_wear(palette.factory),
+    ];
+    let plaza_material = wear_color(palette.plaza, 1);
     let tree_scenes: Vec<_> = TREE_MODEL_PATHS
         .iter()
         .map(|p| server.load(GltfAssetLabel::Scene(0).from_asset(*p)))
@@ -357,15 +369,22 @@ fn spawn_chunk_content(
     for object in &plan.objects {
         match object.kind {
             placement::PlacedKind::Building(kind) => {
-                let Some(material) = assets.building_materials.get(&kind) else {
-                    continue;
+                let style = match kind {
+                    BlockType::OldCity => 0,
+                    BlockType::Apartment => 1,
+                    _ => 2,
                 };
+                let material =
+                    &assets.building_materials[style][placement::wear_bucket(object.wear)];
                 let mesh = meshes.add(Cuboid::new(object.size.x, object.size.y, object.size.z));
                 let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
                 let rotation = Quat::from_rotation_y(object.yaw);
                 commands.entity(root).with_children(|parent| {
                     parent.spawn((
-                        Name::new(format!("Building@{:?}", object.position)),
+                        Name::new(format!(
+                            "Building@{:?} wear={:.2}",
+                            object.position, object.wear
+                        )),
                         Mesh3d(mesh),
                         MeshMaterial3d(material.clone()),
                         Transform::from_translation(position).with_rotation(rotation),
