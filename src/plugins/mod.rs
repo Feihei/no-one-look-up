@@ -6,6 +6,7 @@
 
 pub mod menu;
 pub mod save;
+pub mod save_data;
 pub mod season;
 pub mod sky;
 pub mod world;

@@ -132,7 +132,7 @@
 **目标**：复现原 M4 存档/菜单系统。
 
 - [x] 4.1 探索位图：`ExploredBitmap`（chunk 键 HashSet + 进度/完成判定 + 排序键序列化接口）+ `PlayerChunkChanged` 消息，`track_player_chunk` 挂在流式系统之后（同为 Update）
-- [ ] 4.2 存档序列化：serde JSON（seed + season 枚举 + total_chunks + explored + player_pos + player_yaw），本地存档目录
+- [x] 4.2 存档序列化：`SaveData`（version/seed/season/explored 排序键/pos/yaw，serde JSON）+ `saves/slot_N.json` 落盘；season 为占位枚举（字段先占格式，R3.5 落地无需迁移）；round-trip 位精确 + 版本字段可检测试
 - [ ] 4.3 存档恢复：从 seed 重建布局图（<1s），恢复位图与玩家位姿；round-trip 单元测试
 - [ ] 4.4 多存档：自动存档槽 + 3 用户槽位，列表（seed/季节/进度/时间）
 - [ ] 4.5 菜单 UI（Bevy UI）：主菜单（seed 输入+季节选择/读档/退出）、Esc 暂停菜单、保存面板、探索完成弹窗、HUD
@@ -176,7 +176,7 @@ R4: 存档与菜单       [█░░░░░░░░░] 进行中（4.1 done 
 R5: 声音与润色       [░░░░░░░░░░] 待开始（原 M5 顺延）
 ```
 
-**下一步**：R4.2 存档序列化（serde JSON，含 4.1 的 explored 键；season 占位枚举）。季节（3.5/3.7）顺延至 R4 后。2026-10-24：R3.8 步行测试暴露的街道几何一致性修复见 2.9 修订（环路格点钉死、图节点用扰动坐标、归属按几何侧、curb 逐街宽）。
+**下一步**：R4.3 存档恢复（从 seed 重建布局图 + 恢复位图与位姿，<1s）。季节（3.5/3.7）顺延至 R4 后。2026-10-24：R3.8 步行测试暴露的街道几何一致性修复见 2.9 修订（环路格点钉死、图节点用扰动坐标、归属按几何侧、curb 逐街宽）。
 
 ## 风险与依赖
 
