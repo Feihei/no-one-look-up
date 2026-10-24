@@ -70,6 +70,57 @@ impl SaveData {
     }
 }
 
+/// Slot numbering (ADR-0001): slot 0 is the autosave, slots 1-3 are the
+/// user's manual saves.
+pub const AUTOSAVE_SLOT: u32 = 0;
+pub const USER_SLOT_COUNT: u32 = 3;
+
+/// What the slot list (R4.4/4.5) shows for one save file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaveSlotInfo {
+    /// Slot index the file occupies.
+    pub slot: u32,
+    /// Seed (regenerates the world).
+    pub seed: u64,
+    /// Season chosen at run start.
+    pub season: Season,
+    /// Explored-chunk count (progress against [`crate::world::GRID_CELLS`]²).
+    pub explored_chunks: usize,
+    /// File modification time (seconds since Unix epoch), for ordering.
+    pub modified_secs: u64,
+}
+
+/// Lists every occupied slot, oldest-modified first.
+///
+/// Corrupt or unreadable files are skipped (a bad save must never break the
+/// menu); an empty directory yields an empty list.
+pub fn list_slots() -> Vec<SaveSlotInfo> {
+    let mut slots = Vec::new();
+    for slot in AUTOSAVE_SLOT..=USER_SLOT_COUNT {
+        let Ok(json) = fs::read_to_string(save_path(slot)) else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<SaveData>(&json) else {
+            continue;
+        };
+        let modified_secs = fs::metadata(save_path(slot))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        slots.push(SaveSlotInfo {
+            slot,
+            seed: data.seed,
+            season: data.season,
+            explored_chunks: data.explored.len(),
+            modified_secs,
+        });
+    }
+    slots.sort_by_key(|info| info.modified_secs);
+    slots
+}
+
 /// Directory that holds the save files.
 pub fn save_dir() -> PathBuf {
     PathBuf::from("saves")
