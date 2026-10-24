@@ -12,6 +12,7 @@
 pub mod chunks;
 pub mod collision;
 pub mod debug_viz;
+pub mod explored;
 pub mod geometry;
 pub mod layout_graph;
 pub mod path_network;

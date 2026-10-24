@@ -430,16 +430,23 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, generate_layout)
+        app.init_resource::<crate::world::explored::ExploredBitmap>()
+            .add_message::<crate::world::explored::PlayerChunkChanged>()
+            .add_systems(Startup, generate_layout)
             .add_systems(PreUpdate, build_placement_assets)
             .add_systems(
                 Update,
-                update_chunk_streaming
-                    .in_set(WorldSystems::Streaming)
-                    // The controller writes the camera Transform; streaming
-                    // reads it, so the window is computed from the settled
-                    // position (explicit, per root AGENTS.md).
-                    .after(crate::player::PlayerSystems::Move),
+                (
+                    update_chunk_streaming
+                        .in_set(WorldSystems::Streaming)
+                        // The controller writes the camera Transform; streaming
+                        // reads it, so the window is computed from the settled
+                        // position (explicit, per root AGENTS.md).
+                        .after(crate::player::PlayerSystems::Move),
+                    // Exploration follows the settled position too, after
+                    // streaming (it reads the same camera transform).
+                    crate::world::explored::track_player_chunk.after(WorldSystems::Streaming),
+                ),
             );
     }
 }
@@ -585,6 +592,53 @@ mod tests {
         }
         let manager = app.world().resource::<ChunkManager>();
         assert_eq!(manager.active.len(), expected, "active set should converge");
+    }
+
+    #[test]
+    fn player_chunk_changes_are_tracked_and_explored() {
+        use crate::world::explored::{ExploredBitmap, PlayerChunkChanged};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(1000.0, 1.6, 1000.0),
+        ));
+
+        app.update();
+        app.update();
+
+        let bitmap = app.world().resource::<ExploredBitmap>();
+        assert!(
+            bitmap.is_explored((20, 20)),
+            "the starting chunk counts as explored"
+        );
+        assert!(bitmap.len() >= 1);
+
+        // Teleport two chunks east: the change message fires with the old
+        // chunk recorded.
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<Camera3d>>();
+        for mut transform in cameras.iter_mut(app.world_mut()) {
+            transform.translation = Vec3::new(1120.0, 1.6, 1000.0);
+        }
+        app.update();
+        app.update();
+
+        let messages: Vec<_> = app
+            .world()
+            .resource::<bevy::ecs::message::Messages<PlayerChunkChanged>>()
+            .iter_current_update_messages()
+            .copied()
+            .collect();
+        let last = messages.last().expect("a chunk change was sent");
+        assert_eq!(last.new_chunk, (22, 20));
+        assert_eq!(last.old_chunk, Some((20, 20)));
+
+        let bitmap = app.world().resource::<ExploredBitmap>();
+        assert!(bitmap.is_explored((22, 20)), "the new chunk is explored");
+        assert!(bitmap.is_explored((20, 20)), "the old chunk stays explored");
     }
 
     #[test]
