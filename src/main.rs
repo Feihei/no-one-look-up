@@ -3,7 +3,7 @@
 //!
 //! R2: world generation + chunk streaming (ground tiles stream around the
 //! camera; debug gizmos toggle with G). R3.4: kinematic player controller
-//! (A/D turn, W/S walk, mouse look clamped to 40-60° up, E/Q speed).
+//! (A/D turn, W/S walk, mouse look clamped to -10°-60°, E/Q speed).
 //! Placement/seasons (R3) and save/menu (R4) per milestone.
 
 use bevy::camera::Exposure;

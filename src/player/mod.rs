@@ -36,9 +36,12 @@ pub const ACCELERATION: f32 = 8.0;
 pub const TURN_SPEED_DEG: f32 = 60.0;
 /// Mouse sensitivity (original `mouse_sensitivity`, degrees per pixel).
 pub const MOUSE_SENSITIVITY: f32 = 0.15;
-/// Pitch is clamped to looking up 40-60°: this game is played with the eyes
-/// on the sky, and the ground should never enter frame.
-pub const MIN_PITCH_DEG: f32 = 40.0;
+/// Pitch is clamped to looking up between 10° below the horizon and 60° up.
+/// The golden-hour opening still fills the view with sky (default 60°), but
+/// the player can look down far enough to actually see the streets and trees:
+/// an 11 m tree 20-50 m away only subtends 10-25° above the horizon, so a
+/// strict 40° floor put the whole world outside the frame.
+pub const MIN_PITCH_DEG: f32 = -10.0;
 pub const MAX_PITCH_DEG: f32 = 60.0;
 /// Camera yaw offset around the body's facing (degrees, ±).
 pub const MAX_YAW_OFFSET_DEG: f32 = 10.0;
@@ -87,7 +90,10 @@ impl PlayerBody {
 
     /// Camera rotation for the current body/camera angles.
     pub fn camera_rotation(&self) -> Quat {
-        Quat::from_euler(EulerRot::YXZ, self.yaw + self.yaw_offset, -self.pitch, 0.0)
+        // Bevy: positive rotation about X tilts forward (-Z) upward, so a
+        // positive pitch looks up. (A minus sign here pointed the camera at
+        // the ground despite the clamped 40-60° "looking up" band.)
+        Quat::from_euler(EulerRot::YXZ, self.yaw + self.yaw_offset, self.pitch, 0.0)
     }
 
     /// Unit direction the body walks in (world XZ, camera pitch ignored).
@@ -251,7 +257,7 @@ mod tests {
 
     #[test]
     fn pitch_is_clamped_to_the_looking_up_band() {
-        assert!((PlayerBody::clamp_pitch(0.0) - MIN_PITCH_DEG.to_radians()).abs() < 1e-6);
+        assert!((PlayerBody::clamp_pitch(-30.0) - MIN_PITCH_DEG.to_radians()).abs() < 1e-6);
         assert!(
             (PlayerBody::clamp_pitch(std::f32::consts::FRAC_PI_2) - MAX_PITCH_DEG.to_radians())
                 .abs()
