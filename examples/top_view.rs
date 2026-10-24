@@ -77,6 +77,7 @@ fn main() {
     ));
     app.add_plugins((
         bevy::post_process::PostProcessPlugin,
+        bevy::world_serialization::WorldSerializationPlugin,
         bevy::gltf::GltfPlugin::default(),
         bevy::pbr::PbrPlugin::default(),
         bevy::light::LightPlugin,
@@ -88,6 +89,10 @@ fn main() {
     // MinimalPlugins carries no keyboard input resource, but the world
     // plugin's walk/streaming systems require it (dev-only stand-in).
     app.init_resource::<ButtonInput<KeyCode>>();
+    // The glTF loader registers AnimationClip handles for animated models,
+    // but this minimal stack carries no AnimationPlugin: init the asset type
+    // so loading the trees does not panic in the loader.
+    app.init_asset::<bevy::animation::AnimationClip>();
     app.insert_resource(HeadsUpSeed(seed));
     app.insert_resource(DebugVizEnabled(true));
     app.init_resource::<FrameCounter>();

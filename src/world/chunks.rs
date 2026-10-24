@@ -288,10 +288,20 @@ pub(crate) fn update_chunk_streaming(
 pub(crate) struct PlacementAssets {
     building_materials: HashMap<BlockType, Handle<StandardMaterial>>,
     plaza_material: Handle<StandardMaterial>,
-    /// Tree glTF scenes (`aspen_1` / `tree_2` / `tree_3`; tree_3_1 / tree_3_3
-    /// arrive when their .blend files do — dev-plan R0.5).
+    /// Preloaded glTF scene handles (`aspen_1` / `tree_2` / `tree_3`;
+    /// tree_3_1 / tree_3_3 arrive when their .blend files do — dev-plan
+    /// R0.5). Each loads the glTF's default scene via its `Scene(0)` label:
+    /// the glTF loader produces a `Gltf` asset, not a raw `WorldAsset`, so
+    /// loading the .glb path directly as `WorldAsset` finds no loader.
     tree_scenes: Vec<Handle<bevy::world_serialization::WorldAsset>>,
 }
+
+/// The tree model paths, indexed by placement `asset` id.
+const TREE_MODEL_PATHS: [&str; 3] = [
+    "models/aspen_1.glb",
+    "models/tree_2.glb",
+    "models/tree_3.glb",
+];
 
 /// Builds the placement assets on first chunk spawn (lazy: `Mesh3d` handles
 /// need the render `Assets` stores, which headless tests do not run).
@@ -322,14 +332,10 @@ fn build_placement_assets(
         (BlockType::Factory, color(palette.factory)),
     ]);
     let plaza_material = color(palette.plaza);
-    let tree_scenes: Vec<_> = [
-        "models/aspen_1.glb",
-        "models/tree_2.glb",
-        "models/tree_3.glb",
-    ]
-    .iter()
-    .map(|p| server.load::<bevy::world_serialization::WorldAsset>(*p))
-    .collect();
+    let tree_scenes: Vec<_> = TREE_MODEL_PATHS
+        .iter()
+        .map(|p| server.load(GltfAssetLabel::Scene(0).from_asset(*p)))
+        .collect();
     commands.insert_resource(PlacementAssets {
         building_materials,
         plaza_material,
