@@ -65,6 +65,10 @@ impl ExploredBitmap {
     }
 }
 
+/// Fires once every chunk has been explored (R4.6 completion gate).
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldExplorationCompleted;
+
 /// Message sent when the player's chunk changed (R4.1: the save system
 /// listens to mark exploration; R4.6 may also use it for autosave timing).
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]

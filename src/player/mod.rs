@@ -19,7 +19,7 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::core::input::{
-    MOVE_BACKWARD, MOVE_FORWARD, SPEED_DOWN, SPEED_UP, TOGGLE_MOUSE, TURN_LEFT, TURN_RIGHT,
+    MOVE_BACKWARD, MOVE_FORWARD, SPEED_DOWN, SPEED_UP, TURN_LEFT, TURN_RIGHT,
 };
 use crate::world::collision::{CollisionIndex, PLAYER_RADIUS};
 
@@ -117,10 +117,15 @@ pub enum PlayerSystems {
 /// ±10° camera offset. The body's facing is deliberately untouched, so
 /// glancing at a sky detail never changes the walk direction.
 pub(crate) fn mouse_look(
+    phase: Res<crate::core::game_state::GamePhase>,
     mut motion: MessageReader<MouseMotion>,
     mut players: Query<&mut PlayerBody>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
 ) {
+    // R4.6 input gating: no looking outside the playing phase.
+    if !phase.is_game_active() {
+        return;
+    }
     // Only when the cursor is captured.
     let captured = windows
         .single()
@@ -152,9 +157,14 @@ pub(crate) fn mouse_look(
 /// 0.1 m/s steps between 1.2 and 2.0.
 pub(crate) fn adjust_speed_and_cursor(
     keys: Res<ButtonInput<KeyCode>>,
+    phase: Res<crate::core::game_state::GamePhase>,
     mut players: Query<&mut PlayerBody>,
-    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    // Menus own the cursor now (Esc pauses instead of toggling capture), so
+    // speed only adjusts while the game actually runs.
+    if !phase.is_game_active() {
+        return;
+    }
     if let Ok(mut body) = players.single_mut() {
         if keys.just_pressed(SPEED_UP) {
             body.walk_speed = (body.walk_speed + SPEED_STEP).min(MAX_WALK_SPEED);
@@ -162,20 +172,6 @@ pub(crate) fn adjust_speed_and_cursor(
         if keys.just_pressed(SPEED_DOWN) {
             body.walk_speed = (body.walk_speed - SPEED_STEP).max(MIN_WALK_SPEED);
         }
-    }
-
-    if keys.just_pressed(TOGGLE_MOUSE)
-        && let Ok(mut options) = windows.single_mut()
-    {
-        let captured = options.grab_mode != CursorGrabMode::None;
-        // `Locked` gives real relative mouse motion; `None` releases the
-        // cursor so the player can leave the window.
-        options.grab_mode = if captured {
-            CursorGrabMode::None
-        } else {
-            CursorGrabMode::Locked
-        };
-        options.visible = captured;
     }
 }
 
@@ -187,9 +183,14 @@ pub(crate) fn adjust_speed_and_cursor(
 pub(crate) fn walk_and_collide(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    phase: Res<crate::core::game_state::GamePhase>,
     collision: Res<CollisionIndex>,
     mut players: Query<(&mut PlayerBody, &mut Transform)>,
 ) {
+    // R4.6 input gating: no movement outside the playing phase.
+    if !phase.is_game_active() {
+        return;
+    }
     let Ok((mut body, mut transform)) = players.single_mut() else {
         return;
     };

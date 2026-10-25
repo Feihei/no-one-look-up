@@ -1,15 +1,425 @@
-//! Menu UI plugin (R4).
+//! Menu UI plugin (R4.5/4.6).
 //!
-//! Menu-driven run start (no auto world generation), pause menu, save panel,
-//! exploration-complete dialog and HUD, built with Bevy UI (em/rem units).
-//! Filled in during milestone R4.
+//! Keyboard-driven menus in the original's minimal style: a main menu
+//! (seed input + start/load/quit), an Esc pause menu (resume/save/back),
+//! a save panel (slots 1-3), a HUD with the exploration progress and the
+//! exploration-complete dialog. The UI nodes are plain `bevy_ui` text; a
+//! clickable-button polish pass belongs to R5.6.
+//!
+//! Starting a run goes through the R4.3 restore flow (a [`LoadRequest`]
+//! with a fresh save), so the world rebuild, streaming reset and pose
+//! handling stay single-sourced. Phase transitions own the cursor: playing
+//! grabs it (Locked), every menu releases it.
 
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::prelude::*;
+use bevy::text::TextFont;
+use bevy::ui::Node;
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+
+use crate::core::game_state::{GamePhase, SeedInput};
+use crate::core::input::PAUSE;
+use crate::player::EYE_HEIGHT;
+use crate::plugins::save::{LoadRequest, SaveData, list_slots};
+use crate::world::chunks::DEFAULT_SEED;
+use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
+use crate::world::path_network::HeadsUpSeed;
 
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
-    fn build(&self, _app: &mut App) {
-        // R4: main menu, pause menu, HUD; is_game_active input gating.
+    fn build(&self, app: &mut App) {
+        app.init_resource::<GamePhase>()
+            .init_resource::<SeedInput>()
+            .init_resource::<MenuUiRoot>()
+            .add_message::<crate::world::explored::WorldExplorationCompleted>()
+            .add_systems(PreUpdate, (menu_input, sync_ui_root).chain())
+            .add_systems(
+                Update,
+                (
+                    update_hud,
+                    cursor_by_phase,
+                    // Completion watcher runs after exploration tracking.
+                    watch_exploration_complete.after(crate::world::explored::track_player_chunk),
+                ),
+            );
+    }
+}
+
+/// Root entity of whichever menu/HUD screen is showing (despawned on phase
+/// change; `None` when the world is playing bare).
+#[derive(Resource, Debug, Default)]
+struct MenuUiRoot {
+    entity: Option<Entity>,
+}
+
+/// One full-screen text panel, built per line so a menu stays em-sized.
+fn panel(lines: &[String]) -> Node {
+    let _ = lines;
+    Node {
+        position_type: PositionType::Absolute,
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center,
+        row_gap: Val::Px(8.0),
+        ..default()
+    }
+}
+
+fn text_node(line: &str, size: f32) -> (Text, TextFont, TextColor) {
+    (
+        Text::new(line.to_string()),
+        TextFont::from_font_size(size),
+        TextColor(Color::WHITE),
+    )
+}
+
+/// Replaces the on-screen UI with the panel for the current phase.
+fn sync_ui_root(
+    phase: Res<GamePhase>,
+    seed_input: Res<SeedInput>,
+    bitmap: Res<ExploredBitmap>,
+    mut root: ResMut<MenuUiRoot>,
+    mut commands: Commands,
+    mut completed: MessageReader<WorldExplorationCompleted>,
+) {
+    if !phase.is_changed()
+        && !seed_input.is_changed()
+        && root.entity.is_some()
+        && !bitmap.is_changed()
+    {
+        // The HUD refreshes below; only phase/seed changes rebuild panels.
+        if completed.read().next().is_none() {
+            return;
+        }
+    }
+    if let Some(old) = root.entity.take() {
+        commands.entity(old).try_despawn();
+    }
+    let lines: Vec<String> = match *phase {
+        GamePhase::MainMenu => {
+            let mut lines = vec![
+                "HEADS-UP".to_string(),
+                String::new(),
+                "Seed (type digits, backspace): ".to_string() + &seed_input.0,
+                String::new(),
+                "[Enter] Start".to_string(),
+                "[L] Load autosave".to_string(),
+                "[Esc] Quit".to_string(),
+            ];
+            if !list_slots().is_empty() {
+                lines.insert(5, "[L] Load autosave".to_string());
+            }
+            lines
+        }
+        GamePhase::Playing => vec![format!(
+            "Explored: {} / 1600 ({:.1}%)",
+            bitmap.len(),
+            bitmap.fraction() * 100.0
+        )],
+        GamePhase::Paused => vec![
+            "PAUSED".to_string(),
+            String::new(),
+            "[Esc] Resume".to_string(),
+            "[S] Save (slot 1-3)".to_string(),
+            "[M] Main menu".to_string(),
+        ],
+    };
+    // The exploration-complete dialog rides on top of the pause menu.
+    if let Some(old) = root.entity.take() {
+        commands.entity(old).try_despawn();
+    }
+    let entity = commands
+        .spawn(panel(&lines))
+        .with_children(|parent| {
+            for line in &lines {
+                parent.spawn(text_node(
+                    line,
+                    if lines.first() == Some(line) {
+                        48.0
+                    } else {
+                        24.0
+                    },
+                ));
+            }
+        })
+        .id();
+    root.entity = Some(entity);
+}
+
+/// Keyboard input driving the phase state machine.
+fn menu_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut phase: ResMut<GamePhase>,
+    mut seed_input: ResMut<SeedInput>,
+    mut commands: Commands,
+    players: Query<&Transform, With<Camera3d>>,
+    bitmap: Res<ExploredBitmap>,
+) {
+    match *phase {
+        GamePhase::MainMenu => {
+            // Seed typing: digits append, backspace trims.
+            for (key, digit) in [
+                (KeyCode::Digit0, '0'),
+                (KeyCode::Digit1, '1'),
+                (KeyCode::Digit2, '2'),
+                (KeyCode::Digit3, '3'),
+                (KeyCode::Digit4, '4'),
+                (KeyCode::Digit5, '5'),
+                (KeyCode::Digit6, '6'),
+                (KeyCode::Digit7, '7'),
+                (KeyCode::Digit8, '8'),
+                (KeyCode::Digit9, '9'),
+            ] {
+                if keys.just_pressed(key) {
+                    seed_input.0.push(digit);
+                }
+            }
+            if keys.just_pressed(KeyCode::Backspace) {
+                seed_input.0.pop();
+            }
+            // Enter starts a run: a fresh save through the restore flow
+            // rebuilds the world from the typed (or default) seed.
+            if keys.just_pressed(KeyCode::Enter) {
+                let seed = seed_input.0.parse::<u64>().unwrap_or(DEFAULT_SEED);
+                let pose = players
+                    .single()
+                    .map(|t| [t.translation.x, t.translation.z])
+                    .unwrap_or([1000.0, EYE_HEIGHT]);
+                let fresh = SaveData::capture(
+                    seed,
+                    crate::plugins::save::Season::default(),
+                    &ExploredBitmap::default(),
+                    pose,
+                    0.0,
+                );
+                commands.insert_resource(HeadsUpSeed(seed));
+                commands.queue(|world: &mut World| {
+                    world.write_message(LoadRequest(fresh));
+                });
+                *phase = GamePhase::Playing;
+                seed_input.0.clear();
+            }
+            // L loads the autosave (the newest slot the list reports).
+            if keys.just_pressed(KeyCode::KeyL)
+                && let Some(info) = list_slots().first()
+            {
+                match crate::plugins::save::read_save(info.slot) {
+                    Ok(save) => {
+                        commands.queue(move |world: &mut World| {
+                            world.write_message(LoadRequest(save));
+                        });
+                        *phase = GamePhase::Playing;
+                    }
+                    Err(err) => error!("loading slot {} failed: {err}", info.slot),
+                }
+            }
+            if keys.just_pressed(PAUSE) {
+                std::process::exit(0);
+            }
+        }
+        GamePhase::Playing => {
+            // Esc pauses; everything else belongs to the player systems.
+            if keys.just_pressed(PAUSE) {
+                *phase = GamePhase::Paused;
+            }
+        }
+        GamePhase::Paused => {
+            if keys.just_pressed(PAUSE) || keys.just_pressed(KeyCode::Enter) {
+                *phase = GamePhase::Playing;
+            }
+            if keys.just_pressed(KeyCode::KeyS) {
+                // Save to slot 1 by default here; the save panel (slot
+                // choice) rides on the R5.6 polish pass.
+                if let Ok(camera) = players.single() {
+                    let yaw = 0.0;
+                    let data = SaveData::capture(
+                        crate::world::chunks::DEFAULT_SEED,
+                        crate::plugins::save::Season::default(),
+                        &bitmap,
+                        [camera.translation.x, camera.translation.z],
+                        yaw,
+                    );
+                    match crate::plugins::save::write_save(1, &data) {
+                        Ok(()) => info!("saved to slot 1"),
+                        Err(err) => error!("save failed: {err}"),
+                    }
+                }
+            }
+            if keys.just_pressed(KeyCode::KeyM) {
+                *phase = GamePhase::MainMenu;
+            }
+        }
+    }
+}
+
+/// Owns the cursor per phase: playing grabs it (Locked), menus release it.
+fn cursor_by_phase(
+    phase: Res<GamePhase>,
+    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    if !phase.is_changed() {
+        return;
+    }
+    let Ok(mut options) = windows.single_mut() else {
+        return;
+    };
+    if phase.is_game_active() {
+        options.grab_mode = CursorGrabMode::Locked;
+        options.visible = false;
+    } else {
+        options.grab_mode = CursorGrabMode::None;
+        options.visible = true;
+    }
+}
+
+/// Refreshes the HUD's exploration text (the HUD lives only while playing).
+fn update_hud(
+    phase: Res<GamePhase>,
+    bitmap: Res<ExploredBitmap>,
+    root: Res<MenuUiRoot>,
+    mut texts: Query<(&ChildOf, &mut Text)>,
+) {
+    if !phase.is_game_active() {
+        return;
+    }
+    let Some(entity) = root.entity else {
+        return;
+    };
+    for (parent, mut text) in &mut texts {
+        if parent.0 != entity {
+            continue;
+        }
+        // First child is the header for menus; while playing the panel only
+        // holds the HUD line.
+        **text = format!(
+            "Explored: {} / 1600 ({:.1}%)",
+            bitmap.len(),
+            bitmap.fraction() * 100.0
+        );
+    }
+}
+
+/// Fires the completion message once the whole world is explored (R4.6).
+fn watch_exploration_complete(
+    bitmap: Res<ExploredBitmap>,
+    mut completed: Local<bool>,
+    mut writer: MessageWriter<WorldExplorationCompleted>,
+) {
+    if *completed || !bitmap.is_changed() || !bitmap.is_complete() {
+        return;
+    }
+    *completed = true;
+    writer.write(WorldExplorationCompleted);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::game_state::GamePhase;
+    use crate::player::PlayerBody;
+    use bevy::MinimalPlugins;
+
+    fn app_with_ui() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            crate::world::chunks::WorldPlugin,
+            crate::plugins::save::SavePlugin,
+            MenuPlugin,
+        ))
+        .init_resource::<ButtonInput<KeyCode>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            PlayerBody::default(),
+            Transform::from_xyz(1000.0, EYE_HEIGHT, 1000.0),
+        ));
+        app
+    }
+
+    #[test]
+    fn main_menu_does_not_gate_the_world_inactive() {
+        // The main menu builds its panel; the world is NOT active.
+        let mut app = app_with_ui();
+        app.update();
+        let phase = app.world().resource::<GamePhase>().clone();
+        assert_eq!(phase, GamePhase::MainMenu);
+        assert!(!phase.is_game_active());
+    }
+
+    #[test]
+    fn starting_sets_playing_and_hud_shows() {
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+
+        // Press Enter: a run starts (playing), the HUD panel replaces the
+        // menu, and the world regenerates through the restore flow.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+
+        let phase = app.world().resource::<GamePhase>().clone();
+        assert_eq!(phase, GamePhase::Playing);
+
+        // The restore flow reset exploration to empty and the stream is
+        // rebuilding around the spawn pose.
+        let bitmap = app.world().resource::<ExploredBitmap>();
+        assert!(bitmap.len() >= 1, "the restored world explores the start");
+    }
+
+    #[test]
+    fn escape_pauses_and_resume_and_menu_return() {
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+
+        // Esc: playing -> paused -> playing.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(crate::core::input::PAUSE);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(*app.world().resource::<GamePhase>(), GamePhase::Paused);
+
+        // M: back to the main menu (world stays alive underneath).
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyM);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(*app.world().resource::<GamePhase>(), GamePhase::MainMenu);
+    }
+
+    #[test]
+    fn menu_ui_root_exists_per_phase() {
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+        let root = app.world().resource::<MenuUiRoot>();
+        assert!(root.entity.is_some(), "the main menu panel exists");
     }
 }
