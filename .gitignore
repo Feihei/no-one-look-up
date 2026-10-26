@@ -19,6 +19,9 @@
 # Local save files (player runtime data)
 /saves/
 
+# Scratch dir for temporary test output
+/.tmp/
+
 # OS
 .DS_Store
 Thumbs.db
