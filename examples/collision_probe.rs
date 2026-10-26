@@ -42,11 +42,12 @@ fn main() {
 
     // Sample a grid of points: how much of the map is walkable?
     let step = 5.0f32;
+    let world = heads_up_bevy::world::WORLD_SIZE;
     let (mut free, mut blocked) = (0u32, 0u32);
     let mut y = 0.0;
-    while y < 2000.0 {
+    while y < world {
         let mut x = 0.0;
-        while x < 2000.0 {
+        while x < world {
             if index.is_blocked(Vec2::new(x, y)) {
                 blocked += 1;
             } else {
@@ -64,7 +65,7 @@ fn main() {
 
     // Walk a straight line along a street: start at the middle of the map and
     // walk east until the resolver stops advancing.
-    let mut pos = Vec2::new(1000.0, 1000.0);
+    let mut pos = Vec2::splat(heads_up_bevy::world::world_center());
     // Nudge onto the nearest street first: if the centre is inside a block,
     // resolve() pushes it out.
     pos = index.resolve(pos, PLAYER_RADIUS);

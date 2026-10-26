@@ -19,11 +19,11 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::core::game_state::{GamePhase, SeedInput};
 use crate::core::input::PAUSE;
-use crate::player::EYE_HEIGHT;
 use crate::plugins::save::{LoadRequest, SaveData, list_slots};
 use crate::world::chunks::DEFAULT_SEED;
 use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
 use crate::world::path_network::HeadsUpSeed;
+use crate::world::world_center;
 
 pub struct MenuPlugin;
 
@@ -188,7 +188,7 @@ fn menu_input(
                 let pose = players
                     .single()
                     .map(|t| [t.translation.x, t.translation.z])
-                    .unwrap_or([1000.0, EYE_HEIGHT]);
+                    .unwrap_or([world_center(), world_center()]);
                 let fresh = SaveData::capture(
                     seed,
                     crate::plugins::save::Season::default(),
@@ -335,7 +335,7 @@ mod tests {
         app.world_mut().spawn((
             Camera3d::default(),
             PlayerBody::default(),
-            Transform::from_xyz(1000.0, EYE_HEIGHT, 1000.0),
+            Transform::from_xyz(world_center(), crate::player::EYE_HEIGHT, world_center()),
         ));
         app
     }
@@ -345,7 +345,7 @@ mod tests {
         // The main menu builds its panel; the world is NOT active.
         let mut app = app_with_ui();
         app.update();
-        let phase = app.world().resource::<GamePhase>().clone();
+        let phase = *app.world().resource::<GamePhase>();
         assert_eq!(phase, GamePhase::MainMenu);
         assert!(!phase.is_game_active());
     }
@@ -367,13 +367,13 @@ mod tests {
             .clear();
         app.update();
 
-        let phase = app.world().resource::<GamePhase>().clone();
+        let phase = *app.world().resource::<GamePhase>();
         assert_eq!(phase, GamePhase::Playing);
 
         // The restore flow reset exploration to empty and the stream is
         // rebuilding around the spawn pose.
         let bitmap = app.world().resource::<ExploredBitmap>();
-        assert!(bitmap.len() >= 1, "the restored world explores the start");
+        assert!(!bitmap.is_empty(), "the restored world explores the start");
     }
 
     #[test]

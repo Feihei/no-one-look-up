@@ -804,7 +804,7 @@ pub fn rotated_corners(
     ]
 }
 
-/// True if `position ± extent` stays inside the 2 km map.
+/// True if `position ± extent` stays inside the world square.
 fn within_bounds(graph: &LayoutGraph, position: bevy::math::Vec2, extent: f32) -> bool {
     let world = CELL_SIZE * GRID_CELLS as f32;
     let _ = graph;
@@ -1003,8 +1003,11 @@ mod tests {
             .1;
         let wear_of = |seed: u64| -> Vec<f32> {
             let mut wear = Vec::new();
-            for cx in 16..24 {
-                for cz in 16..24 {
+            // Sample every chunk of the map: the world is small (16x16), so a
+            // centre-window like the old 16..24 leaves too few buildings.
+            let cells = crate::world::GRID_CELLS as i32;
+            for cx in 0..cells {
+                for cz in 0..cells {
                     for o in &plan_chunk(&graph, seed, (cx, cz), 0).objects {
                         if o.kind == PlacedKind::Building(BlockType::OldCity)
                             || o.kind == PlacedKind::Building(BlockType::Apartment)

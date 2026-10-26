@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn graph_round_trips_through_serde() {
         let graph = LayoutGraph {
-            bounds: Vec2::splat(2000.0),
+            bounds: Vec2::splat(crate::world::WORLD_SIZE),
             nodes: vec![LayoutNode {
                 pos: Vec2::new(50.0, 50.0),
                 kind: NodeKind::Junction,

@@ -11,6 +11,7 @@ use bevy::prelude::*;
 
 use heads_up_bevy::player::{EYE_HEIGHT, PlayerBody, PlayerPlugin};
 use heads_up_bevy::plugins::{GoldenHourCamera, HeadsUpPlugins, sky::HeadsUpSky};
+use heads_up_bevy::world::world_center;
 
 fn main() -> AppExit {
     App::new()
@@ -48,7 +49,7 @@ fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
             ..default()
         },
         PlayerBody::default(),
-        Transform::from_xyz(1000.0, EYE_HEIGHT, 1000.0),
+        Transform::from_xyz(world_center(), EYE_HEIGHT, world_center()),
     ));
 }
 

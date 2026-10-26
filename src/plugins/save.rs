@@ -222,6 +222,9 @@ mod tests {
     use crate::world::chunks::WorldPlugin;
     use bevy::MinimalPlugins;
 
+    /// World centre, derived from the world constants.
+    const CENTER: f32 = crate::world::WORLD_SIZE * 0.5;
+
     fn app_with_world() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, WorldPlugin, SavePlugin))
@@ -229,7 +232,7 @@ mod tests {
         app.world_mut().spawn((
             Camera3d::default(),
             PlayerBody::default(),
-            Transform::from_xyz(1000.0, EYE_HEIGHT, 1000.0),
+            Transform::from_xyz(CENTER, EYE_HEIGHT, CENTER),
         ));
         app
     }
@@ -246,19 +249,19 @@ mod tests {
                 crate::world::chunks::DEFAULT_SEED,
                 Season::Summer,
                 bitmap,
-                [1000.0, 1000.0],
+                [CENTER, CENTER],
                 0.0,
             );
             (bitmap.clone(), data)
         };
-        assert!(bitmap_snapshot.is_explored((20, 20)));
+        assert!(bitmap_snapshot.is_explored((8, 8)));
 
         // Wander: teleport far away and let streaming mark exploration.
         let mut cameras = app
             .world_mut()
             .query_filtered::<&mut Transform, With<Camera3d>>();
         for mut transform in cameras.iter_mut(app.world_mut()) {
-            transform.translation = Vec3::new(1500.0, EYE_HEIGHT, 1500.0);
+            transform.translation = Vec3::new(CENTER + 300.0, EYE_HEIGHT, CENTER + 300.0);
         }
         let _ = &mut cameras;
         app.update();
@@ -276,15 +279,15 @@ mod tests {
 
         let bitmap = app.world().resource::<ExploredBitmap>();
         assert_eq!(bitmap.len(), saved.explored.len(), "bitmap restored");
-        assert!(bitmap.is_explored((20, 20)));
-        assert!(!bitmap.is_explored((30, 30)), "post-walk chunks unlearned");
+        assert!(bitmap.is_explored((8, 8)));
+        assert!(!bitmap.is_explored((14, 14)), "post-walk chunks unlearned");
 
         let mut cameras = app
             .world_mut()
             .query_filtered::<&Transform, With<Camera3d>>();
         let transform = cameras.single(app.world()).expect("camera exists");
-        assert!((transform.translation.x - 1000.0).abs() < 1e-4);
-        assert!((transform.translation.z - 1000.0).abs() < 1e-4);
+        assert!((transform.translation.x - CENTER).abs() < 1e-4);
+        assert!((transform.translation.z - CENTER).abs() < 1e-4);
 
         // Streaming rebuilds the window around the restored pose.
         let manager = app.world().resource::<ChunkManager>();
@@ -369,7 +372,7 @@ mod tests {
             .world_mut()
             .query_filtered::<&mut Transform, With<Camera3d>>();
         for mut transform in cameras.iter_mut(app.world_mut()) {
-            transform.translation = Vec3::new(1120.0, EYE_HEIGHT, 1000.0);
+            transform.translation = Vec3::new(CENTER + 120.0, EYE_HEIGHT, CENTER);
         }
         // Real-frame loop is impractical at 30 s; verify the arming + write
         // path directly instead: run enough simulated frames by shrinking
@@ -389,10 +392,7 @@ mod tests {
             "armed timer + interval triggers the autosave write"
         );
         let loaded = read_save(AUTOSAVE_SLOT).expect("autosave is readable");
-        assert!(
-            loaded.explored.contains(&(22, 20)),
-            "autosave carries state"
-        );
+        assert!(loaded.explored.contains(&(10, 8)), "autosave carries state");
         let _ = std::fs::remove_file(save_path(AUTOSAVE_SLOT));
     }
 

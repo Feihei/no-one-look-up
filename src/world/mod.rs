@@ -25,8 +25,13 @@ pub mod world_grid;
 /// space).
 pub const CELL_SIZE: f32 = 50.0;
 
-/// Grid cells per axis. 40 x 40 cells = 2 km x 2 km world.
-pub const GRID_CELLS: u32 = 40;
+/// Grid cells per axis. 16 x 16 cells = 0.8 km x 0.8 km world.
+///
+/// Sizing (ADR-0001): the walk is 1.2-2.0 m/s, so half an hour covers
+/// ~2.7 km at the default 1.5 m/s. At 800 m a player can cross the map
+/// (~1.6 km) or walk most of its perimeter (3.2 km) within that window,
+/// while the city still reads as a city from the shoulders-up view.
+pub const GRID_CELLS: u32 = 16;
 
 /// Total world extent in meters (`CELL_SIZE * GRID_CELLS`).
 pub const WORLD_SIZE: f32 = CELL_SIZE * GRID_CELLS as f32;
@@ -68,14 +73,28 @@ pub const BLOCK_SOLID_HEIGHT: f32 = 2.0;
 
 /// FOREST blocks are edge transition zones (ADR-0004): only cells within this
 /// many cells of the map border may roll the FOREST type.
-pub const FOREST_EDGE_MAX_DISTANCE_CELLS: u32 = 8;
+///
+/// Kept at 1/4 of the map so the transition band stays a band: at 8 cells it
+/// covered 20% of a 40-cell map, but a third of a 16-cell one.
+pub const FOREST_EDGE_MAX_DISTANCE_CELLS: u32 = 4;
 
 /// Chunk edge, in meters. Chunks align 1:1 with base grid cells
-/// (2000 / 50 = 40 x 40 = 1600 chunks, ADR-0002).
+/// (800 / 50 = 16 x 16 chunks, ADR-0002).
 pub const CHUNK_SIZE: f32 = 50.0;
+
+/// World centre in world units. Spawn poses default here instead of a
+/// hard-coded literal, so resizing [`GRID_CELLS`] keeps the spawn central.
+pub fn world_center() -> f32 {
+    WORLD_SIZE * 0.5
+}
 
 /// Streaming radius: chunks loaded ahead of the walk direction (ADR-0002,
 /// first-person view optimization).
+///
+/// 4 chunks ahead is a 200 m sightline. On the previous 40-chunk map that
+/// left a 20-chunk interior; on a 16-chunk map it is a quarter of the map,
+/// which is still shorter than the sky-dominated view distance, so the
+/// window stays comfortably inside the map while the player is central.
 pub const CHUNK_AHEAD: i32 = 4;
 /// Streaming radius: chunks kept behind the walk direction (turn safety).
 pub const CHUNK_BEHIND: i32 = 2;

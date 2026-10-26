@@ -10,8 +10,8 @@
 //! ```
 //!
 //! Output: `target/world_top_view.png` (default). The camera is orthographic,
-//! looking straight down from `CAM_HEIGHT`, framed to cover the whole 2 km
-//! world; debug gizmos are forced on for the capture.
+//! looking straight down from `CAM_HEIGHT`, framed to cover the whole
+//! `WORLD_SIZE` world; debug gizmos are forced on for the capture.
 
 use std::time::Duration;
 

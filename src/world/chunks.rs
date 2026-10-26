@@ -27,7 +27,7 @@ pub const DEFAULT_SEED: u64 = 0x4845_4144; // "HEAD"
 
 /// Chunk grid coordinates. Chunk `(x, z)` covers the world square
 /// `[x * CHUNK_SIZE, (x + 1) * CHUNK_SIZE) x [z * CHUNK_SIZE, (z + 1) *
-/// CHUNK_SIZE)`; 40 x 40 chunks tile the 2 km world.
+/// CHUNK_SIZE)`; 16 x 16 chunks tile the 800 m world.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkCoords {
     pub x: i32,
@@ -462,6 +462,9 @@ pub fn layout_resource(world: &World) -> Option<&LayoutGraph> {
 mod tests {
     use super::*;
 
+    /// World centre, grounded on the actual constants under test.
+    const CENTER: f32 = crate::world::WORLD_SIZE * 0.5;
+
     #[test]
     fn chunk_grid_tiles_the_world() {
         use crate::world::WORLD_SIZE;
@@ -469,7 +472,7 @@ mod tests {
         assert_eq!(
             (WORLD_SIZE / CHUNK_SIZE) as u32,
             GRID_CELLS,
-            "40x40 chunks tile the 2 km world"
+            "16x16 chunks tile the 800 m world"
         );
     }
 
@@ -477,12 +480,12 @@ mod tests {
     fn desired_chunks_follow_the_walk_direction() {
         // Player at the world center facing -Z (north): the window is the
         // original's square scan — 4 ahead, 2 behind (Chebyshev).
-        let pos = Vec2::new(1000.0, 1000.0);
+        let pos = Vec2::new(CENTER, CENTER);
         let forward = Vec2::new(0.0, -1.0);
         let desired = ChunkManager::desired_chunks(pos, forward);
 
         let player = ChunkCoords::from_world(pos);
-        assert_eq!(player, ChunkCoords { x: 20, z: 20 });
+        assert_eq!(player, ChunkCoords { x: 8, z: 8 });
         // Square scan: rows are 2 behind + own + 4 ahead. Columns whose
         // centre sits exactly abeam have dot == 0 and count as "ahead", so the
         // window is symmetric on both axes near the centre of a chunk.
@@ -508,7 +511,7 @@ mod tests {
 
     #[test]
     fn desired_chunks_shift_with_facing() {
-        let pos = Vec2::new(1000.0, 1000.0);
+        let pos = Vec2::new(CENTER, CENTER);
         let player = ChunkCoords::from_world(pos);
         // Facing +X (east): the window reaches CHUNK_AHEAD east, less west.
         let east = ChunkManager::desired_chunks(pos, Vec2::new(1.0, 0.0));
@@ -556,7 +559,7 @@ mod tests {
         // A camera entity (data only; no render plugins needed).
         app.world_mut().spawn((
             Camera3d::default(),
-            Transform::from_xyz(1000.0, 1.6, 1000.0),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
         ));
 
         app.update(); // Startup: layout generated; Update: chunks spawned.
@@ -566,13 +569,13 @@ mod tests {
         let manager = app.world().resource::<ChunkManager>();
         assert!(!manager.active.is_empty(), "chunks spawn at startup");
 
-        // Teleport the camera 500 m east and update twice: the old chunks
-        // despawn, new ones spawn (both positions inside the world).
+        // Teleport the camera 300 m east (still 6 chunks from the east edge)
+        // and update twice: the old chunks despawn, new ones spawn.
         let mut cameras = app
             .world_mut()
             .query_filtered::<&mut Transform, With<Camera3d>>();
         for mut transform in cameras.iter_mut(app.world_mut()) {
-            transform.translation = Vec3::new(1500.0, 1.6, 1000.0);
+            transform.translation = Vec3::new(CENTER + 300.0, 1.6, CENTER);
         }
         app.update();
         app.update();
@@ -580,13 +583,14 @@ mod tests {
         let manager = app.world().resource::<ChunkManager>();
         let all_x: Vec<i32> = manager.active.keys().map(|k| k.0).collect();
         assert!(
-            all_x.iter().all(|x| *x >= 26),
+            all_x.iter().all(|x| *x >= 10),
             "chunks behind the teleport should have despawned: {all_x:?}"
         );
         // The active set matches the footprint once the per-frame budget has
         // drained the queue (CHUNKS_PER_FRAME = 1, so give it time).
         let expected =
-            ChunkManager::desired_chunks(Vec2::new(1500.0, 1000.0), Vec2::new(0.0, -1.0)).len();
+            ChunkManager::desired_chunks(Vec2::new(CENTER + 300.0, CENTER), Vec2::new(0.0, -1.0))
+                .len();
         for _ in 0..(expected + 8) {
             app.update();
         }
@@ -602,7 +606,7 @@ mod tests {
             .init_resource::<ButtonInput<KeyCode>>();
         app.world_mut().spawn((
             Camera3d::default(),
-            Transform::from_xyz(1000.0, 1.6, 1000.0),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
         ));
 
         app.update();
@@ -610,10 +614,10 @@ mod tests {
 
         let bitmap = app.world().resource::<ExploredBitmap>();
         assert!(
-            bitmap.is_explored((20, 20)),
+            bitmap.is_explored((8, 8)),
             "the starting chunk counts as explored"
         );
-        assert!(bitmap.len() >= 1);
+        assert!(!bitmap.is_empty());
 
         // Teleport two chunks east: the change message fires with the old
         // chunk recorded.
@@ -621,7 +625,7 @@ mod tests {
             .world_mut()
             .query_filtered::<&mut Transform, With<Camera3d>>();
         for mut transform in cameras.iter_mut(app.world_mut()) {
-            transform.translation = Vec3::new(1120.0, 1.6, 1000.0);
+            transform.translation = Vec3::new(CENTER + 120.0, 1.6, CENTER);
         }
         app.update();
         app.update();
@@ -633,12 +637,12 @@ mod tests {
             .copied()
             .collect();
         let last = messages.last().expect("a chunk change was sent");
-        assert_eq!(last.new_chunk, (22, 20));
-        assert_eq!(last.old_chunk, Some((20, 20)));
+        assert_eq!(last.new_chunk, (10, 8));
+        assert_eq!(last.old_chunk, Some((8, 8)));
 
         let bitmap = app.world().resource::<ExploredBitmap>();
-        assert!(bitmap.is_explored((22, 20)), "the new chunk is explored");
-        assert!(bitmap.is_explored((20, 20)), "the old chunk stays explored");
+        assert!(bitmap.is_explored((10, 8)), "the new chunk is explored");
+        assert!(bitmap.is_explored((8, 8)), "the old chunk stays explored");
     }
 
     #[test]
@@ -649,7 +653,7 @@ mod tests {
             .init_resource::<ButtonInput<KeyCode>>();
         app.world_mut().spawn((
             Camera3d::default(),
-            Transform::from_xyz(1000.0, 1.6, 1000.0),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
         ));
         app.update();
         let graph = layout_resource(app.world()).expect("layout graph resource");

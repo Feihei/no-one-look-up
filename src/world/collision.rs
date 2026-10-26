@@ -498,8 +498,11 @@ mod tests {
             "north band, next chunk"
         );
         // The world centre is free.
-        index.register_chunk(&LayoutGraph::default(), (20, 20));
-        assert!(!index.is_blocked(Vec2::new(1000.0, 1000.0)));
+        index.register_chunk(&LayoutGraph::default(), (8, 8));
+        assert!(!index.is_blocked(Vec2::new(
+            crate::world::world_center(),
+            crate::world::world_center()
+        )));
     }
 
     #[test]
@@ -552,6 +555,12 @@ mod tests {
     /// never leave the world. This is the dynamic form of the enclosure
     /// guarantee the point tests check statically: no seam blocks a walker,
     /// and the scenery ring keeps them inside the map.
+    ///
+    /// Share of grid cells that must yield a walkable edge. The old 500 at
+    /// 60x60 cells (40x40 grid edges) was ~2 per cell; the 800 m map still
+    /// produces well over one edge per cell.
+    const MIN_WALKED_EDGE_RATIO: usize = 1;
+
     #[test]
     fn walking_every_street_reaches_the_far_end() {
         for seed in [7_u64, 0x4845_4144] {
@@ -629,7 +638,14 @@ mod tests {
                 );
                 walked += 1;
             }
-            assert!(walked > 500, "seed {seed}: walked only {walked} edges");
+            // Every street edge must be traversable. The world shrank to 16x16
+            // cells (from 40x40) with the 800 m map, so the floor scales with
+            // the grid rather than sitting at a 2 km-era constant.
+            let min_edges = (GRID_CELLS * GRID_CELLS) as usize * MIN_WALKED_EDGE_RATIO;
+            assert!(
+                walked > min_edges,
+                "seed {seed}: walked only {walked} edges (floor {min_edges})"
+            );
         }
     }
 
