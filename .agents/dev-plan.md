@@ -62,7 +62,7 @@
 - [x] 2.2 `world_grid.rs`：2D 网格中间结构（cell 记录 block_id/is_road/is_junction，`get_cell` 快速查询，serde）；is_road=贴街 cell，is_junction=含图节点的 cell
 - [x] 2.3 `path_network.rs`：Block 优先生成。**修订（2026-10-21）：改为完整矩形剖分**——行序扫描取「区域内最大自由方块」，装不进目标类型的最小尺寸就降级为 1×1 老城区。原 carve+回退会留下 L 形残余块，其凹角在扰动+内缩下翻转朝外，实测 280 对穿插 / 最深 20.8m；剖分保证每格恰属一个矩形，无残余即无凹角。类型按面积配额抽样（见 2.12）
 - [x] 2.4 种子系统：`rand_chacha::StdRng::seed_from_u64(seed)`，同 seed bit-exact 单元测试；`thread_rng` 不进入生成路径
-- [x] 2.5 `chunks.rs`：50m×50m Chunk（40×40=1600，与 cell 1:1 对齐），不对称半径（前方 4 / 后方 2 / 侧 3，窗口最坏 8×8=64）流式 spawn/despawn（0.20 递归 `despawn` 组删除）+ 每 Chunk 地面 tile（seed 着色）供流式反馈 ⚠️ 原版为「切比雪夫距离 + 前后点积判定」，当前为旋转矩形窗口，略多加载；对齐见 2.15
+- [x] 2.5 `chunks.rs`：50m×50m Chunk（16×16=256，与 cell 1:1 对齐），不对称半径（前方 4 / 后方 2），窗口最坏 8×8=64 格流式 spawn/despawn（2026-10-26 地图缩至 0.8km 后仍为 16×16=256 Chunk）（0.20 递归 `despawn` 组删除）+ 每 Chunk 地面 tile（seed 着色）供流式反馈 ⚠️ 原版为「切比雪夫距离 + 前后点积判定」，当前为旋转矩形窗口，略多加载；对齐见 2.15
 - [x] 2.6 几何验证单元测试：半平面内缩裁剪（`inset_polygon_clip`）+ SAT；OVERLAPS=0 断言（4 个 seed 全块对）
 - [x] 2.7 调试可视化：Bevy Gizmos 绘制 Chunk 边界/街道中心线/Block 轮廓（按类型着色）+ Text2d Block 标签；G 键开关（debug 构建默认开）
 - [x] 2.8 系统排序显式声明（`.before()/.after()` 链）+ 调度随机化 property testing（16 种子随机注册顺序 + 歧义检测 = Error）
@@ -107,7 +107,7 @@
 - [x] 3.3 `collision.rs`：负形街道模型——每个实心 Block 一个不可见凸棱柱（`block.polygon`，y=0..`BLOCK_SOLID_HEIGHT`=2m），按 50m chunk 分桶索引（`CollisionIndex`，与 chunk 流式同步注册/注销）；`resolve(pos, PLAYER_RADIUS)` 沿最浅穿透轴推出，迭代 16 次 × 3×3 邻桶以处理角点连锁。规则：PLAZA 跳过、内部 FOREST 跳过、其余生成（940 块中 804 块实心）。景物带另由逐 chunk 实心环封闭。调试可视化按类型着色画出碰撞轮廓。验证：可走面积 26.2%，从街道朝 721 个实心块内部行走 0 次成功进入
 
 > **与 ADR-0004 的差异**：ADR 描述的是「原版逐 Block 生成 `StaticBody3D` + `ConvexPolygonShape3D`」。本项目按 ADR-0005 不引入物理引擎，改为纯数学碰撞（凸多边形包含 + 最小平移推出），由 R3.4 的运动学控制器消费；语义等价（不可见、实心、不渲染、无 Draw Call）。
-- [x] 3.4 自研运动学玩家控制器（`src/player/mod.rs`）：A/D 以 60°/s 转身（相机 ±10° 偏移不改变行进方向）、鼠标纵向钳制仰角 40–60°、W/S 沿朝向行走、E/Q 调速 1.2–2.0（0.1 步进，加速 8 m/s²）、视高 1.65m、无跳跃/跑步/FOV。运动按 ½ 半径细分子步后交 `CollisionIndex::resolve`，高速不穿墙。Esc 释放/重新捕获鼠标。替换 R2 临时调试移动；删除 R1 的 `aim_at_sun_once`（两个系统写同一 Transform 会构成隐式排序）
+- [x] 3.4 自研运动学玩家控制器（`src/player/mod.rs`）：A/D 以 60°/s 转身（相机 ±10° 偏移不改变行进方向）、鼠标纵向钳制仰角 22.55–60°（底边掠过地平线）、W/S 沿朝向行走、E/Q 调速 1.2–2.0（0.1 步进，加速 8 m/s²）、视高 1.65m、无跳跃/跑步/FOV。运动按 ½ 半径细分子步后交 `CollisionIndex::resolve`，高速不穿墙。Esc 释放/重新捕获鼠标。替换 R2 临时调试移动；删除 R1 的 `aim_at_sun_once`（两个系统写同一 Transform 会构成隐式排序）
 
 > **碰撞修复**：合并块内缩后的周长会出现轻微凹陷（实测顶点 3/5/7 的叉积为负），`push_out` 依赖凸性，导致 770 次高速穿墙尝试中有 13 次进入块内。改为对 `convex_hull(polygon)` 做碰撞后降为 0 次；代价是碰撞体比可见轮廓大出凹陷深度（±4m 扰动下可忽略）。已加回归测试。
 - [x] 3.1 放置偏差（2026-10-22）：**完整放置**——原版 ADR footprint（公寓 25-40×12-14m / 厂房 50×50m）只有块深 ≥ `w/2 + setback + depth` 时成立，本项目剖分可给「厂房」单 cell（内缩后仅 ~39m），参数表尺寸放不下。改为：逐边采样整排建筑可用深度（`block_depth_along_pub`，从外部入射的射线扫描，非凸多边形安全），先试参数表尺寸，放不下降级为 4-6m 模块节奏，整排放不下再丢弃。`LayoutEdge` 补 `left_block/right_block`（2.13 遗留）；`street_segments` 改为**每 unit edge 一条 segment**（原合并成 1900m 长边会让放置只有 1 个锚点，整条街正面永远放不出）。三重剔除保留（走廊 / block 凸多边形 + 凸包 / 地图边界）；树资产仅 3 种，按可用集合抽样
