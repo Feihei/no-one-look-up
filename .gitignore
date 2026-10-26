@@ -16,6 +16,9 @@
 /examples/_stats.rs
 /image*.png
 
+# Local save files (player runtime data)
+/saves/
+
 # OS
 .DS_Store
 Thumbs.db
