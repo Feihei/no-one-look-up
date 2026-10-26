@@ -8,7 +8,7 @@
 //! block edge thinner than one frame's step.
 //!
 //! Design constraints (ADR-0001) that shape this module:
-//! - First person, forever looking up: pitch is clamped to 40-60°.
+//! - First person, forever looking up: pitch is clamped to 22.55-60°.
 //! - The body turns with A/D at a fixed rate; the camera adds a small ±10°
 //!   yaw offset so glancing sideways never turns the body.
 //! - No jump, no sprint, no FOV change; walking speed 1.2-2.0 m/s adjustable
@@ -36,12 +36,12 @@ pub const ACCELERATION: f32 = 8.0;
 pub const TURN_SPEED_DEG: f32 = 60.0;
 /// Mouse sensitivity (original `mouse_sensitivity`, degrees per pixel).
 pub const MOUSE_SENSITIVITY: f32 = 0.15;
-/// Pitch is clamped to looking up between 10° below the horizon and 60° up.
-/// The golden-hour opening still fills the view with sky (default 60°), but
-/// the player can look down far enough to actually see the streets and trees:
-/// an 11 m tree 20-50 m away only subtends 10-25° above the horizon, so a
-/// strict 40° floor put the whole world outside the frame.
-pub const MIN_PITCH_DEG: f32 = -10.0;
+/// Pitch is clamped to looking up between 22.55° and 60°. The floor is the
+/// lowest angle at which the horizon is just visible without any ground:
+/// the bottom edge of the frame (Bevy default 45° vertical FOV) then grazes
+/// the horizon line, which dips only 0.041° below level at a 1.65 m eye
+/// height. Everything in frame is sky/atmosphere; the ground never appears.
+pub const MIN_PITCH_DEG: f32 = 22.55;
 pub const MAX_PITCH_DEG: f32 = 60.0;
 /// Camera yaw offset around the body's facing (degrees, ±).
 pub const MAX_YAW_OFFSET_DEG: f32 = 10.0;
@@ -92,7 +92,7 @@ impl PlayerBody {
     pub fn camera_rotation(&self) -> Quat {
         // Bevy: positive rotation about X tilts forward (-Z) upward, so a
         // positive pitch looks up. (A minus sign here pointed the camera at
-        // the ground despite the clamped 40-60° "looking up" band.)
+        // the ground despite the clamped 22.55-60° "looking up" band.)
         Quat::from_euler(EulerRot::YXZ, self.yaw + self.yaw_offset, self.pitch, 0.0)
     }
 
@@ -113,7 +113,7 @@ pub enum PlayerSystems {
     Move,
 }
 
-/// Mouse look: vertical motion sets pitch (40-60°), horizontal motion sets the
+/// Mouse look: vertical motion sets pitch (22.55-60°), horizontal motion sets the
 /// ±10° camera offset. The body's facing is deliberately untouched, so
 /// glancing at a sky detail never changes the walk direction.
 pub(crate) fn mouse_look(

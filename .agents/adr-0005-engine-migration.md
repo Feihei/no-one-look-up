@@ -34,7 +34,7 @@
 | `global_shader_uniform` | 共享 storage buffer | 见 ADR-0004 第 6 节 |
 | CanvasLayer 代码构建 UI | Bevy UI（em/rem） | 菜单/HUD 用 Bevy UI 代码构建，沿用原 M4 结构 |
 | StaticBody3D + WorldBoundaryShape3D | 移除 | 负形街道模型已取代边界长墙 |
-| CharacterBody3D 玩家控制器 | 自研运动学控制器 | 视角钳制（±10°/40–60°）、速度 1.2–2.0 m/s 可调 |
+| CharacterBody3D 玩家控制器 | 自研运动学控制器 | 视角钳制（±10°/22.55–60°）、速度 1.2–2.0 m/s 可调 |
 | .blend/.tscn 资产 | glTF（.glb） | 树与建筑模型统一 glTF 导出链路 |
 | 调试可视化（F 键 tilemap） | Bevy Gizmos | Block 分布/合并规模/碰撞范围可视化保留 |
 | JSON 存档（user://saves） | serde JSON（本地存档目录） | 结构不变：seed+size+season+explored+player_pose |
