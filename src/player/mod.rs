@@ -113,9 +113,9 @@ pub enum PlayerSystems {
     Move,
 }
 
-/// Mouse look: vertical motion sets pitch (22.55-60°), horizontal motion sets the
-/// ±10° camera offset. The body's facing is deliberately untouched, so
-/// glancing at a sky detail never changes the walk direction.
+/// Mouse look: only vertical motion, setting pitch (22.55-60°). Horizontal
+/// mouse motion is ignored — turning is keyboard-only (A/D), so the mouse
+/// never changes facing or walk direction.
 pub(crate) fn mouse_look(
     phase: Res<crate::core::game_state::GamePhase>,
     mut motion: MessageReader<MouseMotion>,
@@ -147,10 +147,9 @@ pub(crate) fn mouse_look(
     let Ok(mut body) = players.single_mut() else {
         return;
     };
-    // Screen-up (negative y) raises the view.
+    // Screen-up (negative y) raises the view. Horizontal motion is ignored:
+    // turning is keyboard-only.
     body.pitch = PlayerBody::clamp_pitch(body.pitch - delta.y * MOUSE_SENSITIVITY.to_radians());
-    body.yaw_offset =
-        PlayerBody::clamp_yaw_offset(body.yaw_offset - delta.x * MOUSE_SENSITIVITY.to_radians());
 }
 
 /// Speed adjustment (E/Q) and cursor capture toggle (Esc), in the original's
