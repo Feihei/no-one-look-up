@@ -9,13 +9,11 @@ pub mod save;
 pub mod save_data;
 pub mod season;
 pub mod sky;
-// R3.9: the F7 gallery is retired. It was a one-shot snapshot pinned where the
-// player stood, so walking away left it behind and it needed two F7 presses to
-// rebuild — which read as "trees don't stream with chunks". World trees now
-// come from chunk content (`world::chunks` + `world::tree_mesh`). The module
-// is kept out of the build; `examples/tree_gallery.rs` is the shape reference.
-#[cfg(any())]
-pub mod tree_preview;
+// R3.9: the F7 tree gallery is gone. It was a one-shot snapshot pinned where
+// the player stood, so walking away left it behind and it needed two F7 presses
+// to rebuild — which read as "trees don't stream with chunks". World trees now
+// come from chunk content (`world::chunks` + `world::tree_mesh`), and the
+// silhouette study lives in `examples/tree_gallery.rs`.
 pub mod world;
 
 pub use sky::GoldenHourCamera;
