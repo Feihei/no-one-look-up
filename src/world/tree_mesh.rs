@@ -19,6 +19,7 @@
 //! geometry.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::VisibilityRange;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
 
@@ -36,6 +37,94 @@ const BLOB_SUBDIVISIONS: u32 = 0;
 /// Branches thinner than this (m) are dropped from the bake: at any walking
 /// distance they are sub-pixel, and the finest twigs are ~40% of all parts.
 const MIN_BAKED_RADIUS: f32 = 0.035;
+
+/// How much detail a baked mesh keeps.
+///
+/// Foliage dominates the triangle count (measured: ~85-90% of a tree — 183
+/// clusters of 20 faces against ~930 triangles of branch), so the tiers differ
+/// mostly in how many leaf clusters survive. A dusk silhouette is a flat dark
+/// shape, so dropping clusters and detail costs little visually while cutting
+/// the frame cost of the far field sharply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TreeLod {
+    /// Full detail: every branch and every leaf cluster.
+    Near,
+    /// Coarser foliage: the crown keeps its shape but carries fewer vblobs,
+    /// and thin branches are dropped.
+    Mid,
+    /// A handful of big blobs: at this distance the crown is a smudge.
+    Far,
+}
+
+impl TreeLod {
+    /// Tiers in draw order, nearest first.
+    pub const ALL: [TreeLod; 3] = [TreeLod::Near, TreeLod::Mid, TreeLod::Far];
+
+    /// Where this tier takes over from the previous one, in metres from the
+    /// camera. The last entry is where trees disappear entirely.
+    ///
+    /// 40 m / 110 m / 220 m: `CHUNK_AHEAD` is 4 chunks (200 m), so the far
+    /// tier only ever covers the last stretch the player can see. Close enough
+    /// to the walk that the crown still reads, far enough that a 1.2-2.0 m/s
+    /// walker sees the swap rarely.
+    pub const BOUNDARIES: [f32; 4] = [0.0, 40.0, 110.0, 220.0];
+
+    /// The visibility range for this tier, or `None` for `Near` (visible from
+    /// 0 m, which `VisibilityRange` expresses as an open start).
+    pub fn range(self) -> VisibilityRange {
+        let index = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        VisibilityRange::abrupt(Self::BOUNDARIES[index], Self::BOUNDARIES[index + 1])
+    }
+
+    /// Smallest branch radius kept at this tier (m).
+    fn min_branch_radius(self) -> f32 {
+        match self {
+            TreeLod::Near => MIN_BAKED_RADIUS,
+            // Mid drops twigs entirely: at 40 m+ a 3.5 cm twig is under a
+            // pixel and its branch geometry was only carrying the crown's
+            // inner structure, which the blobs occlude anyway.
+            TreeLod::Mid => 0.06,
+            TreeLod::Far => f32::INFINITY,
+        }
+    }
+
+    /// Icosphere subdivisions for leaf blobs at this tier.
+    fn blob_subdivisions(self) -> u32 {
+        match self {
+            TreeLod::Near | TreeLod::Mid => BLOB_SUBDIVISIONS,
+            TreeLod::Far => 0,
+        }
+    }
+
+    /// Keep every `n`th leaf cluster (1 = all).
+    fn blob_stride(self) -> usize {
+        match self {
+            TreeLod::Near => 1,
+            TreeLod::Mid => 3,
+            TreeLod::Far => 14,
+        }
+    }
+
+    /// Blobs below this radius (m) are dropped; keeps the big crown masses and
+    /// discards the small filler.
+    fn min_blob_radius(self) -> f32 {
+        match self {
+            TreeLod::Near => 0.0,
+            TreeLod::Mid => 0.30,
+            TreeLod::Far => 0.0,
+        }
+    }
+
+    /// Fatten the surviving blobs so the crown still fills its silhouette once
+    /// most of them are gone.
+    fn blob_scale(self) -> f32 {
+        match self {
+            TreeLod::Near => 1.0,
+            TreeLod::Mid => 1.18,
+            TreeLod::Far => 1.55,
+        }
+    }
+}
 
 /// Which skeleton to bake: species (index into [`TREE_PROFILES`]) and a
 /// per-species variation id.
@@ -81,23 +170,35 @@ pub fn silhouette_material() -> StandardMaterial {
 
 /// Grows the skeleton behind `key` and bakes it into one mesh.
 pub fn bake_tree_mesh(key: TreeMeshKey) -> Mesh {
+    bake_tree_mesh_lod(key, TreeLod::Near)
+}
+
+/// [`bake_tree_mesh`] at a specific detail tier.
+pub fn bake_tree_mesh_lod(key: TreeMeshKey, lod: TreeLod) -> Mesh {
     let profile = TREE_PROFILES
         .get(key.species as usize)
         .copied()
         .unwrap_or(TREE_PROFILES[0]);
     // Deliberately a fixed gallery seed: a tree's SHAPE must not depend on
-    // world position, or the mesh cache would miss on every chunk.
+    // world position, or the mesh cache would miss on every chunk. It also
+    // keeps every LOD of one tree the same tree.
     let skeleton = grow_tree(
         crate::world::tree_shape::TREE_SHAPE_SEED,
         key.species,
         key.variant as u64,
     );
-    bake_skeleton(&skeleton, &profile)
+    bake_skeleton_lod(&skeleton, &profile, lod)
 }
 
 /// Merges every branch and leaf cluster of `skeleton` into one mesh.
 pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> Mesh {
+    bake_skeleton_lod(skeleton, profile, TreeLod::Near)
+}
+
+/// [`bake_skeleton`] at a specific detail tier.
+pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: TreeLod) -> Mesh {
     let mut merged: Option<Mesh> = None;
+    let min_branch = lod.min_branch_radius();
 
     for branch in &skeleton.branches {
         let start = Vec3::from_array(branch.start);
@@ -108,7 +209,7 @@ pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> Mesh {
         if length < 1e-3 {
             continue;
         }
-        if branch.radius < MIN_BAKED_RADIUS {
+        if branch.radius < min_branch {
             continue;
         }
         let radius = branch.radius;
@@ -129,17 +230,30 @@ pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> Mesh {
         merge_into(&mut merged, placed);
     }
 
-    for foliage in &skeleton.foliage {
-        let blob = SphereMeshBuilder::new(
-            1.0,
-            SphereKind::Ico {
-                subdivisions: BLOB_SUBDIVISIONS,
-            },
-        )
-        .build()
-        .transformed_by(
+    // Foliage: keep every `stride`th cluster and drop the small filler. The
+    // stride walk is deterministic (index order), so each tier stays a stable
+    // subset of the same crown rather than a re-randomised one.
+    let stride = lod.blob_stride();
+    let min_blob = lod.min_blob_radius();
+    let blob_scale = lod.blob_scale();
+    let blob_template = SphereMeshBuilder::new(
+        1.0,
+        SphereKind::Ico {
+            subdivisions: lod.blob_subdivisions(),
+        },
+    )
+    .build();
+
+    for (index, foliage) in skeleton.foliage.iter().enumerate() {
+        if index % stride != 0 {
+            continue;
+        }
+        if foliage.radius < min_blob {
+            continue;
+        }
+        let blob = blob_template.clone().transformed_by(
             Transform::from_translation(Vec3::from_array(foliage.center))
-                .with_scale(Vec3::splat(foliage.radius.max(0.02))),
+                .with_scale(Vec3::splat((foliage.radius * blob_scale).max(0.02))),
         );
         merge_into(&mut merged, blob);
     }
@@ -201,6 +315,83 @@ mod tests {
             assert!(
                 tri_count < 20_000,
                 "species {species}: {tri_count} triangles per tree is too heavy"
+            );
+        }
+    }
+
+    #[test]
+    fn lod_tiers_actually_get_cheaper() {
+        // The whole point of the tiers: each must cost strictly less than the
+        // one before it, by a margin worth the extra entities. A "LOD" that
+        // loses 5% of the triangles is just three copies of the same tree.
+        let tri_count = |m: &Mesh| match m.indices() {
+            Some(Indices::U32(i)) => i.len() / 3,
+            Some(Indices::U16(i)) => i.len() / 3,
+            None => 0,
+        };
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let key = TreeMeshKey {
+                species,
+                variant: 0,
+            };
+            let near = tri_count(&bake_tree_mesh_lod(key, TreeLod::Near));
+            let mid = tri_count(&bake_tree_mesh_lod(key, TreeLod::Mid));
+            let far = tri_count(&bake_tree_mesh_lod(key, TreeLod::Far));
+            assert!(
+                near > 0 && mid > 0 && far > 0,
+                "species {species}: empty LOD"
+            );
+            assert!(
+                mid < near * 3 / 4,
+                "species {species}: mid tier keeps {mid}/{near} triangles, not a real reduction"
+            );
+            assert!(
+                far < mid / 2,
+                "species {species}: far tier keeps {far}/{mid} triangles"
+            );
+        }
+    }
+
+    #[test]
+    fn lod_ranges_tile_the_distances_without_gaps_or_overlap() {
+        // A gap would make trees vanish at some distance; an overlap would
+        // draw two tiers at once. Both are silent in a screenshot.
+        for pair in TreeLod::ALL.windows(2) {
+            let (lower, upper) = (pair[0], pair[1]);
+            let a = lower.range();
+            let b = upper.range();
+            assert_eq!(
+                a.end_margin.end, b.start_margin.start,
+                "{lower:?} ends at {} but {upper:?} starts at {}",
+                a.end_margin.end, b.start_margin.start
+            );
+        }
+        // Near starts at the camera.
+        let near = TreeLod::ALL[0].range();
+        assert_eq!(near.start_margin.start, 0.0);
+
+        // Exactly one tier is visible at any distance up to the cull point.
+        for distance in [0.0, 1.0, 39.9, 40.0, 109.9, 110.0, 219.9] {
+            let visible: Vec<TreeLod> = TreeLod::ALL
+                .iter()
+                .copied()
+                .filter(|lod| !lod.range().is_culled(distance))
+                .collect();
+            assert_eq!(
+                visible.len(),
+                1,
+                "{distance} m: {visible:?} are all visible at once"
+            );
+        }
+
+        // Beyond the last boundary nothing is drawn: the tree is culled
+        // rather than left at full cost out to the horizon.
+        for distance in [220.0, 500.0] {
+            assert!(
+                TreeLod::ALL
+                    .iter()
+                    .all(|lod| lod.range().is_culled(distance)),
+                "{distance} m: a tier is still visible past the cull distance"
             );
         }
     }

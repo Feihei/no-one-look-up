@@ -20,7 +20,7 @@ use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::placement;
-use crate::world::tree_mesh::{self, TreeMeshKey, bake_tree_mesh};
+use crate::world::tree_mesh::{self, TreeLod, TreeMeshKey, bake_tree_mesh_lod};
 use crate::world::tree_shape::TREE_PROFILES;
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
 
@@ -310,10 +310,10 @@ pub(crate) struct PlacementAssets {
     /// state beyond the bucket switch (R3.6).
     building_materials: [[Handle<StandardMaterial>; placement::WEAR_BUCKETS]; 3],
     plaza_material: Handle<StandardMaterial>,
-    /// One baked mesh per `(species, variant)` (R3.9): a whole tree in a
-    /// single `Mesh3d`, so a chunk costs one entity per tree instead of one
-    /// per branch and leaf cluster. Indices follow
-    /// `species * TreeMeshKey::VARIANTS + variant`.
+    /// One baked mesh per `(lod, species, variant)` (R3.9): a whole tree in a
+    /// single `Mesh3d`, so a chunk costs one entity per tree per LOD tier.
+    /// Indices follow `lod * TreeMeshKey::VARIANTS * TREE_PROFILES.len() +
+    /// species * TreeMeshKey::VARIANTS + variant`.
     tree_meshes: Vec<Handle<Mesh>>,
     /// Shared near-black silhouette material for every procedural tree.
     tree_material: Handle<StandardMaterial>,
@@ -324,10 +324,14 @@ pub(crate) struct PlacementAssets {
 }
 
 impl PlacementAssets {
-    /// Baked mesh for a placement tree instance, or `None` if out of range.
-    fn tree_mesh(&self, asset: u8, wear: f32) -> Option<&Handle<Mesh>> {
+    /// Baked mesh for a placement tree instance at one LOD tier, or `None` if
+    /// out of range.
+    fn tree_mesh(&self, asset: u8, wear: f32, lod: TreeLod) -> Option<&Handle<Mesh>> {
         let key = crate::world::tree_mesh::TreeMeshKey::from_placement(asset, wear);
-        let index = key.species as usize * crate::world::tree_mesh::TreeMeshKey::VARIANTS as usize
+        let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
+        let tier = TreeLod::ALL.iter().position(|t| *t == lod)?;
+        let index = tier * per_lod
+            + key.species as usize * TreeMeshKey::VARIANTS as usize
             + key.variant as usize;
         self.tree_meshes.get(index)
     }
@@ -384,18 +388,23 @@ fn build_placement_assets(
     // R3.9: trees are procedural, baked to one mesh per (species, variant).
     // 3 species x 4 variants = 12 meshes for the whole world, reused by every
     // chunk that spawns a tree.
-    let mut tree_meshes = Vec::with_capacity(TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize);
-    for species in 0..TREE_PROFILES.len() as u8 {
-        for variant in 0..TreeMeshKey::VARIANTS {
-            tree_meshes.push(meshes.add(bake_tree_mesh(TreeMeshKey { species, variant })));
+    let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
+    let mut tree_meshes = Vec::with_capacity(per_lod * TreeLod::ALL.len());
+    for lod in TreeLod::ALL {
+        for species in 0..TREE_PROFILES.len() as u8 {
+            for variant in 0..TreeMeshKey::VARIANTS {
+                tree_meshes
+                    .push(meshes.add(bake_tree_mesh_lod(TreeMeshKey { species, variant }, lod)));
+            }
         }
     }
     let tree_material = materials.add(tree_mesh::silhouette_material());
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
     info!(
-        "placement assets built: {} tree meshes, {} building materials",
+        "placement assets built: {} tree meshes ({} LODs), {} building materials",
         tree_meshes.len(),
+        TreeLod::ALL.len(),
         building_materials.len()
     );
     commands.insert_resource(PlacementAssets {
@@ -457,22 +466,38 @@ fn spawn_chunk_content(
                 });
             }
             _ => {
-                // Trees (street/forest/plaza): one baked mesh for the whole
-                // tree (R3.9), so a chunk spawns one entity per tree.
+                // Trees (street/forest/plaza): one baked mesh per LOD tier
+                // (R3.9 step 4). All three sit at the same place; each carries
+                // a `VisibilityRange` so exactly one is drawn at any camera
+                // distance. Foliage is ~85-90% of a tree, so the tiers differ
+                // mostly in how many leaf clusters survive: measured 2952
+                // triangles near, 1238 mid (-58%), 183 far (-94%).
                 let Some(tree) = object.tree else { continue };
-                let Some(mesh) = assets.tree_mesh(tree.asset, object.wear) else {
-                    continue;
-                };
-                let mesh = mesh.clone();
+                let transform = Transform::from_xyz(object.position.x, 0.0, object.position.y)
+                    .with_rotation(Quat::from_rotation_y(tree.yaw))
+                    .with_scale(Vec3::splat(tree.scale));
+
                 commands.entity(root).with_children(|parent| {
-                    parent.spawn((
-                        Name::new("Tree"),
-                        Mesh3d(mesh),
-                        MeshMaterial3d(assets.tree_material.clone()),
-                        Transform::from_xyz(object.position.x, 0.0, object.position.y)
-                            .with_rotation(Quat::from_rotation_y(tree.yaw))
-                            .with_scale(Vec3::splat(tree.scale)),
-                    ));
+                    for lod in TreeLod::ALL {
+                        let Some(mesh) = assets.tree_mesh(tree.asset, object.wear, lod) else {
+                            continue;
+                        };
+                        let mut entity = parent.spawn((
+                            Name::new(match lod {
+                                TreeLod::Near => "Tree",
+                                TreeLod::Mid => "TreeMid",
+                                TreeLod::Far => "TreeFar",
+                            }),
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(assets.tree_material.clone()),
+                            transform,
+                        ));
+                        // The near tier has nothing to fade from, so it needs
+                        // no range component at all.
+                        if lod != TreeLod::Near {
+                            entity.insert(lod.range());
+                        }
+                    }
                 });
             }
         }
@@ -699,6 +724,78 @@ mod tests {
             unplaced.len(),
             &unplaced[..unplaced.len().min(5)]
         );
+    }
+
+    #[test]
+    fn every_tree_spawns_all_lod_tiers_with_ranges() {
+        // LOD is wired per entity, and a missing tier is invisible: the tree
+        // simply vanishes between two boundaries. Assert the structure, not
+        // that "a tree exists".
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+        for _ in 0..30 {
+            app.update();
+        }
+
+        let count = |app: &mut App, name: &'static str| -> usize {
+            let mut query = app.world_mut().query::<&Name>();
+            query
+                .iter(app.world())
+                .filter(|n| n.as_str() == name)
+                .count()
+        };
+        let near = count(&mut app, "Tree");
+        let mid = count(&mut app, "TreeMid");
+        let far = count(&mut app, "TreeFar");
+        assert!(near > 0, "no trees spawned");
+        assert_eq!(near, mid, "every tree needs a mid tier");
+        assert_eq!(near, far, "every tree needs a far tier");
+
+        // The two distant tiers must carry ranges, and they must be the ones
+        // the LOD table defines.
+        for (name, expected) in [("TreeMid", TreeLod::Mid), ("TreeFar", TreeLod::Far)] {
+            let mut query = app
+                .world_mut()
+                .query::<(&Name, Option<&bevy::camera::visibility::VisibilityRange>)>();
+            let mut checked = 0usize;
+            for (entity_name, range) in query.iter(app.world()) {
+                if entity_name.as_str() != name {
+                    continue;
+                }
+                let range = range.unwrap_or_else(|| panic!("{name} has no VisibilityRange"));
+                // `VisibilityRange` has no Debug impl, so compare the parts.
+                let want = expected.range();
+                assert!(
+                    range.start_margin.start == want.start_margin.start
+                        && range.end_margin.end == want.end_margin.end,
+                    "{name} carries the wrong visibility range ({:?}-{:?}, expected {:?}-{:?})",
+                    range.start_margin.start,
+                    range.end_margin.end,
+                    want.start_margin.start,
+                    want.end_margin.end
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, near, "{name} is missing on some trees");
+        }
+
+        // The near tier deliberately has no range (it is visible from 0 m and
+        // `VisibilityRange` cannot express an open start).
+        let mut query = app
+            .world_mut()
+            .query::<(&Name, Option<&bevy::camera::visibility::VisibilityRange>)>();
+        for (entity_name, range) in query.iter(app.world()) {
+            if entity_name.as_str() == "Tree" {
+                assert!(range.is_none(), "the near tier must not be range-gated");
+            }
+        }
     }
 
     #[test]
