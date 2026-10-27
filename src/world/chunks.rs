@@ -20,6 +20,8 @@ use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::placement;
+use crate::world::tree_mesh::{self, TreeMeshKey, bake_tree_mesh};
+use crate::world::tree_shape::TREE_PROFILES;
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
 
 /// Default seed until the R4 menu provides one (dev builds).
@@ -239,6 +241,14 @@ pub(crate) fn update_chunk_streaming(
                 Name::new(format!("Chunk({}, {})", coords.x, coords.z)),
                 ChunkRoot,
                 coords,
+                // A parent WITHOUT `Transform`/`Visibility` breaks hierarchy
+                // propagation for every child: the ground tile, the buildings
+                // and the trees all lost their `GlobalTransform` and rendered
+                // nothing (while the gizmo overlay, which does not go through
+                // the hierarchy, kept drawing). Bevy warns B0004 once per
+                // child; the log showed 1120 of them.
+                Transform::default(),
+                Visibility::default(),
             ))
             .id();
         // Ground tile: real streaming feedback; placement content follows.
@@ -266,16 +276,25 @@ pub(crate) fn update_chunk_streaming(
             collision.register_chunk(graph, key);
             // R3 placement: plan this chunk's buildings/trees and spawn them
             // under the chunk root, so despawning the root removes them all.
+            if assets.is_none() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    error!(
+                        "chunk {key:?} streamed with NO PlacementAssets: no buildings, no trees"
+                    );
+                });
+            }
             if let Some(assets) = assets.as_deref() {
                 let plan = placement::plan_chunk(
                     graph,
                     seed_value,
                     key,
-                    assets.tree_scenes.len().min(u8::MAX as usize) as u8,
+                    // Procedural trees: the planner samples a SPECIES index.
+                    TREE_PROFILES.len() as u8,
                 );
-                if let Some(meshes) = meshes.as_deref_mut() {
-                    spawn_chunk_content(&mut commands, meshes, assets, root, &plan);
-                }
+                // Trees/buildings use the shared handles in `assets`, so
+                // streaming needs no `Assets<Mesh>` access at all.
+                spawn_chunk_content(&mut commands, assets, root, &plan);
             }
         }
         manager.active.insert(key, root);
@@ -291,20 +310,28 @@ pub(crate) struct PlacementAssets {
     /// state beyond the bucket switch (R3.6).
     building_materials: [[Handle<StandardMaterial>; placement::WEAR_BUCKETS]; 3],
     plaza_material: Handle<StandardMaterial>,
-    /// Preloaded glTF scene handles (`aspen_1` / `tree_2` / `tree_3`;
-    /// tree_3_1 / tree_3_3 arrive when their .blend files do — dev-plan
-    /// R0.5). Each loads the glTF's default scene via its `Scene(0)` label:
-    /// the glTF loader produces a `Gltf` asset, not a raw `WorldAsset`, so
-    /// loading the .glb path directly as `WorldAsset` finds no loader.
-    tree_scenes: Vec<Handle<bevy::world_serialization::WorldAsset>>,
+    /// One baked mesh per `(species, variant)` (R3.9): a whole tree in a
+    /// single `Mesh3d`, so a chunk costs one entity per tree instead of one
+    /// per branch and leaf cluster. Indices follow
+    /// `species * TreeMeshKey::VARIANTS + variant`.
+    tree_meshes: Vec<Handle<Mesh>>,
+    /// Shared near-black silhouette material for every procedural tree.
+    tree_material: Handle<StandardMaterial>,
+    /// One unit cube reused by every building and plaza pad; each instance
+    /// scales it. Buildings used to call `meshes.add(Cuboid)` per object,
+    /// which allocated a new mesh every time a chunk streamed in.
+    unit_cube: Handle<Mesh>,
 }
 
-/// The tree model paths, indexed by placement `asset` id.
-const TREE_MODEL_PATHS: [&str; 3] = [
-    "models/aspen_1.glb",
-    "models/tree_2.glb",
-    "models/tree_3.glb",
-];
+impl PlacementAssets {
+    /// Baked mesh for a placement tree instance, or `None` if out of range.
+    fn tree_mesh(&self, asset: u8, wear: f32) -> Option<&Handle<Mesh>> {
+        let key = crate::world::tree_mesh::TreeMeshKey::from_placement(asset, wear);
+        let index = key.species as usize * crate::world::tree_mesh::TreeMeshKey::VARIANTS as usize
+            + key.variant as usize;
+        self.tree_meshes.get(index)
+    }
+}
 
 /// Builds the placement assets on first chunk spawn (lazy: `Mesh3d` handles
 /// need the render `Assets` stores, which headless tests do not run).
@@ -312,13 +339,23 @@ fn build_placement_assets(
     mut commands: Commands,
     meshes: Option<ResMut<Assets<Mesh>>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
-    server: Option<Res<AssetServer>>,
+    existing: Option<Res<PlacementAssets>>,
 ) {
-    // Headless tests run without the asset plugins: no server, no placement
-    // assets (plan_chunk still works, trees just stay disabled).
-    let (Some(_meshes), Some(mut materials), Some(server)) = (meshes, materials, server) else {
-        // Headless tests run without the asset plugins: no placement assets
-        // (plan_chunk still works, trees just stay disabled).
+    // Build ONCE. This system used to run every frame with no guard: it baked
+    // 12 tree meshes, rebuilt every building material and replaced the
+    // `PlacementAssets` resource each frame. Measured over 240 frames: meshes
+    // 13 -> 3242, materials 15 -> 3411, all leaked — and every chunk kept
+    // handles to a resource that was already gone.
+    if existing.is_some() {
+        return;
+    }
+    // Headless tests run without the render assets stores; placement content
+    // stays disabled for them (plan_chunk still works).
+    //
+    // R3.9: no `AssetServer` needed any more. Trees are baked procedurally
+    // from `tree_shape`, not loaded from glTF — which also means the world
+    // gets trees in a headless test, so streaming is actually testable.
+    let (Some(mut meshes), Some(mut materials)) = (meshes, materials) else {
         return;
     };
     let palette = placement::StylePalette::default();
@@ -344,14 +381,29 @@ fn build_placement_assets(
         style_wear(palette.factory),
     ];
     let plaza_material = wear_color(palette.plaza, 1);
-    let tree_scenes: Vec<_> = TREE_MODEL_PATHS
-        .iter()
-        .map(|p| server.load(GltfAssetLabel::Scene(0).from_asset(*p)))
-        .collect();
+    // R3.9: trees are procedural, baked to one mesh per (species, variant).
+    // 3 species x 4 variants = 12 meshes for the whole world, reused by every
+    // chunk that spawns a tree.
+    let mut tree_meshes = Vec::with_capacity(TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize);
+    for species in 0..TREE_PROFILES.len() as u8 {
+        for variant in 0..TreeMeshKey::VARIANTS {
+            tree_meshes.push(meshes.add(bake_tree_mesh(TreeMeshKey { species, variant })));
+        }
+    }
+    let tree_material = materials.add(tree_mesh::silhouette_material());
+    let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+
+    info!(
+        "placement assets built: {} tree meshes, {} building materials",
+        tree_meshes.len(),
+        building_materials.len()
+    );
     commands.insert_resource(PlacementAssets {
         building_materials,
         plaza_material,
-        tree_scenes,
+        tree_meshes,
+        tree_material,
+        unit_cube,
     });
 }
 
@@ -361,7 +413,6 @@ fn build_placement_assets(
 /// a chunk's contents exist in the same frame its collision is registered.
 fn spawn_chunk_content(
     commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
     assets: &PlacementAssets,
     root: Entity,
     plan: &placement::ChunkPlan,
@@ -376,7 +427,7 @@ fn spawn_chunk_content(
                 };
                 let material =
                     &assets.building_materials[style][placement::wear_bucket(object.wear)];
-                let mesh = meshes.add(Cuboid::new(object.size.x, object.size.y, object.size.z));
+                let mesh = assets.unit_cube.clone();
                 let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
                 let rotation = Quat::from_rotation_y(object.yaw);
                 commands.entity(root).with_children(|parent| {
@@ -387,35 +438,37 @@ fn spawn_chunk_content(
                         )),
                         Mesh3d(mesh),
                         MeshMaterial3d(material.clone()),
-                        Transform::from_translation(position).with_rotation(rotation),
+                        Transform::from_translation(position)
+                            .with_rotation(rotation)
+                            .with_scale(object.size),
                     ));
                 });
             }
             placement::PlacedKind::PlazaPad => {
-                let mesh = meshes.add(Cuboid::new(object.size.x, object.size.y, object.size.z));
+                let mesh = assets.unit_cube.clone();
                 let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
                 commands.entity(root).with_children(|parent| {
                     parent.spawn((
                         Name::new("PlazaPad"),
                         Mesh3d(mesh),
                         MeshMaterial3d(assets.plaza_material.clone()),
-                        Transform::from_translation(position),
+                        Transform::from_translation(position).with_scale(object.size),
                     ));
                 });
             }
             _ => {
-                // Trees (street/forest/plaza): the glTF scene root. The
-                // loader spawns the whole model, so the transform applies to
-                // the instance.
+                // Trees (street/forest/plaza): one baked mesh for the whole
+                // tree (R3.9), so a chunk spawns one entity per tree.
                 let Some(tree) = object.tree else { continue };
-                let Some(scene) = assets.tree_scenes.get(tree.asset as usize) else {
+                let Some(mesh) = assets.tree_mesh(tree.asset, object.wear) else {
                     continue;
                 };
-                let scene = scene.clone();
+                let mesh = mesh.clone();
                 commands.entity(root).with_children(|parent| {
                     parent.spawn((
                         Name::new("Tree"),
-                        bevy::world_serialization::WorldAssetRoot(scene),
+                        Mesh3d(mesh),
+                        MeshMaterial3d(assets.tree_material.clone()),
                         Transform::from_xyz(object.position.x, 0.0, object.position.y)
                             .with_rotation(Quat::from_rotation_y(tree.yaw))
                             .with_scale(Vec3::splat(tree.scale)),
@@ -596,6 +649,226 @@ mod tests {
         }
         let manager = app.world().resource::<ChunkManager>();
         assert_eq!(manager.active.len(), expected, "active set should converge");
+    }
+
+    #[test]
+    fn chunk_root_can_propagate_transforms_to_its_children() {
+        // Regression: `ChunkRoot` was spawned with only `Name`/`ChunkRoot`/
+        // `coords`, so the hierarchy had a parent without `Transform`. Every
+        // child (ground tile, buildings, trees) failed to receive a
+        // `GlobalTransform` and rendered nothing — while the gizmo overlay,
+        // which bypasses the hierarchy, kept drawing. Bevy logged B0004 once
+        // per child: 1120 of them in a 25 s run.
+        //
+        // The whole rendered world hangs off these roots, so assert the parent
+        // can actually carry a transform rather than just checking a count.
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+        for _ in 0..30 {
+            app.update();
+        }
+
+        let mut roots = app
+            .world_mut()
+            .query_filtered::<Entity, (With<ChunkRoot>, Without<Transform>)>();
+        let missing: Vec<Entity> = roots.iter(app.world()).collect();
+        assert!(
+            missing.is_empty(),
+            "{} chunk roots have no Transform; their children cannot be placed              in the world and will not render",
+            missing.len()
+        );
+
+        // And the children really do have a GlobalTransform after propagation.
+        let mut children = app
+            .world_mut()
+            .query_filtered::<&Name, (Without<GlobalTransform>, With<ChildOf>)>();
+        let unplaced: Vec<String> = children
+            .iter(app.world())
+            .map(|n| n.as_str().to_string())
+            .collect();
+        assert!(
+            unplaced.is_empty(),
+            "{} children never got a GlobalTransform, e.g. {:?}",
+            unplaced.len(),
+            &unplaced[..unplaced.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn placement_assets_and_meshes_are_allocated_once() {
+        // Regression: `build_placement_assets` ran every frame with no guard.
+        // It re-baked 12 tree meshes, rebuilt every building material and
+        // replaced the `PlacementAssets` resource each frame — measured over
+        // 240 frames: meshes 13 -> 3242, materials 15 -> 3411. Buildings also
+        // allocated a fresh `Cuboid` per object on every chunk load.
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+
+        for _ in 0..60 {
+            app.update();
+        }
+        let meshes_after_warmup = app.world().resource::<Assets<Mesh>>().len();
+        let materials_after_warmup = app.world().resource::<Assets<StandardMaterial>>().len();
+
+        // Run a lot more frames with no world change: nothing may be
+        // allocated.
+        for _ in 0..120 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<Assets<Mesh>>().len(),
+            meshes_after_warmup,
+            "mesh assets grow every frame; the placement assets are being rebuilt"
+        );
+        assert_eq!(
+            app.world().resource::<Assets<StandardMaterial>>().len(),
+            materials_after_warmup,
+            "material assets grow every frame"
+        );
+    }
+
+    #[test]
+    fn procedural_trees_stream_with_their_chunks() {
+        // R3.9 regression: the first tree implementation was a one-shot debug
+        // gallery pinned at a fixed spot, so walking away left the world
+        // treeless until the player toggled it off and on again. Trees must
+        // be part of chunk content and despawn with their chunk root.
+        use bevy::mesh::Indices;
+        use bevy::prelude::Mesh3d;
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+
+        // `build_placement_assets` runs in PreUpdate; the first update brings
+        // up the layout, later ones stream chunks in.
+        for _ in 0..12 {
+            app.update();
+        }
+
+        let trees_near = count_tree_entities(&mut app);
+        assert!(
+            trees_near > 0,
+            "no procedural trees spawned around the spawn point"
+        );
+
+        // Every tree must be a single baked mesh, not one entity per branch.
+        let single_mesh_trees = {
+            let mut query = app.world_mut().query::<(&Mesh3d, &Name)>();
+            query
+                .iter(app.world())
+                .filter(|(_, name)| name.as_str() == "Tree")
+                .count()
+        };
+        assert_eq!(
+            single_mesh_trees, trees_near,
+            "each tree should be exactly one Mesh3d entity"
+        );
+
+        // Baked trees must be real geometry (a shared handle could still be
+        // an empty mesh if the bake silently failed).
+        {
+            let handle = {
+                let mut query = app.world_mut().query::<&Mesh3d>();
+                query
+                    .iter(app.world())
+                    .next()
+                    .map(|m| m.0.clone())
+                    .expect("a tree mesh handle")
+            };
+            let meshes = app.world().resource::<Assets<Mesh>>();
+            let mesh = meshes.get(&handle).expect("tree mesh exists");
+            let tris = match mesh.indices() {
+                Some(Indices::U32(i)) => i.len() / 3,
+                Some(Indices::U16(i)) => i.len() / 3,
+                None => 0,
+            };
+            assert!(tris > 0, "baked tree mesh is empty");
+        }
+
+        // Teleport far enough that the original chunks leave the window.
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<Camera3d>>();
+        for mut transform in cameras.iter_mut(app.world_mut()) {
+            transform.translation = Vec3::new(CENTER + 300.0, 1.6, CENTER);
+        }
+        for _ in 0..80 {
+            app.update();
+        }
+
+        // The world stays treed at the new location, and no tree survives at
+        // the old one: the tree set follows the player rather than sitting
+        // still like the old gallery.
+        let trees_far = count_tree_entities(&mut app);
+        assert!(
+            trees_far > 0,
+            "no trees after walking away; trees are not streaming with chunks"
+        );
+
+        // Every tree must belong to an ACTIVE chunk root. Counting trees that
+        // merely have a `ChildOf` misses orphans entirely — the earlier
+        // version of this check passed even with trees spawned unparented,
+        // which is exactly the "pinned gallery" failure mode.
+        let manager = app.world().resource::<ChunkManager>();
+        let live_roots: std::collections::HashSet<Entity> =
+            manager.active.values().copied().collect();
+
+        let mut query = app
+            .world_mut()
+            .query::<(&Transform, &Name, Option<&ChildOf>)>();
+        let mut orphaned = 0usize;
+        let mut behind = 0usize;
+        for (transform, name, parent) in query.iter(app.world()) {
+            if name.as_str() != "Tree" {
+                continue;
+            }
+            match parent {
+                Some(parent) if live_roots.contains(&parent.parent()) => {}
+                _ => orphaned += 1,
+            }
+            // Trees left standing in the abandoned half of the map mean the
+            // set is not following the player.
+            if transform.translation.x <= CENTER {
+                behind += 1;
+            }
+        }
+        assert_eq!(
+            orphaned, 0,
+            "{orphaned} trees are not attached to an active chunk root"
+        );
+        assert_eq!(
+            behind, 0,
+            "{behind} trees are still standing in the abandoned area"
+        );
+    }
+
+    fn count_tree_entities(app: &mut App) -> usize {
+        let mut query = app.world_mut().query::<&Name>();
+        query
+            .iter(app.world())
+            .filter(|name| name.as_str() == "Tree")
+            .count()
     }
 
     #[test]
