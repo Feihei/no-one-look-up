@@ -13,7 +13,8 @@
 //! #           WORLD_MAP_OUT=world_map.png cargo run --example world_map
 //! ```
 //!
-//! Output: `target/world_map.png` (default), 4000x4000 px, 2 px = 1 m, north
+//! Output: `target/world_map.png` (default), 2 px/m so the canvas tracks
+//! `WORLD_SIZE` (800 m -> 1600x1600 px), north
 //! (-Z / row 0) at the top, west (x = 0) at the left.
 //!
 //! Colors:
@@ -30,7 +31,11 @@ use heads_up_bevy::world::layout_graph::{BlockType, NodeKind};
 use heads_up_bevy::world::path_network::generate_world;
 use heads_up_bevy::world::{CELL_SIZE, GRID_CELLS, WORLD_SIZE};
 
-const PX: usize = 4000; // 2 px = 1 m (streets are 6-10 m: need >=2 px/m)
+/// Pixels per metre. 2 px/m keeps 6-10 m streets legible; derived from
+/// `WORLD_SIZE` so resizing the map never leaves the canvas mismatched.
+const PX_PER_M: f32 = 2.0;
+/// Canvas edge in pixels (`2 px/m * WORLD_SIZE`).
+const PX: usize = (PX_PER_M as usize) * (WORLD_SIZE as usize);
 
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
@@ -76,8 +81,8 @@ impl Canvas {
             min_y = min_y.min(p.y);
             max_y = max_y.max(p.y);
         }
-        let y0 = ((min_y * 2.0).floor() as i64).max(0);
-        let y1 = ((max_y * 2.0).ceil() as i64).min(PX as i64 - 1);
+        let y0 = ((min_y * PX_PER_M).floor() as i64).max(0);
+        let y1 = ((max_y * PX_PER_M).ceil() as i64).min(PX as i64 - 1);
         for y in y0..=y1 {
             let sy = (y as f32 + 0.5) * 0.5;
             let mut xs: Vec<f32> = Vec::with_capacity(4);
@@ -94,8 +99,8 @@ impl Canvas {
                 if pair.len() < 2 {
                     continue;
                 }
-                let xa = (pair[0] * 2.0).floor() as i64;
-                let xb = (pair[1] * 2.0).ceil() as i64;
+                let xa = (pair[0] * PX_PER_M).floor() as i64;
+                let xb = (pair[1] * PX_PER_M).ceil() as i64;
                 for x in xa..xb {
                     self.set(x, y, color);
                 }
@@ -105,8 +110,14 @@ impl Canvas {
 
     /// Draws a 1 px line (Bresenham) between two world points.
     fn line(&mut self, a: Vec2, b: Vec2, color: Rgb) {
-        let (mut x0, mut y0) = ((a.x * 2.0).round() as i64, (a.y * 2.0).round() as i64);
-        let (x1, y1) = ((b.x * 2.0).round() as i64, (b.y * 2.0).round() as i64);
+        let (mut x0, mut y0) = (
+            (a.x * PX_PER_M).round() as i64,
+            (a.y * PX_PER_M).round() as i64,
+        );
+        let (x1, y1) = (
+            (b.x * PX_PER_M).round() as i64,
+            (b.y * PX_PER_M).round() as i64,
+        );
         let dx = (x1 - x0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
         let dy = -(y1 - y0).abs();
@@ -141,8 +152,8 @@ impl Canvas {
             for dx in -r..=r {
                 if ((dx * dx + dy * dy) as f32).sqrt() <= radius {
                     self.set(
-                        (center.x * 2.0) as i64 + dx,
-                        (center.y * 2.0) as i64 + dy,
+                        (center.x * PX_PER_M) as i64 + dx,
+                        (center.y * PX_PER_M) as i64 + dy,
                         color,
                     );
                 }
@@ -300,20 +311,20 @@ fn main() {
         }
     }
 
-    // Frame + place reference marks every 250 m (faint).
+    // Frame + place reference marks every 100 m (faint).
     let world = WORLD_SIZE;
     canvas.line(Vec2::ZERO, Vec2::new(world, 0.0), OUTLINE);
     canvas.line(Vec2::new(0.0, world), Vec2::new(world, world), OUTLINE);
     canvas.line(Vec2::ZERO, Vec2::new(0.0, world), OUTLINE);
     canvas.line(Vec2::new(world, 0.0), Vec2::new(world, world), OUTLINE);
     for i in 1..8 {
-        let v = i as f32 * 250.0;
+        let v = i as f32 * 100.0;
         canvas.disc(Vec2::new(v, 0.0 + 4.0), 1.0, NODE);
         canvas.disc(Vec2::new(4.0, v), 1.0, NODE);
     }
 
     match write_png(&out, PX, PX, &canvas.px) {
-        Ok(()) => println!("world map saved to {out} ({PX}x{PX}, 1 px = 1 m)"),
+        Ok(()) => println!("world map saved to {out} ({PX}x{PX}, {PX_PER_M} px = 1 m)"),
         Err(err) => {
             eprintln!("failed to write {out}: {err}");
             std::process::exit(1);
