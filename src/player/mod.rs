@@ -80,14 +80,6 @@ impl PlayerBody {
         pitch.clamp(MIN_PITCH_DEG.to_radians(), MAX_PITCH_DEG.to_radians())
     }
 
-    /// Clamps the camera yaw offset to ±`MAX_YAW_OFFSET_DEG`.
-    fn clamp_yaw_offset(offset: f32) -> f32 {
-        offset.clamp(
-            -MAX_YAW_OFFSET_DEG.to_radians(),
-            MAX_YAW_OFFSET_DEG.to_radians(),
-        )
-    }
-
     /// Camera rotation for the current body/camera angles.
     pub fn camera_rotation(&self) -> Quat {
         // Bevy: positive rotation about X tilts forward (-Z) upward, so a
@@ -266,13 +258,6 @@ mod tests {
         // A value inside the band is untouched.
         let inside = 50f32.to_radians();
         assert!((PlayerBody::clamp_pitch(inside) - inside).abs() < 1e-6);
-    }
-
-    #[test]
-    fn yaw_offset_is_clamped() {
-        let limit = MAX_YAW_OFFSET_DEG.to_radians();
-        assert!((PlayerBody::clamp_yaw_offset(1.0) - limit).abs() < 1e-6);
-        assert!((PlayerBody::clamp_yaw_offset(-1.0) + limit).abs() < 1e-6);
     }
 
     #[test]

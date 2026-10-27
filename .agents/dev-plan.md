@@ -114,6 +114,56 @@
 - [x] 3.2 树木放置偏差：3 种 glTF 懒加载（`WorldAssetRoot` + `GltfAssetLabel::Scene(0)`），行道树概率 20/60/80%、FOREST 8m 密、PLAZA 稀疏（上限 2 棵）；树不带碰撞；资产未就绪时该 chunk 无树（`trees_ready` 标记，重 plan）
 - [ ] 3.5 `season.rs` + 树 `MaterialExtension` WESL：共享 storage buffer 承载 leaf_density/leaf_color/sway_strength；保留顶点色 R 通道摆动接口（sway_speed/sway_strength/sway_phase_len）——**顺延至 R4 之后（2026-10-24 用户决策）**：当前剪影+天空观感下季节仅有叶子有无差异，投入产出低
 - [ ] 3.6 建筑做旧材质：BoxMesh 占位 + `StandardMaterial` 扩展（脏污/褪色/风化）——**当前下一步**
+- [ ] 3.9 **程序化树形态原型（步骤 1–2）**：现状是半透明 alpha 卡片，剪影偏“纸片”。新建 `world/tree_shape.rs`（纯数据 L-system/BFS 生长模型，`StdRng` 确定性）产出「枝条骨架 + 叶簇球」；`plugins/tree_preview.rs` 用 Gizmos 在出生点前方摆 3 物种 × 4 变体画廊，F7 开关；`examples/tree_gallery.rs` headless 渲染对照图（自写 PPM→PNG，无新增依赖），`examples/tree_stats.rs` 输出高度/宽度/枝数/代理三角数。
+  - [x] 步骤 1：骨架生成器 + 确定性/预算单元测试（4 个测试：同 seed 复现、跨 id/物种不同、预算区间、逐级变细）
+  - [x] 步骤 2：Gizmos 画廊 + F7 开关 + headless 对照图
+  - [x] 步骤 3（2026-10-27）**程序化树接入 chunk 流式**：新建 `world/tree_mesh.rs`，把 `TreeSkeleton` 烘焙成**单棵树一个 Mesh**（`ConicalFrustumMeshBuilder` 5 边锥台作枝 + 20 面 icosphere 作叶簇，`Mesh::merge` 合并），黑色剪影材质（roughness 1 / reflectance 0）。`chunks.rs` 的 `PlacementAssets` 改为持有 3 物种 × 4 变体 = **12 个共享 mesh**，替换原 glTF `WorldAssetRoot`；树随 chunk root spawn/despawn
+  - [ ] 步骤 4：LOD（近全几何 / 中主枝 / 远单椭球）+ 每 Chunk 三角数预算
+  - **实测（seed 0x48454144，4 变体均值）**：杨 73 枝/208 簇/约 5.0k 代理三角、冠高 10.1–11.9 m；行道树 46 枝/135 簇/约 3.3k、冠高 6.6–8.9 m；宽叶 27 枝/168 簇/约 3.7k、冠高 8.1–11.2 m。均为不透明几何预算，远低于 alpha 卡片的 overdraw 成本。
+  - **调参轮（2026-10-27，用户选方案 A：先定形态再做实例化）**：
+    - 对照图改为**每物种一张等轴测图**（无灭点，4 变体按列对齐），列距 = 实测冠宽 + 2.5 m；此前单一透视相机把三行压成一团、宽叶冠互相粘连
+    - 新增 `crown_floor`（按每棵树自身冠底切掉下部簇，消除平直“裙边”）与 `leaf_density`（按位置哈希确定性抽稀，留出透气缝）
+    - 叶簇改为**沿枝轴放置**（原为绕枝尖散布，抽稀后最外圈会变成悬浮碎块）；新增 `leaf_spread` 控制离轴漂移上限
+    - 抽稀引入**邻域密度加成**：孤立球最难保留（消悬浮碎块），密集处优先保留
+    - **修正 `crown_width()` 不含叶簇球半径**：原只统计枝条端点，低估每侧最多一个球径；对照图按该低估值排列距，导致最宽物种仍相互接触（已加回归测试）
+    - 所有物种开启 `leaf_run_spacing`（沿枝身布簇，上限 6/枝），让叶团跟随枝条深入冠内
+    - 实测（4 变体均值）：杨 72 枝/190 簇/4.7k、行道树 40 枝/130 簇/3.1k、宽叶 26 枝/112 簇/2.6k 代理三角
+    - 测试 84 通过（新增 `crown_width_includes_leaf_radius`、`thinning_keeps_crowns_dense_and_grounded`）
+  - **第二轮（2026-10-27，Feihei 反馈：线框看不到真实效果 + 树干太长、树冠要更贴近相机）**：
+    - **预览改为实体网格**：`TreePreviewPlugin` 不再用 `Gizmos`，每根枝一个低模锥台（6 边，`ConicalFrustumMeshBuilder`），每个叶簇一个低模二十面球（`ico(1)`），近黑剪影材质（roughness 1、reflectance 0）。每棵树一个实体，画廊挂在单一根实体下，关 F7 一次性 despawn
+    - **画廊贴近相机**：首排 9 m（原 16 m），行距 17 m / 列距 15 m
+    - **树干缩短 + 冠底下压**（Feihei 核心诉求）：杨 `trunk_length` 0.42→0.17、`leaf_min_level`→2；行道树 0.34→0.24；新增 `leaf_start`（叶从枝条多深处开始）
+    - **修总预算不守恒**：`level_share` 是每层量，但深层枝数远多于浅层（行道树 L2 8 支 vs L3 25 支），按层预算分摊导致深层枝反而更长（实测 L2 0.96 m vs L3 1.02 m）。改为补偿枝数增长的平方根
+    - **实测冠底**（眼高 1.65 m）：杨 1.8–2.9×、行道树 1.1–1.6×、宽叶 1.0–1.9×；原杨为 3.3×，玩家需仰角 60° 以上才能看到冠
+    - 三角代理：杨 4.5k、行道树 2.0–3.9k、宽叶 1.8–2.6k（每棵）
+  - **取舍记录**：杨树的「露出 Y 形分叉」与「低冠底」在本生长模型下互斥——露出分叉要占 2–3 m 高度，会把冠底推回 3× 眼高以上。**按 Feihei 的明确要求优先压低树冠**，放弃强制露分叉（宽叶因低分叉设定天然可见）
+  - **第四轮（2026-10-27，Feihei 反馈：树不随 chunk 加载，走出范围就没树，要按两次 F7 才刷出来）**：
+    - 根因：R3.9 步骤 2 的画廊是**一次性快照**（按 F7 当帧玩家位置建好，之后不再更新），它只是形态调试工具，本来就不该承担世界树的职责
+    - 修复：把程序化树接入 `chunks.rs`，成为 chunk 内容的一部分——chunk root despawn 时树一起消失
+    - **网格预算**：初版叶簇 80 面 + 枝 6 边 → 全窗口约 **262 万三角面**，超 ADR 性能预算。改为叶簇 20 面（ico 0 级）+ 枝 5 边 + 剔除半径 <3.5 cm 的细枝 → **约 72 万**，最重一棵 4392 面，13 棵树/chunk = 5.7 万面
+    - **去掉 glTF 依赖**：`build_placement_assets` 不再需要 `AssetServer`（树是程序化烘焙的），顺带让 headless 测试第一次能真正验证树的流式加载
+    - 新增 `procedural_trees_stream_with_their_chunks`：断言树在出生点生成、每棵只有 1 个 `Mesh3d`、网格非空、**传送到 300 m 外后树跟着走且没有一棵留在原地或脱离 chunk root**。已验证**把“树挂到 chunk root 外”的 bug 放回去该测试即失败**（报 184 trees not attached）
+  - **第五轮（2026-10-27，Feihei 反馈：仍需按两次 F7 才加载新区域的树；并清理临时文件）**：
+    - **真实原因：Feihei 看到的一直是 F7 画廊，不是世界里的树**。实测确认 chunk 树一直正常流式（走 100 m 后 chunk 范围 4..11 → 6..14，树 191 → 230）；而画廊是固定快照，走出范围就空、按两次才会在新位置重建——现象完全吻合
+    - **处置：F7 画廊从 `HeadsUpPlugins` 注销**。它已完成使命（形态定稿），世界树由 chunk 提供；模块保留作为 `examples/tree_gallery.rs` 的形态参照
+    - **顺带修掉两个每帧泄漏（严重）**：
+      1. `build_placement_assets` **没有 guard，每帧重跑**——每帧重烘 12 个树 mesh、重建全部建筑材质、替换 `PlacementAssets` 资源。实测 240 帧：mesh 13 → 3242、材质 15 → 3411。加 `existing.is_some()` 早退后稳定在 64/65
+      2. `spawn_chunk_content` **每个建筑都 `meshes.add(Cuboid)`**——改为共享单位立方体 + 每实例缩放，`spawn_chunk_content` 不再需要 `Assets<Mesh>`
+    - 新增 `placement_assets_and_meshes_are_allocated_once`：跑 180 帧断言 mesh/材质数量不增长。已验证**去掉 guard 该测试即失败**（报 "mesh assets grow every frame"）
+  - **第六轮（2026-10-27，Feihei 反馈：F7 无变化、走动旋转都看不到树，建筑盒子也不见了）——这是真正的根因**：
+    - **`ChunkRoot` 实体没有 `Transform`/`Visibility`**。它是所有 chunk 内容的父节点（地面 tile / 建筑 / 树），而 Bevy 的层级传播要求父实体带 `Transform`（→`GlobalTransform`）。缺了它，**所有子节点拿不到世界变换，一个都渲染不出来**。而 gizmo 线框不走层级，所以「天空 + 彩色线框正常、网格全空」——症状完全吻合
+    - 发现方式：抓真实游戏日志，看到 **1120 条 `warning[B0004]`**（"parent ... without [Transform]"），远早于这次改动就存在——**之前一直是 glTF `WorldAssetRoot` 树 + 本轮之前没人看日志**才没暴露
+    - 修复：`ChunkRoot` 补 `Transform::default()` + `Visibility::default()`。实测 25 s 运行：B0004 从 1120 → **0**，无其它告警
+    - 新增 `chunk_root_can_propagate_transforms_to_its_children`：断言每个 chunk root 都有 `Transform`、每个子节点都拿到 `GlobalTransform`。已验证**去掉修复该测试即失败**（报 30 chunk roots have no Transform）
+    - 顺带删掉 `PlayerBody::clamp_yaw_offset` 及其测试（鼠标横向转向已移除，该函数不再被调用；`yaw_offset` 字段保留，相机旋转仍用）。至此 `cargo clippy -D warnings` 全绿、零告警
+  - **仍未解决**：冠内枝干在渲染中不可见（叶簇球覆盖枝段，需实例化阶段用材质/明暗区分）；行道树 V2 树干偏长、组内一致性差
+  - **第三轮（2026-10-27，Feihei 反馈：按 F7 后连线框都没有）——两个叠加 bug，都不是材质/背面剔除问题**：
+    - **Bug A：空缓存提前返回**。`sync_tree_preview` 里 `if !roots.is_empty() || data.trees.is_empty() { return; }`——打开 F7 的当帧 `data.trees` 必然为空，条件成立直接返回，画廊从未被建造。删掉 `|| data.trees.is_empty()`
+    - **Bug B：锚在世界原点**。`TreePreviewGalleryData::generate(Vec3::ZERO)` 固定用世界原点，而玩家出生在地图中心 400 m 处 → 树在 588 m 外。改为以玩家位置 + 水平朝向为锚（抽出 `gallery_origin()` 便于测试）；变体沿玩家右手方向横排，不再朝前堆叠
+    - **为什么之前“验证过 618 个 mesh 存在”却仍是空的**：headless 测试只统计了实体数量，没检查它们在世界中的位置；而且那两个 bug 都在 `sync_tree_preview` 里，测试却只调 `generate()`，属于“测了错的层”
+    - 新增 `f7_toggle_actually_builds_the_gallery_in_front_of_the_player`：**驱动 `sync_tree_preview` 本身**，断言能建成、距玩家 <80 m、在朝向前方、立于地面、变体横向排开。已验证**把任一 bug 放回去该测试即失败**（Bug A 报“built no gallery”，Bug B 报“588 m from the player”）
+  - **验证缺口（重要）**：`tests/tree_preview_screenshot.rs` 的 `frame` 在本机 headless 精简插件栈下恒为清屏色，即使换成 HDR 目标 + 完整 `GoldenHourCamera` bundle 也不出画面，与 `sky_screenshot.rs` 同栈却正常，差异未定位。**因此「游戏内观感」只有 Feihei 本人 `cargo run` + F7 才是有效证据**；本文所有形态结论均来自 `examples/tree_gallery.rs`（纯 CPU 光栅化）。
+  - **已知验证缺口**：`tests/tree_preview_screenshot.rs` 在精简插件栈下能跑通（F7 生效、12 棵树生成），但截图为空——HDR 相机在这套栈里没有产出画面（`sky_screenshot.rs` 的栈可正常出图，差异未定位）。**桥接测试只覆盖逻辑层，不覆盖“游戏内可见”**；游戏内观感待 Feihei 本地按 F7 人工确认。
 - [ ] 3.7 季节切换快捷键（1/2/3/4，开发期）——随 3.5 顺延
 - [x] 3.8 headless 验证（碰撞围合部分）：`walking_every_street_reaches_the_far_end`——沿全部路网边（2112 条 × 4 seed）按 0.5m 步长模拟步行，断言不卡死、不穿块、不出世界、单调前进。**该测试暴露并驱动修复**：环路中线格点扰动、图节点坐标错位、左右归属按基准格点判定、row_fits 与放置偏移不一致（完整链路见 2.9 修订）。修复后全城建筑 2787 → 10091（此前静默丢弃 ~90% 放置）。四季树形态部分随 3.5 顺延
 
@@ -174,6 +224,8 @@ R2: 布局图与Chunk    [██████████] 完成（2.1–2.15，
 R3: 放置碰撞与季节   [████████░░] 基本完成（3.1-3.4, 3.6, 3.8 碰撞围合 done 2026-10-24；3.5/3.7 顺延）
 R4: 存档与菜单       [██████████] 完成（4.1-4.6，2026-10-24；可点击按钮/完成弹窗接线留 R5.6）
 R5: 声音与润色       [░░░░░░░░░░] 待开始（原 M5 顺延）
+R3.9 程序化树         [██████████] 步骤 1-3 完成 + 层级传播根因修复（2026-10-27，实体已能在游戏内渲染）；
+                      步骤 4（LOD / 每 chunk 三角数预算）待开始
 ```
 
 **下一步**：R5 声音与润色（原 M5 顺延：脚步声/风声/环境音/配乐/LOD/打磨/跨平台）。季节（3.5/3.7）顺延至 R4 后。2026-10-24：R3.8 步行测试暴露的街道几何一致性修复见 2.9 修订（环路格点钉死、图节点用扰动坐标、归属按几何侧、curb 逐街宽）。
