@@ -24,6 +24,112 @@ use bevy_elements::{
     WorldClock,
 };
 
+/// A named low-cloud look.
+///
+/// bevy_elements renders ONE volumetric layer whose type blends between
+/// stratus (flat sheets) and cumulus/cumulonimbus (vertical towers) from the
+/// weather values. Each variant here is a tuned point in that space, so
+/// switching kinds changes what the same renderer produces.
+///
+/// Measured constraint (see the module notes on granularity): the cloud
+/// silhouette is quantised at ~32-64 m by the crate's fixed noise
+/// resolutions, so these knobs change the *distribution and proportions* of
+/// the shapes, not their edge detail. Frayed, irregular edges need a noise
+/// change, which means patching the dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudKind {
+    /// Fair-weather cumulus: distinct puffs with clear sky between them.
+    ScatteredCumulus,
+    /// Heavier cumulus: more cover, taller, still separated.
+    BrokenCumulus,
+    /// Cumulonimbus: towering, dense, most of the sky.
+    ToweringCumulus,
+    /// Stratocumulus: a broken sheet of low cloud, flat and wide.
+    Stratocumulus,
+    /// Overcast stratus: an unbroken grey lid.
+    Overcast,
+}
+
+impl CloudKind {
+    /// Display order for the panel and cycling.
+    pub const ALL: [CloudKind; 5] = [
+        CloudKind::ScatteredCumulus,
+        CloudKind::BrokenCumulus,
+        CloudKind::ToweringCumulus,
+        CloudKind::Stratocumulus,
+        CloudKind::Overcast,
+    ];
+
+    /// Short name for the panel row.
+    pub fn label(self) -> &'static str {
+        match self {
+            CloudKind::ScatteredCumulus => "scattered cu",
+            CloudKind::BrokenCumulus => "broken cu",
+            CloudKind::ToweringCumulus => "towering cb",
+            CloudKind::Stratocumulus => "stratocumulus",
+            CloudKind::Overcast => "overcast",
+        }
+    }
+
+    /// Cover at `amount = 1` for this kind, 0..1.
+    pub fn base_cover(self) -> f32 {
+        match self {
+            CloudKind::ScatteredCumulus => 0.30,
+            CloudKind::BrokenCumulus => 0.55,
+            CloudKind::ToweringCumulus => 0.80,
+            CloudKind::Stratocumulus => 0.65,
+            CloudKind::Overcast => 0.97,
+        }
+    }
+
+    /// Relative humidity this kind wants, 0..1. Above ~0.9 the crate's
+    /// `kind_from_weather` swings the cloud type to stratus, which is what
+    /// turns cumulus into a sheet.
+    pub fn humidity(self) -> f32 {
+        match self {
+            CloudKind::ScatteredCumulus => 0.45,
+            CloudKind::BrokenCumulus => 0.55,
+            CloudKind::ToweringCumulus => 0.70,
+            CloudKind::Stratocumulus => 0.86,
+            CloudKind::Overcast => 0.95,
+        }
+    }
+
+    /// Storminess, 0..6. `storminess / 6` is the crate's cumulonimbus weight.
+    pub fn storminess(self) -> f32 {
+        match self {
+            CloudKind::ScatteredCumulus => 0.0,
+            CloudKind::BrokenCumulus => 0.3,
+            CloudKind::ToweringCumulus => 2.2,
+            CloudKind::Stratocumulus => 0.0,
+            CloudKind::Overcast => 0.0,
+        }
+    }
+
+    /// Cloud base and top (m). Stratus is a thin low lid; cumulonimbus is the
+    /// tall one. `None` lets the crate derive the layer from the weather.
+    pub fn layer(self) -> (f32, f32) {
+        match self {
+            CloudKind::ScatteredCumulus => (1200.0, 2600.0),
+            CloudKind::BrokenCumulus => (1100.0, 3200.0),
+            CloudKind::ToweringCumulus => (800.0, 7000.0),
+            CloudKind::Stratocumulus => (900.0, 1600.0),
+            // A lid 600 m thick reads as an unbroken overcast rather than fog.
+            CloudKind::Overcast => (700.0, 1400.0),
+        }
+    }
+
+    /// Wind speed (m/s). Above 12 the crate grows towers on its own, so the
+    /// stormy kinds keep it high deliberately.
+    pub fn wind(self) -> f32 {
+        match self {
+            CloudKind::ToweringCumulus => 9.0,
+            CloudKind::BrokenCumulus => 5.0,
+            _ => 3.0,
+        }
+    }
+}
+
 /// Golden-hour sky configuration (ADR-0001: fixed dusk, no weather changes).
 ///
 /// Insert this resource before adding [`SkyPlugin`] to override the defaults.
@@ -41,9 +147,15 @@ pub struct HeadsUpSky {
     /// through the dusk tint (≈5° altitude): the game's world is fictional,
     /// so the coordinates only need to produce the adr-0001 gradient.
     pub location: GeoLocation,
-    /// Overrides `Weather.cloud_cover` every frame (0..1). `None` keeps the
-    /// forced `WeatherPreset::Clear` value (0.05, sparse clouds).
-    pub cloud_cover: Option<f32>,
+    /// Which kind of low cloud the sky carries.
+    ///
+    /// bevy_elements has exactly one volumetric layer, and its type is a
+    /// blend between stratus and cumulus driven by weather. A "kind" here is
+    /// therefore a named combination of cover / humidity / storminess /
+    /// layer thickness, not a separate renderer. `None` means a clear sky.
+    pub cloud_kind: Option<CloudKind>,
+    /// How much of the selected kind, 0..1. Scales the kind's own cover.
+    pub cloud_amount: f32,
     /// Overrides the derived `CloudLayer` altitudes (m). Applied with one
     /// frame of lag (see `apply_cloud_layer_override`).
     pub cloud_layer: Option<(f32, f32)>,
@@ -53,12 +165,14 @@ pub struct HeadsUpSky {
     /// Peak amplitude of the world-position exposure perturbation (R1.5), in
     /// ev100 stops. Deterministic function of the camera position.
     pub exposure_noise_amplitude: f32,
-    /// Relative humidity (0..1). Drives how much of the cloud field reads as
-    /// flat stratus instead of cumulus (`CloudLayer::kind_from_weather`).
-    pub relative_humidity: f32,
-    /// Storminess (0..1). The other stratus/cumulus knob: `storminess / 6`
-    /// pushes the cloud type toward towering cumulonimbus.
-    pub storminess: f32,
+    /// Extra humidity offset applied on top of the kind's own value (-1..1).
+    ///
+    /// The kind sets a sensible baseline; this lets a run push the same kind
+    /// toward sheet-like or broken without switching kinds.
+    pub humidity_bias: f32,
+    /// Extra storminess offset (-1..1). Pushes the kind toward towering
+    /// cumulonimbus without changing its cover.
+    pub storminess_bias: f32,
     /// Wind speed at 10 m (m/s). Above ~12 m/s with heavy cover the clouds grow
     /// towers; it also sets how fast the field drifts.
     pub wind_speed_ms: f32,
@@ -84,14 +198,14 @@ impl Default for HeadsUpSky {
                 longitude_deg: 126.4,
                 utc_offset_hours: 8.0,
             },
-            cloud_cover: None,
+            // ADR-0001 asks for a mostly clear dusk with a few low clouds.
+            cloud_kind: Some(CloudKind::ScatteredCumulus),
+            cloud_amount: 0.35,
             cloud_layer: None,
             exposure_ev100: 13.0,
             exposure_noise_amplitude: 0.15,
-            // Forced-clear defaults (`WeatherPreset::Clear`): a dry, calm sky
-            // that reads as scattered cumulus rather than a flat overcast.
-            relative_humidity: 0.62,
-            storminess: 0.0,
+            humidity_bias: 0.0,
+            storminess_bias: 0.0,
             wind_speed_ms: 3.0,
             bloom_intensity: 0.3,
         }
@@ -164,23 +278,71 @@ impl Plugin for SkyPlugin {
 /// storminess / wind are always applied: they only shape the cloud TYPE, and a
 /// panel that silently ignores three of its four knobs would be a trap. Wind is
 /// floored at the preset's value so a still day still drifts a little.
-fn apply_weather_overrides(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elements::Weather>) {
-    weather.relative_humidity = sky.relative_humidity.clamp(0.0, 1.0);
-    weather.storminess = sky.storminess.clamp(0.0, 6.0);
-    weather.wind_speed_ms = sky.wind_speed_ms.max(0.0);
-
-    let Some(cover) = sky.cloud_cover else {
-        return;
+/// Resolves the selected cloud kind plus its amount into the concrete weather
+/// the crate consumes.
+///
+/// Returns `None` for a clear sky (no kind), which is a real state the game
+/// needs: ADR-0001's golden hour is meant to be mostly clear, and an
+/// overcast-only renderer could not produce it.
+pub fn resolve_clouds(sky: &HeadsUpSky) -> Option<ResolvedClouds> {
+    let kind = sky.cloud_kind?;
+    let amount = sky.cloud_amount.clamp(0.0, 1.0);
+    // Cover scales with amount; a slip of cover at amount 0 keeps the crate's
+    // histogram from dividing by zero but shows nothing.
+    let cover = if amount <= 0.001 {
+        0.0
+    } else {
+        (kind.base_cover() * amount).clamp(0.0, 1.0)
     };
-    weather.cloud_cover = cover.clamp(0.0, 1.0);
+    Some(ResolvedClouds {
+        cover,
+        humidity: (kind.humidity() + sky.humidity_bias).clamp(0.0, 1.0),
+        storminess: (kind.storminess() + sky.storminess_bias).clamp(0.0, 6.0),
+        wind: kind.wind(),
+        layer: sky.cloud_layer.unwrap_or_else(|| kind.layer()),
+    })
+}
+
+/// The weather a [`CloudKind`] resolves to. Plain data so the mapping can be
+/// asserted without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedClouds {
+    pub cover: f32,
+    pub humidity: f32,
+    pub storminess: f32,
+    pub wind: f32,
+    pub layer: (f32, f32),
+}
+
+fn apply_weather_overrides(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elements::Weather>) {
+    match resolve_clouds(&sky) {
+        Some(clouds) => {
+            weather.cloud_cover = clouds.cover;
+            weather.relative_humidity = clouds.humidity;
+            weather.storminess = clouds.storminess;
+            weather.wind_speed_ms = clouds.wind;
+        }
+        // Clear sky: no coverage at all, and humidity low enough that the
+        // crate's own `kind_from_weather` cannot conjure a sheet from nothing.
+        None => {
+            weather.cloud_cover = 0.0;
+            weather.relative_humidity = 0.35;
+            weather.storminess = 0.0;
+            weather.wind_speed_ms = 2.0;
+        }
+    }
 }
 
 fn apply_cloud_layer_override(sky: Res<HeadsUpSky>, mut layer: ResMut<CloudLayer>) {
-    let Some((base_m, top_m)) = sky.cloud_layer else {
+    // A clear sky still needs a valid layer: the crate derives one every frame
+    // from `Weather`, and leaving a stale one would make the next kind switch
+    // pop.
+    let Some(clouds) = resolve_clouds(&sky) else {
         return;
     };
+    let (base_m, top_m) = clouds.layer;
     layer.base_m = base_m;
-    layer.top_m = top_m.max(base_m + 1.0);
+    layer.top_m = top_m.max(base_m + 200.0);
 }
 
 /// R1.5: subtle exposure drift driven by a deterministic function of the

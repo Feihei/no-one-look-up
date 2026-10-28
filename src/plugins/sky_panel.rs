@@ -31,121 +31,152 @@ pub struct SkyPanelState {
     pub selected: usize,
 }
 
-/// One tunable knob.
-pub struct SkyParam {
-    /// Row label; the panel prints `name: value`.
-    pub name: &'static str,
-    /// Reads the current value out of `HeadsUpSky`.
-    pub get: fn(&HeadsUpSky) -> f32,
-    /// Writes a new value back.
-    pub set: fn(&mut HeadsUpSky, f32),
-    /// Nudge per Left/Right press, already in the parameter's own units.
-    pub step: f32,
-    /// Clamp range.
-    pub range: (f32, f32),
-    /// Decimal places to print.
-    pub decimals: usize,
-    /// How to write the float: `None` = plain number, `Some(fmt)` = custom.
-    pub format: Option<fn(f32) -> String>,
+/// What a row edits.
+pub enum SkyValue {
+    /// A plain float with range and step.
+    Float {
+        get: fn(&HeadsUpSky) -> f32,
+        set: fn(&mut HeadsUpSky, f32),
+        step: f32,
+        range: (f32, f32),
+        decimals: usize,
+    },
+    /// The cloud kind (an enum): Left/Right cycles it, and `None` (clear sky)
+    /// is part of the cycle.
+    CloudKind,
+    /// Cloud amount, which only has meaning when a kind is selected.
+    CloudAmount,
 }
 
-/// Every knob the panel exposes, in display order.
+/// One tunable row.
+pub struct SkyParam {
+    pub name: &'static str,
+    pub value: SkyValue,
+}
+
+/// Every row the panel exposes, in display order.
 ///
-/// Grouped as the eye sees them: what the clouds are, how big they are, how
-/// the light sits, then the photo settings.
+/// Organised the way the sky is actually read: what cloud is there, how much,
+/// then how it is lit.
 pub const PARAMS: &[SkyParam] = &[
-    // --- clouds -----------------------------------------------------------
     SkyParam {
-        name: "cloud cover",
-        // Reads as the preset value until the first nudge sets an override.
-        get: |sky| sky.cloud_cover.unwrap_or(0.05),
-        set: |sky, v| sky.cloud_cover = Some(v),
-        step: 0.02,
-        range: (0.0, 1.0),
-        decimals: 2,
-        format: None,
+        name: "cloud kind",
+        value: SkyValue::CloudKind,
     },
     SkyParam {
-        name: "humidity",
-        get: |sky| sky.relative_humidity,
-        set: |sky, v| sky.relative_humidity = v,
-        step: 0.02,
-        range: (0.0, 1.0),
-        decimals: 2,
-        format: None,
+        name: "cloud amount",
+        value: SkyValue::CloudAmount,
     },
     SkyParam {
-        name: "storminess",
-        get: |sky| sky.storminess,
-        set: |sky, v| sky.storminess = v,
-        step: 0.05,
-        range: (0.0, 6.0),
-        decimals: 2,
-        format: None,
-    },
-    SkyParam {
-        name: "wind m/s",
-        get: |sky| sky.wind_speed_ms,
-        set: |sky, v| sky.wind_speed_ms = v,
-        step: 0.5,
-        range: (0.0, 25.0),
-        decimals: 1,
-        format: None,
-    },
-    // --- cloud layer ------------------------------------------------------
-    SkyParam {
-        name: "cloud base m",
-        get: |sky| sky.cloud_layer.map(|(b, _)| b).unwrap_or(1500.0),
-        set: |sky, v| {
-            let top = sky.cloud_layer.map(|(_, t)| t).unwrap_or(v + 1800.0);
-            sky.cloud_layer = Some((v, top.max(v + 200.0)));
+        name: "layer base",
+        value: SkyValue::Float {
+            get: |sky| {
+                sky.cloud_layer
+                    .map(|(b, _)| b)
+                    .unwrap_or_else(|| sky.cloud_kind.map(|k| k.layer().0).unwrap_or(1200.0))
+            },
+            set: |sky, v| {
+                let top = sky
+                    .cloud_layer
+                    .map(|(_, t)| t)
+                    .or_else(|| sky.cloud_kind.map(|k| k.layer().1))
+                    .unwrap_or(v + 1400.0);
+                sky.cloud_layer = Some((v, top.max(v + 200.0)));
+            },
+            step: 100.0,
+            range: (300.0, 4000.0),
+            decimals: 0,
         },
-        step: 50.0,
-        range: (200.0, 5000.0),
-        decimals: 0,
-        format: None,
     },
     SkyParam {
-        name: "cloud top m",
-        get: |sky| sky.cloud_layer.map(|(_, t)| t).unwrap_or(3300.0),
-        set: |sky, v| {
-            let base = sky.cloud_layer.map(|(b, _)| b).unwrap_or(1500.0);
-            sky.cloud_layer = Some((base.min(v - 200.0), v.max(base + 200.0)));
+        name: "layer top",
+        value: SkyValue::Float {
+            get: |sky| {
+                sky.cloud_layer
+                    .map(|(_, t)| t)
+                    .unwrap_or_else(|| sky.cloud_kind.map(|k| k.layer().1).unwrap_or(2600.0))
+            },
+            set: |sky, v| {
+                let base = sky
+                    .cloud_layer
+                    .map(|(b, _)| b)
+                    .or_else(|| sky.cloud_kind.map(|k| k.layer().0))
+                    .unwrap_or(1200.0);
+                sky.cloud_layer = Some((base.min(v - 200.0), v.max(base + 200.0)));
+            },
+            step: 200.0,
+            range: (500.0, 9000.0),
+            decimals: 0,
         },
-        step: 100.0,
-        range: (400.0, 9500.0),
-        decimals: 0,
-        format: None,
     },
-    // --- light ------------------------------------------------------------
+    SkyParam {
+        name: "humidity bias",
+        value: SkyValue::Float {
+            get: |sky| sky.humidity_bias,
+            set: |sky, v| sky.humidity_bias = v,
+            step: 0.02,
+            range: (-0.5, 0.5),
+            decimals: 2,
+        },
+    },
+    SkyParam {
+        name: "storm bias",
+        value: SkyValue::Float {
+            get: |sky| sky.storminess_bias,
+            set: |sky, v| sky.storminess_bias = v,
+            step: 0.05,
+            range: (-1.0, 3.0),
+            decimals: 2,
+        },
+    },
     SkyParam {
         name: "exposure ev",
-        get: |sky| sky.exposure_ev100,
-        set: |sky, v| sky.exposure_ev100 = v,
-        step: 0.1,
-        range: (8.0, 18.0),
-        decimals: 2,
-        format: None,
+        value: SkyValue::Float {
+            get: |sky| sky.exposure_ev100,
+            set: |sky, v| sky.exposure_ev100 = v,
+            step: 0.1,
+            range: (8.0, 18.0),
+            decimals: 2,
+        },
     },
     SkyParam {
         name: "bloom",
-        get: |sky| sky.bloom_intensity,
-        set: |sky, v| sky.bloom_intensity = v,
-        step: 0.02,
-        range: (0.0, 1.5),
-        decimals: 2,
-        format: None,
+        value: SkyValue::Float {
+            get: |sky| sky.bloom_intensity,
+            set: |sky, v| sky.bloom_intensity = v,
+            step: 0.02,
+            range: (0.0, 1.5),
+            decimals: 2,
+        },
     },
     SkyParam {
         name: "exp jitter",
-        get: |sky| sky.exposure_noise_amplitude,
-        set: |sky, v| sky.exposure_noise_amplitude = v,
-        step: 0.01,
-        range: (0.0, 0.6),
-        decimals: 2,
-        format: None,
+        value: SkyValue::Float {
+            get: |sky| sky.exposure_noise_amplitude,
+            set: |sky, v| sky.exposure_noise_amplitude = v,
+            step: 0.01,
+            range: (0.0, 0.6),
+            decimals: 2,
+        },
     },
 ];
+
+/// Cycle order for the cloud-kind row: `None` (clear) first, then the kinds.
+/// A clear sky must be reachable, not just a kind set to zero amount.
+fn cloud_kind_cycle(
+    current: Option<crate::plugins::sky::CloudKind>,
+) -> Option<crate::plugins::sky::CloudKind> {
+    use crate::plugins::sky::CloudKind;
+    if current.is_none() {
+        return Some(CloudKind::ALL[0]);
+    }
+    let index = CloudKind::ALL.iter().position(|k| Some(*k) == current);
+    match index {
+        Some(i) if i + 1 < CloudKind::ALL.len() => Some(CloudKind::ALL[i + 1]),
+        // Past the last kind: back to a clear sky.
+        _ => None,
+    }
+}
 
 /// Marker on the panel's UI root.
 #[derive(Component)]
@@ -205,16 +236,59 @@ fn sky_panel_input(
     }
 
     let param = &PARAMS[state.selected];
-    let current = (param.get)(&sky);
-    let next = (current + delta * param.step).clamp(param.range.0, param.range.1);
-    (param.set)(&mut sky, next);
-    info!("{} = {}", param.name, format_value(param, next));
+    // Direction only: -1 or +1 (held keys already collapsed into this).
+    let direction = if delta < 0.0 { -1.0 } else { 1.0 };
+    // A repeat means the key was already down on the previous frame.
+    let is_repeat = !(keys.just_pressed(DEV_PANEL_LEFT) || keys.just_pressed(DEV_PANEL_RIGHT));
+    match &param.value {
+        SkyValue::Float {
+            get,
+            set,
+            step,
+            range,
+            ..
+        } => {
+            let next = (get(&sky) + direction * step).clamp(range.0, range.1);
+            set(&mut sky, next);
+            info!("{} = {}", param.name, format_row(param, &sky));
+        }
+        SkyValue::CloudKind => {
+            // Cycling is discrete: a held key must not spin through every
+            // kind in a few frames, so only a fresh press counts. The caller
+            // adds repeat deltas for held keys, which is wrong here.
+            if !is_repeat {
+                let next = cloud_kind_cycle(sky.cloud_kind);
+                sky.cloud_kind = next;
+                if next.is_some() && sky.cloud_amount <= 0.001 {
+                    // Picking a kind with amount 0 would look like "nothing
+                    // happened"; give it a visible default.
+                    sky.cloud_amount = 0.35;
+                }
+                info!("{} = {}", param.name, format_row(param, &sky));
+            }
+        }
+        SkyValue::CloudAmount => {
+            sky.cloud_amount = (sky.cloud_amount + direction * 0.02).clamp(0.0, 1.0);
+            info!("{} = {}", param.name, format_row(param, &sky));
+        }
+    }
 }
 
-fn format_value(param: &SkyParam, value: f32) -> String {
-    match param.format {
-        Some(f) => f(value),
-        None => format!("{value:.*}", param.decimals),
+/// Renders a row's value for the panel and the log line.
+fn format_row(param: &SkyParam, sky: &HeadsUpSky) -> String {
+    match &param.value {
+        SkyValue::Float { get, decimals, .. } => format!("{:.*}", decimals, get(sky)),
+        SkyValue::CloudKind => match sky.cloud_kind {
+            Some(kind) => kind.label().to_string(),
+            None => "clear (no cloud)".to_string(),
+        },
+        SkyValue::CloudAmount => {
+            if sky.cloud_kind.is_some() {
+                format!("{:.2}", sky.cloud_amount)
+            } else {
+                "-".to_string()
+            }
+        }
     }
 }
 
@@ -232,7 +306,7 @@ fn sky_panel_ui(
             .iter()
             .enumerate()
             .map(|(index, param)| {
-                let value = format_value(param, (param.get)(&sky));
+                let value = format_row(param, &sky);
                 let marker = if index == state.selected { ">" } else { " " };
                 format!("{marker} {:<14} {}", param.name, value)
             })
@@ -298,6 +372,7 @@ impl Plugin for SkyPanelPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::sky::CloudKind;
 
     fn app_with_panel() -> App {
         let mut app = App::new();
@@ -313,11 +388,12 @@ mod tests {
     ///
     /// `MinimalPlugins` has no `InputPlugin`, so nothing calls `clear()` each
     /// frame and `just_pressed` would stay true forever — a second `update()`
-    /// would toggle again. In the real game `keyboard_input_system` does this;
+    /// would act again. In the real game `keyboard_input_system` does this;
     /// here the test has to.
     fn tap(app: &mut App, key: KeyCode) {
-        let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        input.press(key);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
         app.update();
         let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
         input.release(key);
@@ -325,11 +401,15 @@ mod tests {
         app.update();
     }
 
+    fn row(name: &str) -> usize {
+        PARAMS
+            .iter()
+            .position(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no row named {name}"))
+    }
+
     #[test]
     fn panel_starts_closed_and_ignores_keys_until_opened() {
-        // A panel that eats arrow keys while closed would fight the walker
-        // (A/D turn, E/Q speed are separate, but Up/Down are also used by
-        // future UI).
         let mut app = app_with_panel();
         let before = app.world().resource::<HeadsUpSky>().exposure_ev100;
         tap(&mut app, DEV_PANEL_RIGHT);
@@ -338,107 +418,185 @@ mod tests {
     }
 
     #[test]
-    fn f5_toggles_and_arrows_adjust_the_selected_row() {
+    fn f5_toggles_the_panel() {
         let mut app = app_with_panel();
         tap(&mut app, DEV_TOGGLE_SKY_PANEL);
         assert!(app.world().resource::<SkyPanelState>().open);
+        tap(&mut app, DEV_TOGGLE_SKY_PANEL);
+        assert!(!app.world().resource::<SkyPanelState>().open);
+    }
 
-        // Row 0 is cloud cover. Before any nudge it reads the preset's own
-        // value (0.05); one press must move it by exactly one step from THERE,
-        // not from the bottom of the range (which would make the first press
-        // appear to do nothing).
-        let panel = app.world().resource::<SkyPanelState>().selected;
-        assert_eq!(panel, 0);
-        let default_cover = 0.05;
-        tap(&mut app, DEV_PANEL_RIGHT);
-        let cover = app
-            .world()
-            .resource::<HeadsUpSky>()
-            .cloud_cover
-            .expect("the nudge must write a real override");
-        assert!(
-            (cover - (default_cover + PARAMS[0].step)).abs() < 1e-4,
-            "first nudge should be one step above the preset value, got {cover}"
-        );
+    #[test]
+    fn cloud_kind_cycles_through_every_kind_and_back_to_clear() {
+        // A clear sky must be reachable by the same control, not only by
+        // dragging the amount to zero: the game needs cloudless dusk too.
+        let mut app = app_with_panel();
+        tap(&mut app, DEV_TOGGLE_SKY_PANEL);
+        app.world_mut().resource_mut::<SkyPanelState>().selected = row("cloud kind");
+        app.world_mut().resource_mut::<HeadsUpSky>().cloud_kind = Some(CloudKind::ALL[0]);
 
-        // Selecting another row changes which value moves.
-        tap(&mut app, DEV_PANEL_DOWN);
-        tap(&mut app, DEV_PANEL_DOWN);
-        assert_eq!(app.world().resource::<SkyPanelState>().selected, 2);
-        let storm_before = app.world().resource::<HeadsUpSky>().storminess;
-        tap(&mut app, DEV_PANEL_RIGHT);
-        assert!(
-            app.world().resource::<HeadsUpSky>().storminess > storm_before,
-            "storminess should have increased"
-        );
-        // And the previous row is untouched.
+        // Starting on ALL[0], it takes one press per remaining kind plus one
+        // more to step off the end into the clear state. Seed the list with
+        // the starting kind, or it looks like the cycle skipped it.
+        let mut seen = vec![app.world().resource::<HeadsUpSky>().cloud_kind];
+        for _ in 0..CloudKind::ALL.len() {
+            tap(&mut app, DEV_PANEL_RIGHT);
+            seen.push(app.world().resource::<HeadsUpSky>().cloud_kind);
+        }
+
+        for kind in CloudKind::ALL {
+            assert!(seen.contains(&Some(kind)), "cycling never reached {kind:?}");
+        }
         assert_eq!(
-            app.world().resource::<HeadsUpSky>().cloud_cover,
-            Some(cover)
+            seen.last().copied().flatten(),
+            None,
+            "cycling past the last kind must give a clear sky"
+        );
+        assert_eq!(
+            seen[1].map(|k| k.label()),
+            Some(CloudKind::ALL[1].label()),
+            "the first press should advance to the next kind"
         );
     }
 
     #[test]
-    fn values_stay_inside_their_declared_range() {
-        // Hammer every row to both limits: nothing may escape its range, and
-        // nothing may become NaN (a NaN exposure blanks the whole frame).
+    fn picking_a_kind_gives_it_a_visible_amount() {
+        // A kind at amount 0 renders nothing; selecting it would look broken.
         let mut app = app_with_panel();
         tap(&mut app, DEV_TOGGLE_SKY_PANEL);
-        for (row, param) in PARAMS.iter().enumerate() {
-            app.world_mut().resource_mut::<SkyPanelState>().selected = row;
-            for _ in 0..400 {
+        app.world_mut().resource_mut::<SkyPanelState>().selected = row("cloud kind");
+        {
+            let mut sky = app.world_mut().resource_mut::<HeadsUpSky>();
+            sky.cloud_kind = None;
+            sky.cloud_amount = 0.0;
+        }
+        tap(&mut app, DEV_PANEL_RIGHT);
+        let sky = app.world().resource::<HeadsUpSky>();
+        assert!(sky.cloud_kind.is_some());
+        assert!(
+            sky.cloud_amount > 0.0,
+            "selecting a kind must leave it visible, amount = {}",
+            sky.cloud_amount
+        );
+    }
+
+    #[test]
+    fn clear_sky_resolves_to_no_cover() {
+        // The clear state must actually clear: a stale cover would leave the
+        // previous cloud sheet in the sky.
+        let sky = HeadsUpSky {
+            cloud_kind: None,
+            ..Default::default()
+        };
+        assert!(
+            crate::plugins::sky::resolve_clouds(&sky).is_none(),
+            "no kind must resolve to no cloud"
+        );
+
+        // Amount 0 with a kind keeps the kind but shows nothing.
+        let sky = HeadsUpSky {
+            cloud_kind: Some(CloudKind::BrokenCumulus),
+            cloud_amount: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::plugins::sky::resolve_clouds(&sky).map(|c| c.cover),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn every_kind_resolves_to_weather_the_crate_can_use() {
+        for kind in CloudKind::ALL {
+            let sky = HeadsUpSky {
+                cloud_kind: Some(kind),
+                cloud_amount: 1.0,
+                ..Default::default()
+            };
+            let clouds = crate::plugins::sky::resolve_clouds(&sky)
+                .unwrap_or_else(|| panic!("{kind:?} resolved to nothing"));
+            assert!(
+                (0.0..=1.0).contains(&clouds.cover),
+                "{kind:?}: cover {} out of range",
+                clouds.cover
+            );
+            assert!(
+                (0.0..=1.0).contains(&clouds.humidity),
+                "{kind:?}: humidity {} out of range",
+                clouds.humidity
+            );
+            assert!(
+                (0.0..=6.0).contains(&clouds.storminess),
+                "{kind:?}: storminess {} out of range",
+                clouds.storminess
+            );
+            assert!(
+                clouds.layer.1 > clouds.layer.0 + 100.0,
+                "{kind:?}: layer {:?} is degenerate",
+                clouds.layer
+            );
+            assert!(
+                (0.0..=12.0).contains(&clouds.wind),
+                "{kind:?}: wind {} out of the calm band",
+                clouds.wind
+            );
+        }
+    }
+
+    #[test]
+    fn layer_rows_keep_base_below_top() {
+        let mut app = app_with_panel();
+        tap(&mut app, DEV_TOGGLE_SKY_PANEL);
+        for name in ["layer base", "layer top"] {
+            app.world_mut().resource_mut::<SkyPanelState>().selected = row(name);
+            for _ in 0..120 {
                 tap(&mut app, DEV_PANEL_RIGHT);
             }
-            let high = (param.get)(app.world().resource::<HeadsUpSky>());
-            for _ in 0..800 {
+            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
+                assert!(
+                    top > base,
+                    "{name}: top {top} <= base {base} at the high end"
+                );
+            }
+            for _ in 0..240 {
                 tap(&mut app, DEV_PANEL_LEFT);
             }
-            let low = (param.get)(app.world().resource::<HeadsUpSky>());
-            let (min, max) = param.range;
-            for (value, label) in [(low, "low"), (high, "high")] {
+            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
                 assert!(
-                    value.is_finite(),
-                    "{} went non-finite at its {label} end",
-                    param.name
-                );
-                assert!(
-                    value >= min - 1e-3 && value <= max + 1e-3,
-                    "{} = {value} escaped [{min}, {max}] at its {label} end",
-                    param.name
+                    top > base,
+                    "{name}: top {top} <= base {base} at the low end"
                 );
             }
         }
     }
 
     #[test]
-    fn cloud_layer_rows_keep_base_below_top() {
-        // `CloudLayer` with top <= base is a degenerate slab; the layer rows
-        // must never produce one, whichever end you drag.
+    fn float_rows_stay_in_range_and_finite() {
+        // A NaN exposure blanks the whole frame, and a negative humidity feeds
+        // the crate's smoothsteps garbage.
         let mut app = app_with_panel();
         tap(&mut app, DEV_TOGGLE_SKY_PANEL);
-
-        let base_row = PARAMS
-            .iter()
-            .position(|p| p.name == "cloud base m")
-            .expect("base row");
-        let top_row = PARAMS
-            .iter()
-            .position(|p| p.name == "cloud top m")
-            .expect("top row");
-
-        for row in [base_row, top_row] {
-            app.world_mut().resource_mut::<SkyPanelState>().selected = row;
+        for (index, param) in PARAMS.iter().enumerate() {
+            let SkyValue::Float { get, range, .. } = &param.value else {
+                continue;
+            };
+            app.world_mut().resource_mut::<SkyPanelState>().selected = index;
             for _ in 0..200 {
                 tap(&mut app, DEV_PANEL_RIGHT);
             }
-            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
-                assert!(top > base, "row {row}: top {top} <= base {base}");
-            }
+            let high = get(app.world().resource::<HeadsUpSky>());
             for _ in 0..400 {
                 tap(&mut app, DEV_PANEL_LEFT);
             }
-            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
-                assert!(top > base, "row {row}: top {top} <= base {base}");
+            let low = get(app.world().resource::<HeadsUpSky>());
+            for (value, end) in [(high, "high"), (low, "low")] {
+                assert!(value.is_finite(), "{} is non-finite at {end}", param.name);
+                assert!(
+                    value >= range.0 - 1e-3 && value <= range.1 + 1e-3,
+                    "{} = {value} escaped {:?} at {end}",
+                    param.name,
+                    range
+                );
             }
         }
     }

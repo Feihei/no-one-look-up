@@ -218,7 +218,28 @@
 
 **面板刻意不包含的参数**：云密度、噪声缩放、march 步数——它们编译在 bevy_elements 的 shader 里，改它们需要 patch 依赖，属于另一个决策。
 
-**下一步**：用面板调云（先试 `CloudQuality` 抬到 High/Ultra，再看是否需要动噪声分辨率）。
+### R5.2 云种模型（2026-10-27，Feihei 反馈：云是柱体+锥体、形状不随机）
+
+**根因（读源码确认，非猜测）**：三层粒度限制叠加，云的轮廓被量化在 32–64 m：
+
+| 层 | 分辨率 | 每 texel 覆盖 |
+|---|---|---|
+| 覆盖场（平面轮廓，`weather.wesl`） | 512² / 32 km | **62.5 m**（噪声波长仅 8/4/2 km） |
+| 基础噪声（云体，`mod.rs:218`） | 128³ / 8192 m | **64 m** |
+| 细节噪声（边缘侵蚀） | 32³ / 1024 m | **32 m** |
+
+且**噪声分辨率与 `ElementsQuality` 无关**（quality 只改 march 步数和 block），所以抬 quality 无效。「柱体+锥体」正是这个粒度下噪声分布的形状。
+
+- [x] **面板改为云种模式 + 量**：`CloudKind::{ScatteredCumulus, BrokenCumulus, ToweringCumulus, Stratocumulus, Overcast}` + `cloud_amount`。每种是一个调好的气象点（cover/humidity/storminess/wind/layer），左键循环切换，**循环末尾是「无云」**（`None`）
+- [x] `resolve_clouds()` 纯函数把「云种+量」解析成 `Weather`/`CloudLayer`，便于无 GPU 断言。无云时 cover=0、humidity=0.35（防止 crate 的 `kind_from_weather` 从湿度里凭空造出层云）
+- [x] 选中云种时若 amount=0 自动给 0.35（否则选了看不到）
+- [x] 保留 `humidity_bias` / `storminess_bias` 做同种内的微调
+- **测试 8 个**：面板关闭不吞键、F5 切换、云种循环覆盖全部并最终到无云、选云种给可见量、无云解析为零覆盖、每种云解析出的气象值都在 crate 可用范围、云层 base<top、浮点行不越界不出 NaN
+- **实测**：98 测试通过、clippy 零告警、游戏启动零告警
+
+**结论与边界**：方案 A 改的是「云的种类、比例、层次」，**改不了边缘细节**——要做碎边和不规则轮廓必须改噪声分辨率（patch 依赖，方案 B）。Feihei 已知悉并选择先做 A。
+
+**下一步**：用面板实际试五种云，确认哪些可接受；若仍无法接受块状边缘，再走方案 B。
 
 ---
 
