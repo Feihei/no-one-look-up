@@ -26,6 +26,15 @@ pub const PAUSE: KeyCode = KeyCode::Escape;
 
 // Development shortcuts (stripped or gated in release builds)
 pub const DEV_TOGGLE_GIZMOS: KeyCode = KeyCode::KeyG;
+
+// Sky tuning panel (R5.1): F5 opens it, Up/Down select a row, Left/Right
+// adjust. Kept off the walk keys so the panel can be used while standing in
+// the scene the change applies to.
+pub const DEV_TOGGLE_SKY_PANEL: KeyCode = KeyCode::F5;
+pub const DEV_PANEL_UP: KeyCode = KeyCode::ArrowUp;
+pub const DEV_PANEL_DOWN: KeyCode = KeyCode::ArrowDown;
+pub const DEV_PANEL_LEFT: KeyCode = KeyCode::ArrowLeft;
+pub const DEV_PANEL_RIGHT: KeyCode = KeyCode::ArrowRight;
 pub const DEV_SEASON_SPRING: KeyCode = KeyCode::Digit1;
 pub const DEV_SEASON_SUMMER: KeyCode = KeyCode::Digit2;
 pub const DEV_SEASON_AUTUMN: KeyCode = KeyCode::Digit3;

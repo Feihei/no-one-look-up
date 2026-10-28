@@ -9,6 +9,7 @@ pub mod save;
 pub mod save_data;
 pub mod season;
 pub mod sky;
+pub mod sky_panel;
 // R3.9: the F7 tree gallery is gone. It was a one-shot snapshot pinned where
 // the player stood, so walking away left it behind and it needed two F7 presses
 // to rebuild — which read as "trees don't stream with chunks". World trees now
@@ -25,6 +26,7 @@ use menu::MenuPlugin;
 use save::SavePlugin;
 use season::SeasonPlugin;
 use sky::SkyPlugin;
+use sky_panel::SkyPanelPlugin;
 use world::WorldPlugin;
 
 use crate::world::debug_viz::DebugVizPlugin;
@@ -36,6 +38,7 @@ impl PluginGroup for HeadsUpPlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
             .add(SkyPlugin)
+            .add(SkyPanelPlugin)
             .add(WorldPlugin)
             .add(DebugVizPlugin)
             // NOTE (R3.9): the F7 gallery is NOT registered. It was a

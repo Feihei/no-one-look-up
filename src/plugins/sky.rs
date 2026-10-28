@@ -53,6 +53,18 @@ pub struct HeadsUpSky {
     /// Peak amplitude of the world-position exposure perturbation (R1.5), in
     /// ev100 stops. Deterministic function of the camera position.
     pub exposure_noise_amplitude: f32,
+    /// Relative humidity (0..1). Drives how much of the cloud field reads as
+    /// flat stratus instead of cumulus (`CloudLayer::kind_from_weather`).
+    pub relative_humidity: f32,
+    /// Storminess (0..1). The other stratus/cumulus knob: `storminess / 6`
+    /// pushes the cloud type toward towering cumulonimbus.
+    pub storminess: f32,
+    /// Wind speed at 10 m (m/s). Above ~12 m/s with heavy cover the clouds grow
+    /// towers; it also sets how fast the field drifts.
+    pub wind_speed_ms: f32,
+    /// Bloom intensity (R1.3 tuned this by eye; exposed so it can be retuned
+    /// without a rebuild).
+    pub bloom_intensity: f32,
 }
 
 impl Default for HeadsUpSky {
@@ -76,6 +88,12 @@ impl Default for HeadsUpSky {
             cloud_layer: None,
             exposure_ev100: 13.0,
             exposure_noise_amplitude: 0.15,
+            // Forced-clear defaults (`WeatherPreset::Clear`): a dry, calm sky
+            // that reads as scattered cumulus rather than a flat overcast.
+            relative_humidity: 0.62,
+            storminess: 0.0,
+            wind_speed_ms: 3.0,
+            bloom_intensity: 0.3,
         }
     }
 }
@@ -125,7 +143,7 @@ impl Plugin for SkyPlugin {
                     // the celestial/cloud consumers (set `Celestial`), so one
                     // coherent overridden `Weather` reaches lighting and the
                     // cloud layer derivation.
-                    apply_cloud_cover_override
+                    apply_weather_overrides
                         .after(ElementsSystems::Weather)
                         .before(ElementsSystems::Celestial),
                     // `update_layer` (in `Simulation`) re-derives the layer
@@ -134,12 +152,23 @@ impl Plugin for SkyPlugin {
                     // next frame — indistinguishable with a paused clock.
                     apply_cloud_layer_override.after(ElementsSystems::Simulation),
                     perturb_exposure,
+                    apply_bloom_intensity,
                 ),
             );
     }
 }
 
-fn apply_cloud_cover_override(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elements::Weather>) {
+/// Applies the tunable weather knobs to the director's `Weather` every frame.
+///
+/// `cloud_cover: None` keeps the forced-clear preset value, but humidity /
+/// storminess / wind are always applied: they only shape the cloud TYPE, and a
+/// panel that silently ignores three of its four knobs would be a trap. Wind is
+/// floored at the preset's value so a still day still drifts a little.
+fn apply_weather_overrides(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elements::Weather>) {
+    weather.relative_humidity = sky.relative_humidity.clamp(0.0, 1.0);
+    weather.storminess = sky.storminess.clamp(0.0, 6.0);
+    weather.wind_speed_ms = sky.wind_speed_ms.max(0.0);
+
     let Some(cover) = sky.cloud_cover else {
         return;
     };
@@ -175,6 +204,19 @@ fn perturb_exposure(
             + (p.z * 0.021 + 1.7).sin() * 0.3
             + ((p.x + p.z) * 0.005 + 4.1).sin() * 0.2;
         exposure.ev100 = sky.exposure_ev100 + amplitude * noise;
+    }
+}
+
+/// Keeps every `GoldenHourCamera` bloom in step with `HeadsUpSky::bloom_intensity`,
+/// so the panel's bloom knob takes effect on the next frame.
+fn apply_bloom_intensity(
+    sky: Res<HeadsUpSky>,
+    mut cameras: Query<&mut Bloom, With<ElementsCamera>>,
+) {
+    for mut bloom in &mut cameras {
+        if bloom.intensity != sky.bloom_intensity {
+            bloom.intensity = sky.bloom_intensity;
+        }
     }
 }
 

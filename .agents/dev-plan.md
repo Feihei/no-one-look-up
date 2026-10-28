@@ -204,6 +204,24 @@
 
 ---
 
+## 阶段 R5.1: 天空实时调参面板（2026-10-27）
+
+**目标**：云端与黄昏调参是迭代过程，参数互相影响（cover 改变云类型、湿度再改一次、曝光决定你能看到多少），改一次编译一次太慢。
+
+- [x] `plugins/sky_panel.rs`：F5 开关，Up/Down 选行，Left/Right 调值（长按连续）
+- [x] `HeadsUpSky` 扩展可调参数：`relative_humidity` / `storminess` / `wind_speed_ms` / `bloom_intensity`，与已有 `cloud_cover` / `cloud_layer` / `exposure_ev100` / `exposure_noise_amplitude` 凑成 9 行
+- [x] `apply_weather_overrides` 取代原 `apply_cloud_cover_override`：湿度/风暴/风速**始终生效**（只影响云的类型），cover 仍可保持 preset
+- [x] `apply_bloom_intensity`：面板改 bloom 下一帧生效
+- [x] 参数表用 `get`/`set` 闭包描述，新增参数只加一行；范围与步进各自声明，统一钳制
+- **测试**：面板关闭时不吞方向键；F5 切换 + 方向键改选中行；**每行按到两端都不越界、不出 NaN**（NaN 曝光会整帧变黑）；云层 base 永远小于 top
+- **实测**：游戏启动零告警零错误
+
+**面板刻意不包含的参数**：云密度、噪声缩放、march 步数——它们编译在 bevy_elements 的 shader 里，改它们需要 patch 依赖，属于另一个决策。
+
+**下一步**：用面板调云（先试 `CloudQuality` 抬到 High/Ultra，再看是否需要动噪声分辨率）。
+
+---
+
 ## 阶段 R5: 声音与润色（预计 2-3 天，原 M5 顺延）
 
 **目标**：环境音、配乐与细节打磨（原 M5 任务原样继承）。
