@@ -78,7 +78,9 @@ impl CloudKind {
             CloudKind::BrokenCumulus => 0.55,
             CloudKind::ToweringCumulus => 0.80,
             CloudKind::Stratocumulus => 0.65,
-            CloudKind::Overcast => 0.97,
+            // 0.9 rather than 0.97: the shader's deck mode saturates above
+            // ~0.95, which is where the layer stops showing any structure.
+            CloudKind::Overcast => 0.90,
         }
     }
 
@@ -113,9 +115,12 @@ impl CloudKind {
             CloudKind::ScatteredCumulus => (1200.0, 2600.0),
             CloudKind::BrokenCumulus => (1100.0, 3200.0),
             CloudKind::ToweringCumulus => (800.0, 7000.0),
-            CloudKind::Stratocumulus => (900.0, 1600.0),
-            // A lid 600 m thick reads as an unbroken overcast rather than fog.
-            CloudKind::Overcast => (700.0, 1400.0),
+            CloudKind::Stratocumulus => (900.0, 1500.0),
+            // A 300 m lid. A thick slab goes black at dusk: the sun sits at
+            // ~2.4 deg, so light has to cross the whole layer at a grazing
+            // angle to reach the base, and at 600 m it never arrives. Thin
+            // overcast still reads as unbroken cover without the blackout.
+            CloudKind::Overcast => (700.0, 1000.0),
         }
     }
 
@@ -410,5 +415,71 @@ impl Default for GoldenHourCamera {
                 ..Bloom::NATURAL
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_broken_or_overcast_layer_is_thick_enough_to_go_black() {
+        // Measured: with a 600 m overcast lid the GPU's measured transmittance
+        // under the camera decayed to ~1e-5 within ten seconds and the deck
+        // rendered black. The sun sits at ~2.4 deg at the golden hour, so
+        // light crosses the whole layer at a grazing angle and a thick,
+        // UNBROKEN lid never lights its own base.
+        //
+        // Disconnected cumulus is exempt: light passes through the gaps
+        // between puffs, and those kinds are the ones that already read
+        // correctly. The constraint is on the sheet-like kinds, where every
+        // ray meets the deck.
+        for kind in CloudKind::ALL {
+            let (base, top) = kind.layer();
+            let thickness = top - base;
+            // Feihei's field report: stratocumulus and overcast (the two
+            // low-topped, high-cover kinds) went black, while the cumulus
+            // kinds did not. Those two are the sheet-like ones, so the
+            // constraint is scoped to them rather than to a coverage number:
+            // a kind is sheet-like when its cover is high AND its top is low,
+            // i.e. a lid rather than a puff.
+            let sheet_like = kind.base_cover() >= 0.55 && top <= 2000.0;
+            if sheet_like {
+                assert!(
+                    thickness <= 1000.0,
+                    "{kind:?} covers {:.2} of the sky with a {thickness:.0} m lid; a                      sheet that thick goes black at the golden hour",
+                    kind.base_cover()
+                );
+            }
+            assert!(
+                thickness >= 200.0,
+                "{kind:?}: {thickness:.0} m is too thin to read"
+            );
+            assert!(
+                kind.base_cover() <= 0.90,
+                "{kind:?}: cover {} saturates the shader's deck mode",
+                kind.base_cover()
+            );
+        }
+    }
+
+    #[test]
+    fn stormy_kinds_are_the_tall_ones() {
+        // Towering cumulus is the one kind allowed to be tall: its height IS
+        // the feature. It is also the one the crate's storminess heuristic
+        // expects to tower.
+        let tall = CloudKind::ToweringCumulus.layer();
+        for kind in CloudKind::ALL {
+            if kind == CloudKind::ToweringCumulus {
+                continue;
+            }
+            let layer = kind.layer();
+            assert!(
+                layer.1 < tall.1,
+                "{kind:?} tops at {} m, not below towering {tall:?}",
+                layer.1
+            );
+        }
+        assert!(CloudKind::ToweringCumulus.storminess() > 1.0);
     }
 }
