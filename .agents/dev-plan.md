@@ -248,6 +248,20 @@
 - **测试**：`no_broken_or_overcast_layer_is_thick_enough_to_go_black`（层状云厚度上限；**积云豁免**——离散蓬松云块之间可透光，与连续云板物理不同，第一版测试一刀切把积云也判红，是错的）、`stormy_kinds_are_the_tall_ones`
 - **实测**：100 测试通过、clippy 零告警、游戏启动零告警
 
+### R5.4 dome 饱和带 + sky_gain 亮度反转（2026-10-27）
+
+**Feihei 反馈**：仍偏黑；只有 overcast 像自然云，stratocumulus 仍是圆饼+鸡蛋；**天空亮度随云量反向变化**（调高变亮、调低变暗）。
+
+- **stratocumulus 圆饼的真实原因（数学定位）**：shader 的 dome 强度是 `clamp(kind * 4, 0, 1)`，**在 `kind >= 0.25` 时就完全饱和**。原参数 cover 0.65 / rh 0.86 → `kind = 0.342` → dome 仍是满值 1.00，和普通积云一样
+  - 而 `kind_from_weather` 里 `stratus = smoothstep(0.5, 0.9, cover)`，cover 0.65 只贡献 0.28。**真正能压低 kind 的是 cover，不是 humidity**（rh 被 `smoothstep(0.9, 0.98, rh)` 卡住，0.86 贡献为 0）
+  - 修正：`Stratocumulus` cover 0.65 → **0.78**、rh 0.86 → 0.93、厚度 900–1500 → **900–1300**，`kind` 降到 0.108，**dome 0.43**（原 1.00）
+  - 这也解释了为什么 overcast 自然：`kind = 0.000`，dome 完全消失
+- **天空亮度反转的根因**：`composite.wesl` 有 `cloud.a *= mix(1.0, sky_gain, ...)`，而 `sky_gain = total / beam`。cover 越高 beam 越低、gain 越大：cover 0.90 时 gain **1.58**（天空放亮 58%）。crate 的假设是「天空在云层之上不该被下方云的遮挡影响」，但**黄昏低云时该假设不成立**
+  - 这是依赖库的设计取舍，**没有公开 API 可调**（`sky_gain` 是内部函数）。「调低云量变暗」实为天空从被放亮的 1.58 掉回正常，落差明显
+  - **未做补偿**：用曝光去抵消会引入「云量变化时曝光漂移」的新问题，且属观感权衡，留待 Feihei 决定
+- **测试**：`sheet_kinds_do_not_sit_in_the_dome_saturation_band`（层状云的 `kind` 必须 < 0.25，否则圆饼回归）、`cumulus_kinds_keep_the_dome`（积云必须保持 dome，否则蓬松感消失）。已验证**把 stratocumulus cover 改回 0.65 测试即失败**
+- **实测**：102 测试通过、clippy 零告警、游戏启动零告警
+
 **结论与边界**：方案 A 改的是「云的种类、比例、层次」，**改不了边缘细节**——要做碎边和不规则轮廓必须改噪声分辨率 + dome 因子（patch 依赖，方案 B）。Feihei 已知悉并选择先做 A。
 
 **下一步**：用面板实际试五种云，确认哪些可接受；若仍无法接受块状边缘，再走方案 B。

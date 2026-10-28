@@ -77,7 +77,7 @@ impl CloudKind {
             CloudKind::ScatteredCumulus => 0.30,
             CloudKind::BrokenCumulus => 0.55,
             CloudKind::ToweringCumulus => 0.80,
-            CloudKind::Stratocumulus => 0.65,
+            CloudKind::Stratocumulus => 0.78,
             // 0.9 rather than 0.97: the shader's deck mode saturates above
             // ~0.95, which is where the layer stops showing any structure.
             CloudKind::Overcast => 0.90,
@@ -92,7 +92,7 @@ impl CloudKind {
             CloudKind::ScatteredCumulus => 0.45,
             CloudKind::BrokenCumulus => 0.55,
             CloudKind::ToweringCumulus => 0.70,
-            CloudKind::Stratocumulus => 0.86,
+            CloudKind::Stratocumulus => 0.93,
             CloudKind::Overcast => 0.95,
         }
     }
@@ -115,7 +115,10 @@ impl CloudKind {
             CloudKind::ScatteredCumulus => (1200.0, 2600.0),
             CloudKind::BrokenCumulus => (1100.0, 3200.0),
             CloudKind::ToweringCumulus => (800.0, 7000.0),
-            CloudKind::Stratocumulus => (900.0, 1500.0),
+            // Thin and wide is what makes a stratocumulus deck; it is also
+            // the only way to keep the shader's dome factor weak (see the
+            // CloudKind docs).
+            CloudKind::Stratocumulus => (900.0, 1300.0),
             // A 300 m lid. A thick slab goes black at dusk: the sun sits at
             // ~2.4 deg, so light has to cross the whole layer at a grazing
             // angle to reach the base, and at 600 m it never arrives. Thin
@@ -459,6 +462,70 @@ mod tests {
                 kind.base_cover() <= 0.90,
                 "{kind:?}: cover {} saturates the shader's deck mode",
                 kind.base_cover()
+            );
+        }
+    }
+
+    /// Mirror of bevy_elements' `CloudLayer::kind_from_weather` (verified
+    /// against the crate's source; it is `pub(crate)` there).
+    fn kind_from_weather(cover: f32, rh: f32, storm: f32, wind: f32) -> f32 {
+        fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+            let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        let stratus = smoothstep(0.5, 0.9, cover).max(smoothstep(0.9, 0.98, rh));
+        let towering = (storm / 6.0)
+            .clamp(0.0, 1.0)
+            .max(smoothstep(12.0, 16.0, wind) * smoothstep(0.9, 1.0, cover));
+        0.5 * (1.0 - stratus) * (1.0 - towering) + towering
+    }
+
+    /// The shader's dome factor (`common.wesl::cloud_gradient`): 0 = no dome,
+    /// 1 = full "half an egg" rounding. It saturates at `kind >= 0.25`.
+    fn dome_strength(kind: f32) -> f32 {
+        (kind * 4.0).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn sheet_kinds_do_not_sit_in_the_dome_saturation_band() {
+        // Feihei: "stratocumulus is all flat disc with half an egg on top,
+        // only overcast looks natural". Cause: `dome_strength` is
+        // `clamp(kind * 4, 0, 1)`, so it is fully saturated for any
+        // `kind >= 0.25` — a stratocumulus at cover 0.65 / rh 0.86 produced
+        // kind 0.342 and therefore the SAME dome as plain cumulus.
+        //
+        // The two sheet-like kinds must stay clear of that band. Cumulus is
+        // exempt: there the dome is the point.
+        for kind in [CloudKind::Stratocumulus, CloudKind::Overcast] {
+            let (base, _) = kind.layer();
+            let _ = base;
+            let index = kind_from_weather(
+                kind.base_cover(),
+                kind.humidity(),
+                kind.storminess(),
+                kind.wind(),
+            );
+            assert!(
+                index < 0.25,
+                "{kind:?} resolves to cloud type {index:.3}, which saturates the                  shader's dome factor (>= 0.25) and renders as a disc with an egg                  on top; raise its cover instead"
+            );
+        }
+    }
+
+    #[test]
+    fn cumulus_kinds_keep_the_dome() {
+        // The flip side: if the cumulus kinds ever drop below the band the
+        // puffs lose their rounded tops and read as slabs.
+        for kind in [CloudKind::ScatteredCumulus, CloudKind::BrokenCumulus] {
+            let index = kind_from_weather(
+                kind.base_cover(),
+                kind.humidity(),
+                kind.storminess(),
+                kind.wind(),
+            );
+            assert!(
+                dome_strength(index) > 0.9,
+                "{kind:?} lost its dome (cloud type {index:.3}); cumulus should                  stay rounded"
             );
         }
     }
