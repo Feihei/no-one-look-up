@@ -1,0 +1,112 @@
+[package]
+name = "bevy_elements"
+version = "0.5.3"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Living environments for Bevy: sun, moon and stars, climate-driven weather, GPU wind, volumetric clouds, rain, snow and fog, lightning, terrain with hydraulic and thermal erosion, flooding, snow cover, wetness and dust — simulated in compute shaders."
+license = "MIT OR Apache-2.0"
+authors = ["C. Thomas Brittain <cthomasbrittain@yahoo.com>"]
+repository = "https://github.com/Ladvien/bevy_elements"
+documentation = "https://docs.rs/bevy_elements"
+readme = "README.md"
+# `bevy` first: it is the term a Bevy user searches, and crates.io weights keyword position.
+keywords = ["bevy", "weather", "terrain", "erosion", "atmosphere"]
+categories = ["game-development", "graphics", "rendering"]
+exclude = ["docs/*.gif", "docs/*.png", "docs/research/*", "tools/*"]
+
+# docs.rs builds with every feature so the optional integrations are visible to someone choosing
+# the crate, not only to someone who has already checked out the source.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# `serde` derives on the public settings, presets and messages.
+serde = ["dep:serde"]
+# Drive `bevy_flora`'s global wind, season and wetness from this crate (`ElementsFloraPlugin`).
+flora = ["dep:bevy_flora"]
+# Volumetric snow on `bevy_isomesh` voxel volumes (`VoxelPlugin`, `VoxelGround`, `SnowyField`).
+isomesh = ["dep:bevy_isomesh", "dep:isomesh"]
+
+[dependencies]
+# The umbrella with defaults off. Features unify with the game's full bevy, so this costs a consumer
+# nothing; the list is the minimal set for which `cargo build --release` passes.
+bevy = { version = "0.20.0", default-features = false, features = [
+    "std",
+    "bevy_asset",         # Assets<T>, Handle<T>, embedded shaders, RenderAssetUsages
+    "bevy_render",        # compute pipelines, ShaderBuffer, readback, RenderGraph schedule
+    "bevy_core_pipeline", # Core3d schedule, camera_driver, DepthPrepass
+    "bevy_pbr",           # AtmosphereSettings, DistanceFog, materials
+    "bevy_light",         # DirectionalLight, Atmosphere, SunDisk, FogVolume, VolumetricFog
+    "bevy_camera",        # Camera, Hdr, Exposure, Projection
+    "bevy_image",         # Image, 3D storage textures, samplers
+    "bevy_mesh",          # Mesh for the star field and the moon disc
+    "bevy_shader",        # Shader, load_shader_library!, ShaderCacheError
+    "bevy_log",           # warn!/error! for misconfiguration and failed kernels
+    "bevy_color",         # Color for lights and fog
+] }
+serde = { version = "1", features = ["derive"], optional = true }
+# Plain-old-data casts for the GPU uniform structs and the readback decode.
+bytemuck = { version = "1", features = ["derive"] }
+# Optional sibling: trees and their wind, season and wetness belong to `bevy_flora`; this crate
+# only writes its public resources (feature `flora`). Same Bevy minor (0.20).
+bevy_flora = { version = "0.30", optional = true, default-features = false }
+bevy_isomesh = { version = "0.0.11", optional = true }
+isomesh = { version = "0.0.11", optional = true }
+
+# **Tests and examples only.** The examples need a window and the full 3D pipeline, so they take the
+# full umbrella here, where it cannot reach a consumer's dependency graph. `tests/leaf.rs` reads
+# `[dependencies]` only, deliberately.
+[dev-dependencies]
+bevy = { version = "0.20.0" }
+serde_json = "1"
+
+# Compute shaders are not in WebGL2, so wasm means WebGPU. `web` makes `bevy::platform::time::Instant`
+# use `web_time` rather than a `std::time::Instant` whose `now()` panics on wasm.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+bevy = { version = "0.20.0", default-features = false, features = ["web", "webgpu"] }
+
+[[example]]
+name = "flora_wind"
+required-features = ["flora"]
+
+[[example]]
+name = "voxel_snow"
+required-features = ["isomesh"]
+
+[[test]]
+name = "save"
+required-features = ["serde"]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+# Simulation and rendering in a debug build is 20-50x slower and makes it look as if the algorithm
+# is wrong rather than the profile. Examples are always run with --release; this keeps a debug run
+# merely slow rather than unusable. debuginfo 0 rather than the default 2: a Bevy example's
+# debuginfo link ran CI's 7 GB runner out of memory (`ld terminated with signal 7 [Bus
+# error]`, twice, on `weathered_town` and `erosion_bake`; bevy_isomesh measured the same
+# size at ~2 GB per example). A backtrace still has function names without line numbers.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = 0
+
+# Bevy's wasm binary is size-bound, not arithmetic-bound, so `s` beats `3` and `thin` beats `fat`:
+# fat LTO on a 30 MB module costs minutes per example. `strip = "debuginfo"` rather than `true`
+# because the name section is dropped by `wasm-bindgen`, the tool that knows what it may drop.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

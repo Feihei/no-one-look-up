@@ -531,6 +531,68 @@ mod tests {
     }
 
     #[test]
+    fn the_vendored_cloud_shader_patches_are_present() {
+        // The vendored crate replaces upstream through `[patch.crates-io]`.
+        // If it is dropped (a fresh `cargo update`, a forgotten re-merge) the
+        // cloud artefacts come back silently, because nothing else in the
+        // game depends on those three lines. This is the tripwire.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join("vendor/bevy_elements").join(rel))
+                .unwrap_or_else(|err| panic!("cannot read {rel}: {err}"))
+        };
+
+        let manifest = read("Cargo.toml");
+        assert!(
+            manifest.contains("name = \"bevy_elements\""),
+            "the vendored crate is missing its own manifest"
+        );
+        let root_manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+        // Look for the actual assignment, not the substring: a commented-out
+        // or renamed line still contains the path.
+        let patched = root_manifest.lines().any(|line| {
+            let line = line.trim();
+            !line.starts_with('#')
+                && line.starts_with("bevy_elements")
+                && line.contains("vendor/bevy_elements")
+        });
+        assert!(
+            patched,
+            "the root manifest no longer patches bevy_elements to the vendored copy;              the cloud fixes are not in effect"
+        );
+
+        // Dome: widened ramp, gentler profile, per-blob jitter.
+        let common = read("src/clouds/common.wesl");
+        assert!(
+            common.contains("smoothstep(0.05, 0.55, kind)"),
+            "the dome ramp is back to the saturating `clamp(kind * 4, 0, 1)`"
+        );
+        assert!(
+            common.contains("pow(dome, 0.62)"),
+            "the dome profile is back to the half-ellipse `sqrt(dome)`"
+        );
+        assert!(
+            common.contains("dome_jitter"),
+            "per-blob dome jitter is gone, so every cloud is identical again"
+        );
+
+        // Dome width.
+        let weather = read("src/clouds/weather.wesl");
+        assert!(
+            weather.contains("const DOME_WIDTH: f32 = 0.30;"),
+            "DOME_WIDTH is back to 0.37"
+        );
+
+        // Sky gain fade.
+        let celestial = read("src/celestial/mod.rs");
+        assert!(
+            celestial.contains("dusk_gain_fade"),
+            "the sky-gain dusk fade is gone; the sky will brighten as cloud rises"
+        );
+    }
+
+    #[test]
     fn stormy_kinds_are_the_tall_ones() {
         // Towering cumulus is the one kind allowed to be tall: its height IS
         // the feature. It is also the one the crate's storminess heuristic

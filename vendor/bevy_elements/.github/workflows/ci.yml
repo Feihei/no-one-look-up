@@ -1,0 +1,87 @@
+# CI for bevy_elements (canonical repository).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (standalone) + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bevy build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # **The load-bearing step, and it is `build` rather than `test` deliberately.**
+      #
+      # `cargo test` compiles dev-dependencies, and this crate's dev-dependency is the FULL `bevy`
+      # umbrella — the examples need a window and a camera, while the crate itself is trimmed to the
+      # features it names. Cargo unifies features across a build, so under `cargo test` the crate
+      # silently receives every Bevy feature there is, and a hole in its own `[dependencies]` feature
+      # list cannot fail.
+      #
+      # The sibling crate `bevy_autogib` shipped exactly that hole: it named a type behind a feature it
+      # never declared, every test passed, and the published crate did not compile for anyone. A plain
+      # `cargo build` takes no dev-dependencies, so it compiles what a consumer actually gets.
+      - name: Build with only the declared features
+        run: cargo build --release
+
+      # Includes `tests/leaf.rs`, the boundary ratchet. GPU tests are `#[ignore = "needs a GPU"]` and
+      # never run here. The `isomesh` feature's crate compiles with the published isomesh 0.0.11:
+      # its module and the `voxel_snow` example are feature-gated, so a plain `cargo test` skips
+      # them and every voxel test would only ever run on a feature-enabled machine.
+      - name: Test
+        run: cargo test
+
+      - name: Test the isomesh feature
+        run: cargo test --features=isomesh --lib
+
+      # Debug-info debugprofile links of a Bevy example ran the runner out of memory:
+      # `ld terminated with signal 7 [Bus error]` (bevy_isomesh made the same failure
+      # visible at 2 GB of debuginfo per example). Examples only have to load; the
+      # profile keeps debuginfo turned down for this build alone.
+      - name: Build examples
+        run: env RUSTFLAGS="-C debuginfo=0" cargo build --examples --all-features
+
+  lint:
+    name: fmt + clippy + doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bevy build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  wasm:
+    name: wasm32 (WebGPU) library build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo build --lib --target wasm32-unknown-unknown

@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 
 [workspace]
 # Single-package workspace root; members may be split out later if needed.
+# The vendored cloud crate is a `[patch]` source, not a workspace member: it
+# has its own lockfile and tests.
+exclude = ["vendor/bevy_elements"]
 
 [dependencies]
 bevy = { version = "=0.20.0", features = ["serialize"] }
@@ -16,6 +19,14 @@ rand = "0.9"
 rand_chacha = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[patch.crates-io]
+# bevy_elements with three cloud fixes the game needs and the crate does not
+# expose: the shader's dome factor is fully saturated for any cloud type at or
+# above 0.25 (so stratocumulus renders as a flat disc with half an egg on top),
+# its rounding curve is a clean sqrt, and `sky_gain` brightens the sky as cover
+# rises. See `vendor/bevy_elements/PATCHES.md`. Re-merge these on upgrade.
+bevy_elements = { path = "vendor/bevy_elements" }
 
 [profile.dev]
 # Keep iteration fast while still allowing debuggable game code.

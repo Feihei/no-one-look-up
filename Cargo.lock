@@ -858,8 +858,6 @@ dependencies = [
 [[package]]
 name = "bevy_elements"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c163b3c00cba34113ef489ba28d25da20453acf0625bfef44bea29669eb321e5"
 dependencies = [
  "bevy",
  "bytemuck",
