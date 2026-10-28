@@ -7,7 +7,17 @@
 /vendor/*/Cargo.lock
 
 # Assets (models/images stay local-only; not committed for now)
-/assets/
+# (Leading slash + directory: git cannot re-include a path inside an excluded
+# directory, so the shader exception below has to un-ignore the parents first.)
+/assets/*
+# ...except shader sources: they are code, not content, and the game will not
+# run without them (a missing shader shows up as an invisible effect, not an
+# error).
+!/assets/shaders/
+# The shader must be `.wesl`: `#import`/`import` are WESL syntax and a `.wgsl`
+# file is fed to plain WGSL, which rejects the imports. A stale copy with the
+# wrong extension is a trap, not a file.
+/assets/shaders/*.wgsl
 
 # Agent/session housekeeping
 /.box-agent/

@@ -46,6 +46,13 @@ pub enum SkyValue {
     CloudKind,
     /// Cloud amount, which only has meaning when a kind is selected.
     CloudAmount,
+    /// A cirrus setting: high wispy cloud, a separate cheap layer (R5.6).
+    Cirrus(
+        fn(&crate::plugins::cirrus::CirrusSettings) -> f32,
+        fn(&mut crate::plugins::cirrus::CirrusSettings, f32),
+        f32,
+        (f32, f32),
+    ),
 }
 
 /// One tunable row.
@@ -130,6 +137,18 @@ pub const PARAMS: &[SkyParam] = &[
         },
     },
     SkyParam {
+        name: "cirrus amount",
+        value: SkyValue::Cirrus(|c| c.amount, |c, v| c.amount = v, 0.02, (0.0, 1.0)),
+    },
+    SkyParam {
+        name: "cirrus stretch",
+        value: SkyValue::Cirrus(|c| c.stretch, |c, v| c.stretch = v, 0.2, (1.0, 8.0)),
+    },
+    SkyParam {
+        name: "cirrus scale",
+        value: SkyValue::Cirrus(|c| c.scale, |c, v| c.scale = v, 0.1, (0.2, 12.0)),
+    },
+    SkyParam {
         name: "exposure ev",
         value: SkyValue::Float {
             get: |sky| sky.exposure_ev100,
@@ -187,6 +206,7 @@ fn sky_panel_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<SkyPanelState>,
     mut sky: ResMut<HeadsUpSky>,
+    mut cirrus: ResMut<crate::plugins::cirrus::CirrusSettings>,
 ) {
     if keys.just_pressed(DEV_TOGGLE_SKY_PANEL) {
         state.open = !state.open;
@@ -250,7 +270,7 @@ fn sky_panel_input(
         } => {
             let next = (get(&sky) + direction * step).clamp(range.0, range.1);
             set(&mut sky, next);
-            info!("{} = {}", param.name, format_row(param, &sky));
+            info!("{} = {}", param.name, format_row(param, &sky, &cirrus));
         }
         SkyValue::CloudKind => {
             // Cycling is discrete: a held key must not spin through every
@@ -264,18 +284,27 @@ fn sky_panel_input(
                     // happened"; give it a visible default.
                     sky.cloud_amount = 0.35;
                 }
-                info!("{} = {}", param.name, format_row(param, &sky));
+                info!("{} = {}", param.name, format_row(param, &sky, &cirrus));
             }
         }
         SkyValue::CloudAmount => {
             sky.cloud_amount = (sky.cloud_amount + direction * 0.02).clamp(0.0, 1.0);
-            info!("{} = {}", param.name, format_row(param, &sky));
+            info!("{} = {}", param.name, format_row(param, &sky, &cirrus));
+        }
+        SkyValue::Cirrus(get, set, step, range) => {
+            let next = (get(&cirrus) + direction * step).clamp(range.0, range.1);
+            set(&mut cirrus, next);
+            info!("{} = {}", param.name, format_row(param, &sky, &cirrus));
         }
     }
 }
 
 /// Renders a row's value for the panel and the log line.
-fn format_row(param: &SkyParam, sky: &HeadsUpSky) -> String {
+fn format_row(
+    param: &SkyParam,
+    sky: &HeadsUpSky,
+    cirrus: &crate::plugins::cirrus::CirrusSettings,
+) -> String {
     match &param.value {
         SkyValue::Float { get, decimals, .. } => format!("{:.*}", decimals, get(sky)),
         SkyValue::CloudKind => match sky.cloud_kind {
@@ -289,6 +318,7 @@ fn format_row(param: &SkyParam, sky: &HeadsUpSky) -> String {
                 "-".to_string()
             }
         }
+        SkyValue::Cirrus(get, _, _, _) => format!("{:.2}", get(cirrus)),
     }
 }
 
@@ -297,6 +327,7 @@ fn format_row(param: &SkyParam, sky: &HeadsUpSky) -> String {
 fn sky_panel_ui(
     state: Res<SkyPanelState>,
     sky: Res<HeadsUpSky>,
+    cirrus: Res<crate::plugins::cirrus::CirrusSettings>,
     mut commands: Commands,
     roots: Query<Entity, With<SkyPanelRoot>>,
     mut cached: Local<Option<(bool, usize, Vec<String>)>>,
@@ -306,7 +337,7 @@ fn sky_panel_ui(
             .iter()
             .enumerate()
             .map(|(index, param)| {
-                let value = format_row(param, &sky);
+                let value = format_row(param, &sky, &cirrus);
                 let marker = if index == state.selected { ">" } else { " " };
                 format!("{marker} {:<14} {}", param.name, value)
             })
@@ -380,6 +411,7 @@ mod tests {
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<SkyPanelState>()
             .init_resource::<HeadsUpSky>()
+            .init_resource::<crate::plugins::cirrus::CirrusSettings>()
             .add_systems(Update, sky_panel_input);
         app
     }
