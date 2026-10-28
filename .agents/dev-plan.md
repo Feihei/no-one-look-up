@@ -262,7 +262,25 @@
 - **测试**：`sheet_kinds_do_not_sit_in_the_dome_saturation_band`（层状云的 `kind` 必须 < 0.25，否则圆饼回归）、`cumulus_kinds_keep_the_dome`（积云必须保持 dome，否则蓬松感消失）。已验证**把 stratocumulus cover 改回 0.65 测试即失败**
 - **实测**：102 测试通过、clippy 零告警、游戏启动零告警
 
-**结论与边界**：方案 A 改的是「云的种类、比例、层次」，**改不了边缘细节**——要做碎边和不规则轮廓必须改噪声分辨率 + dome 因子（patch 依赖，方案 B）。Feihei 已知悉并选择先做 A。
+### R5.5 方案 B（部分）：vendored bevy_elements，修 dome 与 sky_gain（2026-10-27）
+
+方案 A 的两处残留都要改 shader，而 shader 是 `load_embedded_asset!` 编译期嵌入的，**没有运行时覆盖手段**。按 Feihei 选择「只改 dome 和 sky_gain、不碰噪声」，把 crate vendored 进项目（`vendor/bevy_elements`，仅 2.5 MB 源码）通过 `[patch.crates-io]` 接入。
+
+- [x] **dome 饱和带**：`clamp(kind * 4, 0, 1)` 在 `kind >= 0.25` 全饱和，而 `kind_from_weather` 把多数积云放在 0.34–0.50 → 散积云/碎积云/层积云拿到**同一个** dome。改为 `smoothstep(0.05, 0.55, kind)`
+- [x] **dome 剖面是半椭圆**：`sqrt(dome)` 上升过陡 → 改为 `pow(dome, 0.62)`，并用基础噪声绿通道做**逐云块抖动** `[0.65, 1.35]`，相邻云不再完全一样
+- [x] `DOME_WIDTH` 0.37 → **0.30**（满高度只保留在云块核心）
+- [x] **sky_gain 亮度反转**：`total / beam` 在 cover 0.90 时达 **1.58**，且作用在天空像素上。crate 假设「云层之上的天空不被云层遮挡」，高日角成立、**黄昏 2.4° 不成立**。改为按太阳高度 2°–25° 用 smoothstep 淡出，25° 以上行为不变（上游自带测试仍通过）
+- [x] **`Cargo.toml` 排除 workspace**：vendored crate 有自己的 lockfile 与测试，不该作为 member
+- [x] **`.gitignore`**：`/vendor/*/target`（跑一次测试就 2.1 GB）与 `Cargo.lock`
+- [x] **`vendor/bevy_elements/PATCHES.md`**：逐条记录改动、原因、代码位置，并注明**升级时必须重新合并**
+- **测试**：`the_vendored_cloud_shader_patches_are_present` —— 同时检查 vendored 源码里三处表达式**和** root manifest 的 patch 行是否**真的启用**（不是仅作为注释存在）。已验证：注释掉该行测试即失败
+- **实测**：103 测试通过、clippy 零告警、游戏运行 20 s 零告警（**同时证明两个 WGSL 文件编译通过**——shader 错误会在 pipeline 创建时暴露）
+
+**刻意没做**：
+- **噪声分辨率**（128³/32³）未动。形状与边缘是两个问题，同时改会让结果难以归因；抬高到 256³ 约 +128 MB 显存，等形状定稿后再单独评估
+- **连续云板黄昏变黑**未用 shader 硬补环境光，而是靠游戏侧把层状云做薄（见 `CloudKind::layer`）
+
+**结论与边界**：方案 A 改的是「云的种类、比例、层次」，**改不了边缘细节**——要做碎边和不规则轮廓必须改噪声分辨率。Feihei 已知悉并选择先做 A，dome/sky_gain 已通过 vendor 修复。
 
 **下一步**：用面板实际试五种云，确认哪些可接受；若仍无法接受块状边缘，再走方案 B。
 
