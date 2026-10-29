@@ -423,6 +423,27 @@ mod tests {
     }
 
     #[test]
+    fn the_shader_flips_the_fragment_y_axis() {
+        // `in.position.xy` is a fragment coordinate: origin top-left, y DOWN.
+        // NDC is (-1,-1) bottom-left, (1,1) top-right, so y must be flipped.
+        // Without the flip the sky is mirrored vertically and the pattern
+        // appears to move the wrong way as the camera tilts -- the reported
+        // "the texture follows the view".
+        let shader = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cirrus.wesl"),
+        )
+        .expect("cirrus shader");
+        assert!(
+            shader.contains("1.0 - uv.y * 2.0"),
+            "the fragment y axis is no longer flipped; NDC is y-up and the              fragment coordinate is y-down"
+        );
+        assert!(
+            !shader.contains("(pixel / view.viewport.zw) * 2.0 - 1.0)"),
+            "the unflipped NDC expression is back"
+        );
+    }
+
+    #[test]
     fn the_shader_does_not_unproject_the_degenerate_far_plane() {
         // Bevy's projection is reverse-Z with an INFINITE far plane: depth 1.0
         // is the near plane, depth 0.0 is the point at infinity. Unprojecting

@@ -106,8 +106,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // every triangle edge -- which reads as seams radiating over the sky.
     // Unprojecting the pixel is exact for every fragment, seam-free, and it
     // also removes the dependence on how many triangles the dome has.
-    // NDC from the fragment's pixel coordinate (viewport origin at 0,0 here).
-    let ndc = vec2<f32>(in.position.xy / view.viewport.zw) * 2.0 - 1.0;
+    // NDC from the fragment's pixel coordinate. `viewport` is
+    // (origin.x, origin.y, width, height): the ORIGIN MUST BE SUBTRACTED,
+    // otherwise a viewport that does not start at (0, 0) shifts the whole
+    // pattern, and the shift changes with the view -- which reads as the cloud
+    // texture sliding as the camera turns.
+    let pixel = in.position.xy - view.viewport.xy;
+    let uv = pixel / view.viewport.zw;
+    // `in.position.xy` is a FRAGMENT coordinate: origin top-left, y DOWN.
+    // NDC has y UP, so the y term must be flipped. Without the flip the whole
+    // sky is mirrored vertically, which makes the pattern move the "wrong way"
+    // as the camera tilts.
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
     // Bevy uses REVERSE-Z with an INFINITE far plane: depth 1.0 is the near
     // plane and 0.0 is the point at infinity. Unprojecting depth 0.0 divides
