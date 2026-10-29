@@ -33,6 +33,14 @@ use bevy::shader::ShaderRef;
 ///   leaves the dome comfortably behind everything that can be drawn.
 pub const DOME_RADIUS: f32 = 900.0;
 
+/// Icosphere parameter for the dome.
+///
+/// **Beware the meaning**: this Bevy version's `SphereMeshBuilder::ico(n)`
+/// produces `20 * (n + 1)^2` triangles, NOT the `20 * 4^n` of classic
+/// subdivision -- `ico(3)` is 320 triangles, not 1280 (measured). 7 => 1280,
+/// which keeps the silhouette smooth without being wasteful.
+const DOME_SUBDIVISIONS: u32 = 7;
+
 /// Cirrus look and placement, kept in one struct so the sky panel (R5.1) can
 /// drive it and the values can be asserted without a GPU.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
@@ -147,7 +155,7 @@ fn spawn_dome(
     commands.spawn((
         Name::new("CirrusDome"),
         CirrusDome,
-        Mesh3d(meshes.add(uv_sphere(DOME_RADIUS))),
+        Mesh3d(meshes.add(dome_sphere(DOME_RADIUS))),
         MeshMaterial3d(materials.add(CirrusMaterial::default())),
         // No scale flip. A negative scale mirrors the geometry, which does
         // NOT reliably reverse triangle winding (verified: the cross product
@@ -161,18 +169,27 @@ fn spawn_dome(
     ));
 }
 
-/// A sphere mesh at `radius`, **wound inside-out**.
+/// An **icosphere** at `radius`, wound inside-out.
 ///
-/// The camera sits at the centre and looks at the inside surface, so every
-/// triangle would be back-facing and culled. Bevy's `Material` trait has no
-/// `cull_mode` hook, so the fix has to be in the geometry: reverse each
-/// triangle's index order and the same faces become front-facing from within.
+/// Icosphere, not UV sphere: a UV sphere's poles pinch into slivers (measured
+/// on the default 32x64 sphere: the first polar ring's triangles have an
+/// aspect ratio of 0.098, i.e. long thin needles). Rasterising those produces
+/// interpolation artefacts that read as radiation-stripes converging on the
+/// pole -- which is what a "seam" looked like in the sky. An icosphere's
+/// triangles are near-equilateral everywhere and it has no poles.
 ///
-/// (`ico()` returns a `Result` and a fallback mesh would be a silently
-/// invisible dome; the UV sphere cannot fail and its seams do not matter for a
-/// noise pattern.)
-fn uv_sphere(radius: f32) -> Mesh {
-    let mut mesh = Sphere::new(radius).mesh().build();
+/// Inside-out winding: the camera sits at the centre and looks at the inner
+/// surface, so every triangle would be back-facing and culled. Bevy's
+/// `Material` trait has no `cull_mode` hook, so the fix has to be in the
+/// geometry: swap each triangle's last two indices and the same faces become
+/// front-facing from within.
+fn dome_sphere(radius: f32) -> Mesh {
+    let mut mesh = Sphere::new(radius)
+        .mesh()
+        .ico(DOME_SUBDIVISIONS)
+        // 3 subdivisions is ~1.3 k triangles: smooth enough that no triangle
+        // edge is visible in a soft noise field, cheap enough to ignore.
+        .unwrap_or_else(|_| Sphere::new(radius).mesh().build());
     match mesh.indices_mut() {
         Some(bevy::mesh::Indices::U32(indices)) => {
             for triangle in indices.as_chunks_mut::<3>().0 {
@@ -355,13 +372,85 @@ mod tests {
     }
 
     #[test]
+    fn the_dome_has_no_polar_slivers() {
+        // A UV sphere pinches at its poles into needles: on Bevy's default
+        // 32x64 sphere the first polar ring's triangles measure an aspect
+        // ratio of 0.098. Rasterising those produces interpolation artefacts
+        // that read as seams radiating over the sky.
+        //
+        // An icosphere must stay near-equilateral everywhere. This walks every
+        // triangle and bounds the worst aspect ratio, so a future switch back
+        // to a UV sphere (or a coarser subdivision) fails loudly.
+        let mesh = dome_sphere(DOME_RADIUS);
+        let positions = mesh
+            .attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION)
+            .expect("positions");
+        let Some(bevy::mesh::Indices::U32(indices)) = mesh.indices() else {
+            panic!("expected u32 indices");
+        };
+        let pos = |i: u32| -> Vec3 {
+            match positions {
+                bevy::mesh::VertexAttributeValues::Float32x3(values) => {
+                    Vec3::from_array(values[i as usize])
+                }
+                other => panic!("unexpected position format {other:?}"),
+            }
+        };
+
+        let mut worst = f32::INFINITY;
+        let mut counted = 0usize;
+        for triangle in indices.as_chunks::<3>().0 {
+            let (a, b, c) = (pos(triangle[0]), pos(triangle[1]), pos(triangle[2]));
+            // Aspect = 4*sqrt(3)*area / (sum of squared edges): 1 for an
+            // equilateral triangle, -> 0 as it degenerates to a needle.
+            let area = (b - a).cross(c - a).length() * 0.5;
+            let sum_sq =
+                (b - a).length_squared() + (c - b).length_squared() + (a - c).length_squared();
+            if sum_sq <= f32::EPSILON {
+                continue;
+            }
+            let aspect = 4.0 * 3.0f32.sqrt() * area / sum_sq;
+            worst = worst.min(aspect);
+            counted += 1;
+        }
+        assert!(counted > 500, "only {counted} triangles");
+        // 0.8 allows some distortion at the seam where the icosphere's base
+        // icosahedron edges meet; a UV sphere sits at ~0.1.
+        assert!(
+            worst > 0.8,
+            "worst triangle aspect ratio is {worst:.3}; the dome has slivers              (a UV sphere measures ~0.1) and will show radial seams"
+        );
+    }
+
+    #[test]
+    fn the_shader_rebuilds_the_direction_from_the_pixel() {
+        // Interpolating `world_position` across 135 m triangles makes the
+        // view direction deviate by up to 2.8e-3 rad and jump across every
+        // triangle edge -- the seam. The fragment stage must unproject the
+        // pixel instead; this pins that, because reverting to interpolation
+        // is a one-line change that looks harmless.
+        let shader = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cirrus.wesl"),
+        )
+        .expect("cirrus shader");
+        assert!(
+            shader.contains("world_from_clip"),
+            "the shader no longer unprojects the pixel; the view direction is              interpolated again and triangle seams will return"
+        );
+        assert!(
+            !shader.contains("normalize(in.world_position.xyz - view.world_position.xyz)"),
+            "the interpolated-direction expression is back"
+        );
+    }
+
+    #[test]
     fn the_dome_geometry_faces_inward() {
         // The camera is inside the dome and Bevy culls back faces for every
         // alpha mode (`cull_mode: Some(Face::Back)`), so a normally-wound
         // sphere renders NOTHING from within. The mesh is wound inside-out;
         // this asserts that, because the failure mode is a completely
         // invisible sky with no error to point at.
-        let mesh = uv_sphere(DOME_RADIUS);
+        let mesh = dome_sphere(DOME_RADIUS);
         let positions = mesh
             .attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION)
             .expect("positions");

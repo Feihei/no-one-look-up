@@ -97,9 +97,24 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // View direction in world space: the dome is centred on the camera, so the
-    // surface point minus the eye is the direction for this pixel.
-    let dir = normalize(in.world_position.xyz - view.world_position.xyz);
+    // View direction, rebuilt from the PIXEL's clip position rather than
+    // interpolated from the dome's vertices.
+    //
+    // Interpolating `world_position` across a 900 m dome with subdiv-3
+    // triangles (edge ~135 m) makes the direction deviate by up to
+    // 2.8e-3 rad from the true one, and the error changes abruptly across
+    // every triangle edge -- which reads as seams radiating over the sky.
+    // Unprojecting the pixel is exact for every fragment, seam-free, and it
+    // also removes the dependence on how many triangles the dome has.
+    // NDC from the fragment's pixel coordinate (viewport origin at 0,0 here).
+    let ndc = vec2<f32>(in.position.xy / view.viewport.zw) * 2.0 - 1.0;
+    // Two points on the ray: one just past the near plane, one at the far
+    // plane. Using the DIFFERENCE avoids any dependence on `w` at a single
+    // depth, which is where a projection matrix loses precision.
+    let near_h = view.world_from_clip * vec4<f32>(ndc, 0.0, 1.0);
+    let far_h = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
+    let ray = far_h.xyz / far_h.w - near_h.xyz / near_h.w;
+    let dir = normalize(ray);
     // Cirrus lives above the horizon; everything below is the ground's business.
     if (dir.y < 0.02) {
         discard;
