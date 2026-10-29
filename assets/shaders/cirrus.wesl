@@ -108,13 +108,19 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // also removes the dependence on how many triangles the dome has.
     // NDC from the fragment's pixel coordinate (viewport origin at 0,0 here).
     let ndc = vec2<f32>(in.position.xy / view.viewport.zw) * 2.0 - 1.0;
-    // Two points on the ray: one just past the near plane, one at the far
-    // plane. Using the DIFFERENCE avoids any dependence on `w` at a single
-    // depth, which is where a projection matrix loses precision.
-    let near_h = view.world_from_clip * vec4<f32>(ndc, 0.0, 1.0);
-    let far_h = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
-    let ray = far_h.xyz / far_h.w - near_h.xyz / near_h.w;
-    let dir = normalize(ray);
+
+    // Bevy uses REVERSE-Z with an INFINITE far plane: depth 1.0 is the near
+    // plane and 0.0 is the point at infinity. Unprojecting depth 0.0 divides
+    // by `w == 0` and yields NaN/inf, which normalises to NaN -- and a NaN
+    // direction fails the `dir.y` test below, so every fragment is discarded
+    // and the cirrus silently disappears.
+    //
+    // Take two FINITE depths instead and use the difference: exact in
+    // direction, immune to the degenerate far plane, and independent of where
+    // the near plane happens to sit.
+    let a_h = view.world_from_clip * vec4<f32>(ndc, 0.95, 1.0);
+    let b_h = view.world_from_clip * vec4<f32>(ndc, 0.55, 1.0);
+    let dir = normalize(b_h.xyz / b_h.w - a_h.xyz / a_h.w);
     // Cirrus lives above the horizon; everything below is the ground's business.
     if (dir.y < 0.02) {
         discard;

@@ -206,9 +206,14 @@ impl Default for HeadsUpSky {
                 longitude_deg: 126.4,
                 utc_offset_hours: 8.0,
             },
-            // ADR-0001 asks for a mostly clear dusk with a few low clouds.
-            cloud_kind: Some(CloudKind::ScatteredCumulus),
-            cloud_amount: 0.35,
+            // Volume clouds start OFF. Feihei's call (2026-10-27): the crate's
+            // volumetric layer reads as blocky geometry at the golden hour and
+            // no parameter fixes that (the silhouette is quantised at 32-64 m
+            // by fixed noise resolutions). A clear dusk is also closer to
+            // ADR-0001, and cirrus is available as a cheap alternative. Turn a
+            // kind back on with F5 when it is wanted.
+            cloud_kind: None,
+            cloud_amount: 0.0,
             cloud_layer: None,
             exposure_ev100: 13.0,
             exposure_noise_amplitude: 0.15,
@@ -424,6 +429,27 @@ impl Default for GoldenHourCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_clouds_ship_disabled() {
+        // Feihei's decision (2026-10-27): the volumetric layer reads as blocky
+        // geometry at the golden hour, and no parameter fixes it -- the
+        // silhouette is quantised at 32-64 m by the crate's fixed noise
+        // resolutions. The sky ships clear; F5 can turn a kind back on.
+        //
+        // Asserted because it is a deliberate art direction that a "sensible
+        // default" refactor would happily undo.
+        let sky = HeadsUpSky::default();
+        assert_eq!(
+            sky.cloud_kind, None,
+            "volume clouds must ship disabled; a default kind changes the look              of every existing save"
+        );
+        assert_eq!(sky.cloud_amount, 0.0);
+        assert!(
+            resolve_clouds(&sky).is_none(),
+            "the default sky must resolve to no volumetric cloud"
+        );
+    }
 
     #[test]
     fn no_broken_or_overcast_layer_is_thick_enough_to_go_black() {

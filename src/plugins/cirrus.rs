@@ -423,6 +423,32 @@ mod tests {
     }
 
     #[test]
+    fn the_shader_does_not_unproject_the_degenerate_far_plane() {
+        // Bevy's projection is reverse-Z with an INFINITE far plane: depth 1.0
+        // is the near plane, depth 0.0 is the point at infinity. Unprojecting
+        // depth 0.0 divides by `w == 0`, giving NaN; a NaN normalises to NaN,
+        // fails `dir.y < 0.02`, and every fragment is discarded -- cirrus
+        // vanishes with amount at 1.0 and no error anywhere.
+        //
+        // Verified numerically against Bevy's projection: depth 0.0 yields
+        // (nan, nan, -inf), depths 0.95 / 0.55 yield finite forward rays.
+        let shader = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cirrus.wesl"),
+        )
+        .expect("cirrus shader");
+
+        assert!(
+            !shader.contains("vec4<f32>(ndc, 0.0, 1.0)"),
+            "the shader unprojects depth 0.0 again, which is the point at              infinity: the direction becomes NaN and the cirrus disappears"
+        );
+        // Two finite depths must be present.
+        assert!(
+            shader.contains("ndc, 0.95, 1.0") && shader.contains("ndc, 0.55, 1.0"),
+            "the shader no longer takes two finite depths for the ray"
+        );
+    }
+
+    #[test]
     fn the_shader_rebuilds_the_direction_from_the_pixel() {
         // Interpolating `world_position` across 135 m triangles makes the
         // view direction deviate by up to 2.8e-3 rad and jump across every
