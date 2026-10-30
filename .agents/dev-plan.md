@@ -465,8 +465,8 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - [x] **代码适配**：`ElementsCamera` 扩展为 6 flag（结构字面量补 `..ElementsCamera::default()`）；裁剪名单 +4（Trails/Paths/Waves/Rocks，0.6.0 新增）；`dome_strength` 镜像更新为补丁后的 smoothstep ramp
 - [x] **测试修复（既有缺口，非本次引入）**：`sky_screenshot` 测试栈缺 `InputPlugin`（R4.5 菜单读 `ButtonInput<KeyCode>`）；autosave 测试受 `saves/slot_0.json` 残留文件污染（并发测试清理后已恢复）
 - [x] **验证**：fmt/clippy/test 全绿（155 lib + 集成）；GPU 冒烟 `--ignored` 通过——证明 0.6.0 shader（含补丁）编译进管线、黄昏帧断言成立
-- [x] **bevy_flora 试装**：`examples/flora_gallery.rs`（4 预设 × 4 确定性 seed，静止风，窗口运行）——仅形态对比参照，不接入 chunk 流式，可随时删除；实机观感对比待 Feihei 运行确认
-- **未做**：bevy_flora 与自研树的取舍决策待实机对比后；`Cargo.lock` 沿用 lockfile 解析（bevy_flora 0.46.0 → bevy 0.20 已由 cargo 解析确认）
+- [x] **bevy_flora 试装**：`examples/flora_gallery.rs`（4 预设 × 4 确定性 seed，静止风，窗口运行）——仅形态对比参照，不接入 chunk 流式，可随时删除
+- [x] **试装结论（2026-10-30，Feihei 实机验收）**：**自研树为准，bevy_flora 依赖已移除**。实机对比：bevy_flora 的树质量不优于自研；其唯一优势是"树种特征区分度"，而这是预设表驱动 + 每物种调好参数的做法，自研 `LeafProfile`/`LeafShape` 表已有同一机制。缺的环节是 R3.10 的未落地项——`TREE_PROFILES` 生长参数（杨/行道树/宽叶）与槐/杨/柳贴图物种一一对齐。`examples/flora_gallery.rs` 因会话引用保护无法删除，已改为占位说明，待 `git rm`
 
 ## 进度总览
 
