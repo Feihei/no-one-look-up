@@ -1,7 +1,14 @@
 # bevy_elements 0.5.3 源码阅读笔记
 
+> 2026-10-30 迁移注记：已升级到 0.6.0（vendored + 补丁重移植，见 `vendor/bevy_elements/PATCHES.md`）。0.5.3 时代的阅读要点在下文仍然有效，差异如下：
+> - **ElementsCamera 结构扩展**：0.6.0 从 `{ auto_exposure }` 变为 6 个 bool flag（`auto_exposure` / `atmosphere` / `distance_fog` / `volumetric_fog` / `ambient` / `msaa_off`），每个 flag 默认 true、运行时可单独关掉 crate 插入的部件。结构字面量需 `..ElementsCamera::default()`。
+> - **默认插件组新增 4 个**：`TrailsPlugin` / `PathsPlugin` / `WavesPlugin` / `RocksPlugin`（0.6.0 共 17 个）。本项目裁剪名单从 9 个 disable 增至 13 个，仍只保留 Climate/Celestial/Fog/Cloud。
+> - **云 shader 大重写**：密度拆成 stratiform（`cloud_gradient`）与 cumuliform（`cumulus_envelope` + `cumulus_profile`）双路径；本项目 3 个云补丁（dome ramp/剖面抖动、DOME_WIDTH、sky_gain 黄昏淡出）**上游 0.6.0 全部仍未修**，已重移植到新代码位置。
+> - **API 兼容确认**：`WorldClock`、`WeatherDirector`、`Weather` 字段、`CloudLayer { base_m, top_m }`、`ElementsSystems`（Clock/Weather/Celestial/Simulation/Readback）、`kind_from_weather` 公式、全部插件名在 0.6.0 保持不变。
+> - **GPU 冒烟验证**：`tests/sky_screenshot -- --ignored` 通过（RTX 2070 / Vulkan），证明 0.6.0 shader（含补丁）编译进管线且黄昏帧断言成立。
+
 > 目的：这是一个 "vibe coded"（AI 辅助编写）crate，引入前通读关键模块源码确认真实行为。
-> 源码位置（只读副本）：`.box-agent-scratch/3310a92473bb44cca9905c080b106f57/bevy_elements/src/`
+> 源码位置（只读副本）：`.box-agent-scratch/3310a92473bb44cca9905c080b106f57/bevy_elements/src/`（0.5.3；0.6.0 以 `vendor/bevy_elements/src/` 为准）
 > 标注约定：**[已确认]** = 直接读到源码；**[未确认]** = 基于源码/文档注释推断，未逐行验证。
 > 阅读范围：`plugin.rs`、`celestial/clock.rs`、`celestial/mod.rs`、`climate/weather.rs`、`climate/season.rs`、`climate/mod.rs`、`climate/model.rs`、`clouds/mod.rs`、`clouds/model.rs`（部分）、`fog/mod.rs`、`lib.rs`。
 

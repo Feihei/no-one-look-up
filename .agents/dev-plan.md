@@ -457,6 +457,17 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 
 ---
 
+### R0.6 bevy_elements 0.6.0 迁移 + bevy_flora 试装（2026-10-30）
+
+**背景**：Bevy 0.20 生态跟进（2026-10-30 检索）：`bevy_elements` 0.6.0（2026-10-26，Bevy 0.20，大扩张）与 `bevy_flora` 0.46（2026-10-14，Bevy 0.20，程序化树 + 季节 + LOD）均确认兼容。`bevy-volumetric-clouds`（0.2.0 仍只支持 0.18）与 `bevy_atmosphere`（停在 0.16）确认继续不可用。Feihei 选择：升 0.6.0 + bevy_flora 隔离试装对比（不动 R3.9/R3.10 自研树系统）。
+
+- [x] **0.6.0 迁移**：vendored 源码整体替换为 0.6.0；3 个云补丁（dome ramp/剖面抖动、DOME_WIDTH、sky_gain 黄昏淡出）核对**上游 0.6.0 全部仍未修**，重移植到新 shader 位置（stratiform/cumuliform 双路径，见 `vendor/bevy_elements/PATCHES.md`）
+- [x] **代码适配**：`ElementsCamera` 扩展为 6 flag（结构字面量补 `..ElementsCamera::default()`）；裁剪名单 +4（Trails/Paths/Waves/Rocks，0.6.0 新增）；`dome_strength` 镜像更新为补丁后的 smoothstep ramp
+- [x] **测试修复（既有缺口，非本次引入）**：`sky_screenshot` 测试栈缺 `InputPlugin`（R4.5 菜单读 `ButtonInput<KeyCode>`）；autosave 测试受 `saves/slot_0.json` 残留文件污染（并发测试清理后已恢复）
+- [x] **验证**：fmt/clippy/test 全绿（155 lib + 集成）；GPU 冒烟 `--ignored` 通过——证明 0.6.0 shader（含补丁）编译进管线、黄昏帧断言成立
+- [x] **bevy_flora 试装**：`examples/flora_gallery.rs`（4 预设 × 4 确定性 seed，静止风，窗口运行）——仅形态对比参照，不接入 chunk 流式，可随时删除；实机观感对比待 Feihei 运行确认
+- **未做**：bevy_flora 与自研树的取舍决策待实机对比后；`Cargo.lock` 沿用 lockfile 解析（bevy_flora 0.46.0 → bevy 0.20 已由 cargo 解析确认）
+
 ## 进度总览
 
 ```

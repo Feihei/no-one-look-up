@@ -12,7 +12,7 @@
 |------|-----|
 | 名称 | `heads_up`（Rust workspace 名建议 `heads_up_bevy`） |
 | 引擎 | **Bevy 0.20.0**（crates.io，2026-10-08 发布；最低 Rust 1.97.1） |
-| 天气/天空插件 | **bevy_elements 0.5.3**（截至 2026-10-19 唯一已确认兼容 Bevy 0.20 的完整天气/云/雾 crate） |
+| 天气/天空插件 | **bevy_elements 0.6.0**（vendored + 3 个云 shader 补丁，见 `vendor/bevy_elements/PATCHES.md`）；另有 `bevy_flora 0.46` 试装中（程序化树，隔离 example，未接入世界树） |
 | 语言 | Rust（edition 2024），所有代码 |
 | 目标平台 | PC（Windows 优先，兼顾跨平台） |
 | 类型 | 第一人称无尽散步体验，核心是抬头仰望天空与黄昏天色 |
@@ -24,7 +24,8 @@
 ```toml
 [dependencies]
 bevy = "=0.20.0"
-bevy_elements = "0.5.3"   # 锁定 0.5.3，升级前先核对其 Bevy 依赖
+bevy_elements = "0.6.0"   # vendored（含 3 个云 shader 补丁，升级必须重合并，见 PATCHES.md）
+bevy_flora = "0.46"       # 程序化树试装中（隔离 example，未接入 chunk 流式）
 rand_chacha = "0.9"       # 确定性 seed 生成
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
