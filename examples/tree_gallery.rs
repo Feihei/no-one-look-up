@@ -17,8 +17,6 @@
 //! Output: plain PPM (P6) plus a small stored-deflate PNG writer, so the
 //! example needs no image crate.
 
-use bevy::prelude::{EulerRot, Quat, Vec3};
-
 use heads_up_bevy::world::tree_shape::{TREE_PROFILES, TreeSkeleton, grow_tree};
 
 const WIDTH: usize = 2400;
@@ -273,44 +271,43 @@ fn draw_leaf_cards(
     sheet: &Sheet,
     mask: &heads_up_bevy::world::leaf_shape::AlphaMask,
 ) {
-    let cluster_radius = foliage.radius.max(0.05);
-    let cards = 14usize;
-    let center = Vec3::from_array(foliage.center);
-    let yaw0 = 0.0_f32;
-    let mut hash = 0x9E37_79B9u32;
-    let mut next_unit = || {
-        hash ^= hash << 13;
-        hash ^= hash >> 17;
-        hash ^= hash << 5;
-        (hash & 0xFFFF) as f32 / 65535.0
+    // Ask the GAME for the geometry instead of re-implementing it here.
+    //
+    // The first version copied the card placement into the example and the two
+    // drifted immediately: the sheet kept showing randomly-oriented cards after
+    // the game had been fixed to point petioles at the branch. A preview that
+    // can disagree with the shader is worse than no preview.
+    let skeleton = heads_up_bevy::world::tree_shape::TreeSkeleton {
+        branches: Vec::new(),
+        foliage: vec![*foliage],
+        species: 0,
+        total_length: 0.0,
+    };
+    let profile = heads_up_bevy::world::tree_shape::TREE_PROFILES[0];
+    let parts = heads_up_bevy::world::tree_mesh::bake_skeleton(&skeleton, &profile);
+    let Some(positions) = parts.leaves.attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION) else {
+        return;
+    };
+    let bevy::mesh::VertexAttributeValues::Float32x3(positions) = positions else {
+        return;
+    };
+    let Some(uvs) = parts.leaves.attribute(bevy::mesh::Mesh::ATTRIBUTE_UV_0) else {
+        return;
+    };
+    let bevy::mesh::VertexAttributeValues::Float32x2(uvs) = uvs else {
+        return;
     };
 
-    for card in 0..cards {
-        let yaw = yaw0 + std::f32::consts::PI * card as f32 / cards as f32;
-        let tilt = (card as f32 * 0.7).sin() * 0.35;
-        let rotation = Quat::from_euler(EulerRot::YXZ, yaw, tilt, 0.0);
-        let spread = cluster_radius * 0.75;
-        let offset = Vec3::new(
-            (next_unit() * 2.0 - 1.0) * spread,
-            (next_unit() * 2.0 - 1.0) * spread,
-            (next_unit() * 2.0 - 1.0) * spread,
-        );
-        let card_center = center + offset;
-        let half_w = cluster_radius * 0.42;
-        let half_h = half_w * 1.15;
-
-        let corners = [
-            (-half_w, -half_h, 0.0f32, 1.0f32),
-            (half_w, -half_h, 1.0, 1.0),
-            (half_w, half_h, 1.0, 0.0),
-            (-half_w, half_h, 0.0, 0.0),
-        ];
-        let projected: Vec<((f32, f32), f32, f32, f32)> = corners
+    for (quad, quad_uv) in positions.chunks(4).zip(uvs.chunks(4)) {
+        if quad.len() < 4 {
+            continue;
+        }
+        let projected: Vec<((f32, f32), f32, f32, f32)> = quad
             .iter()
-            .map(|(x, y, u, v)| {
-                let world = card_center + rotation * Vec3::new(*x, *y, 0.0);
-                let (px, depth) = sheet.project(world.to_array());
-                (px, depth, *u, *v)
+            .zip(quad_uv.iter())
+            .map(|(p, uv)| {
+                let (px, depth) = sheet.project(*p);
+                (px, depth, uv[0], uv[1])
             })
             .collect();
 

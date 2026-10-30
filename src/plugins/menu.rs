@@ -70,6 +70,21 @@ fn panel(lines: &[String]) -> Node {
     }
 }
 
+/// The in-game status line, pinned to the top-left corner.
+///
+/// It used to reuse the full-screen centred panel, which put a line of
+/// exploration text across the middle of the view -- straight through the
+/// thing the game exists to show. The HUD is status, not a menu: it hugs a
+/// corner, stays small, and never competes with the sky.
+fn hud_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        top: Val::Px(12.0),
+        left: Val::Px(14.0),
+        ..default()
+    }
+}
+
 fn text_node(line: &str, size: f32) -> (Text, TextFont, TextColor) {
     (
         Text::new(line.to_string()),
@@ -136,18 +151,23 @@ fn sync_ui_root(
     if let Some(old) = root.entity.take() {
         commands.entity(old).try_despawn();
     }
+    // The playing phase gets the corner HUD; every other phase is a full-screen
+    // menu where a centred layout is correct.
+    let playing = *phase == GamePhase::Playing;
     let entity = commands
-        .spawn(panel(&lines))
+        .spawn(if playing { hud_node() } else { panel(&lines) })
         .with_children(|parent| {
             for line in &lines {
-                parent.spawn(text_node(
-                    line,
-                    if lines.first() == Some(line) {
-                        48.0
-                    } else {
-                        24.0
-                    },
-                ));
+                // HUD text is deliberately small: it is a status readout, not
+                // something to read while walking.
+                let size = if playing {
+                    14.0
+                } else if lines.first() == Some(line) {
+                    48.0
+                } else {
+                    24.0
+                };
+                parent.spawn(text_node(line, size));
             }
         })
         .id();
