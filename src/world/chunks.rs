@@ -429,19 +429,17 @@ fn build_placement_assets(
         base: crate::plugins::season::tree_base_material(),
         extension: Default::default(),
     });
-    // The foliage cards need a texture. Until the species atlas exists, one
-    // shared placeholder keeps every tree drawing.
+    // The foliage cards need a texture: ONE shared species atlas (R3.10 — the
+    // single shared material is what keeps a season switch a 32-byte uniform
+    // write), whose cells each species' baked mesh samples by its own UVs.
     // An `Image` store only exists once the render plugins are up; a headless
     // test has none. Falling back to a texture-less card keeps the world
     // building there, where nothing is drawn anyway -- and the test that counts
     // tree entities is about streaming, not about what the crown looks like.
     let leaf_texture = images.as_deref_mut().map(|images| {
-        let profiles = crate::world::leaf_shape::leaf_profiles();
-        let profile = crate::world::leaf_shape::find_profile("poplar")
-            .or_else(|| profiles.first())
-            .expect("the leaf table is never empty");
-        let mask = crate::world::leaf_shape::bake_leaf_alpha(profile, 256);
-        images.add(crate::world::leaf_shape::mask_to_image(&mask))
+        let atlas =
+            crate::world::leaf_shape::bake_species_atlas(crate::world::leaf_shape::ATLAS_HEIGHT);
+        images.add(crate::world::leaf_shape::mask_to_image(&atlas))
     });
     let tree_leaf_material =
         tree_materials.add(crate::plugins::season::tree_leaf_material(leaf_texture));

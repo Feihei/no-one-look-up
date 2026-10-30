@@ -219,7 +219,8 @@ fn draw_tree(
     canvas: &mut Canvas,
     tree: &TreeSkeleton,
     sheet: &Sheet,
-    mask: &heads_up_bevy::world::leaf_shape::AlphaMask,
+    species: u8,
+    atlas: &heads_up_bevy::world::leaf_shape::AlphaMask,
 ) {
     for branch in &tree.branches {
         let (a, da) = sheet.project(branch.start);
@@ -253,7 +254,7 @@ fn draw_tree(
     // cannot show. Each card is rasterised as a textured quad sampling the
     // species' alpha mask, so what this sheet shows is what the GPU draws.
     for foliage in &tree.foliage {
-        draw_leaf_cards(canvas, foliage, sheet, mask);
+        draw_leaf_cards(canvas, foliage, sheet, species, atlas);
     }
 }
 
@@ -269,7 +270,8 @@ fn draw_leaf_cards(
     canvas: &mut Canvas,
     foliage: &heads_up_bevy::world::tree_shape::Foliage,
     sheet: &Sheet,
-    mask: &heads_up_bevy::world::leaf_shape::AlphaMask,
+    species: u8,
+    atlas: &heads_up_bevy::world::leaf_shape::AlphaMask,
 ) {
     // Ask the GAME for the geometry instead of re-implementing it here.
     //
@@ -283,8 +285,8 @@ fn draw_leaf_cards(
         species: 0,
         total_length: 0.0,
     };
-    let profile = heads_up_bevy::world::tree_shape::TREE_PROFILES[0];
-    let parts = heads_up_bevy::world::tree_mesh::bake_skeleton(&skeleton, &profile);
+    let profile = heads_up_bevy::world::tree_shape::TREE_PROFILES[species as usize];
+    let parts = heads_up_bevy::world::tree_mesh::bake_skeleton(&skeleton, &profile, species);
     let Some(positions) = parts.leaves.attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION) else {
         return;
     };
@@ -335,9 +337,11 @@ fn draw_leaf_cards(
                     }
                     let u = w0 * p0.2 + w1 * p1.2 + w2 * p2.2;
                     let v = w0 * p0.3 + w1 * p1.3 + w2 * p2.3;
-                    let tx = (u * mask.width as f32).clamp(0.0, mask.width as f32 - 1.0) as u32;
-                    let ty = (v * mask.height as f32).clamp(0.0, mask.height as f32 - 1.0) as u32;
-                    if mask.get(tx, ty) < 128 {
+                    // `u` already lies in the species' atlas cell (the game
+                    // writes atlas-space UVs), so sample the shared atlas.
+                    let tx = (u * atlas.width as f32).clamp(0.0, atlas.width as f32 - 1.0) as u32;
+                    let ty = (v * atlas.height as f32).clamp(0.0, atlas.height as f32 - 1.0) as u32;
+                    if atlas.get(tx, ty) < 128 {
                         continue;
                     }
                     let depth = w0 * p0.1 + w1 * p1.1 + w2 * p2.1;
@@ -356,25 +360,20 @@ fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
 fn main() {
     let mut canvas = Canvas::new(WIDTH, HEIGHT);
 
-    // Which leaf mask a species draws. The three shipped species map onto the
-    // baked masks by position; a species without one falls back to the first.
-    let masks: Vec<heads_up_bevy::world::leaf_shape::AlphaMask> =
-        heads_up_bevy::world::leaf_shape::leaf_profiles()
-            .iter()
-            .map(|p| heads_up_bevy::world::leaf_shape::bake_leaf_alpha(p, 256))
-            .collect();
+    // The world's single shared atlas (the same one `chunks.rs` builds); each
+    // species' cards sample their own cell via the UVs the game bakes.
+    let atlas = heads_up_bevy::world::leaf_shape::bake_species_atlas(
+        heads_up_bevy::world::leaf_shape::ATLAS_HEIGHT,
+    );
 
     for (species, profile) in TREE_PROFILES.iter().enumerate() {
-        let mask = masks
-            .get(species)
-            .unwrap_or_else(|| masks.first().expect("at least one leaf mask"));
         let top = species * (SHEET_HEIGHT + SHEET_GAP);
         canvas.fill_rect(0, top, WIDTH, SHEET_HEIGHT, [0.13, 0.15, 0.21]);
 
         let title = match species {
-            0 => "0 ASPEN - SLENDER, TALL, UPRIGHT",
-            1 => "1 STREET - ROUNDER CROWN, WIDER SPREAD",
-            _ => "2 BROADLEAF - LOW FORK, HEAVY LIMBS",
+            0 => "0 ASPEN/YANG - SLENDER, TALL, UPRIGHT (deltoid, serrate)",
+            1 => "1 STREET/HUAI - ROUNDER CROWN, WIDER SPREAD (pinnate compound)",
+            _ => "2 BROADLEAF/LIU - LOW FORK, HEAVY LIMBS (lanceolate)",
         };
         canvas.text(SHEET_MARGIN_X, (top + 10) as f32, title, [0.92, 0.90, 0.85]);
 
@@ -421,7 +420,7 @@ fn main() {
                 ground_y,
                 yaw: SHEET_YAW,
             };
-            draw_tree(&mut canvas, tree, &sheet, mask);
+            draw_tree(&mut canvas, tree, &sheet, species as u8, &atlas);
             canvas.text(
                 sheet.origin_x - 30.0,
                 ground_y + 12.0,

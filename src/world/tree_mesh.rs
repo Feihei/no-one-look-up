@@ -51,6 +51,55 @@ use bevy::prelude::*;
 
 use crate::world::tree_shape::{TREE_PROFILES, TreeProfile, TreeSkeleton, grow_tree};
 
+/// Which leaf species' atlas cell each growth profile's cards sample.
+///
+/// The growth profiles ([`TREE_PROFILES`]) and the leaf table
+/// ([`crate::world::leaf_shape`]) are two independent tables; this row aligns
+/// them 1:1 (the R3.10 leftover): 0 aspen (slender, upright) samples poplar's
+/// deltoid blade (杨), 1 street tree (broad crown) samples sophora's pinnate
+/// compound leaf (槐), 2 broadleaf samples willow's lanceolate sliver (柳).
+/// The drooping willow habit is a future growth-model change; the blade alone
+/// still reads as 柳.
+const SPECIES_LEAF: [&str; 3] = ["poplar", "sophora", "willow"];
+
+/// Per-species foliage-card tuning, resolved from the leaf species.
+pub struct FoliageBake {
+    /// The atlas (u0, u1) this species' cards sample.
+    pub cell: (f32, f32),
+    /// Card-count multiplier. A pinnate crown reads finer with MORE, SMALLER
+    /// cards (each compound leaf is one small unit, so the sky is cut into
+    /// many more pieces); the simple blades keep the base count.
+    pub cards_scale: f32,
+    /// Card-reach multiplier, paired with the card count: more cards means
+    /// smaller ones, so the cluster's total coverage stays put.
+    pub reach_scale: f32,
+}
+
+fn species_foliage(species: u8) -> FoliageBake {
+    let species = SPECIES_LEAF
+        .get(species as usize)
+        .copied()
+        .unwrap_or(SPECIES_LEAF[0]);
+    let cell =
+        crate::world::leaf_shape::species_cell(species, crate::world::leaf_shape::ATLAS_HEIGHT);
+    match species {
+        // 槐: many small compound leaves, the finely fragmented silhouette.
+        // The street profile grows fewer, larger clusters than the aspen, so
+        // the card count more than doubles to keep the locust the finest
+        // silhouette of the three; the reach shrinks to match.
+        "sophora" => FoliageBake {
+            cell,
+            cards_scale: 2.6,
+            reach_scale: 0.62,
+        },
+        _ => FoliageBake {
+            cell,
+            cards_scale: 1.0,
+            reach_scale: 1.0,
+        },
+    }
+}
+
 /// Branches are tapered 5-sided tubes. At silhouette distance a 5-gon is
 /// indistinguishable from a 6-gon, and branches are ~40% of the triangle budget,
 /// so the odd side is worth having.
@@ -271,22 +320,24 @@ pub fn bake_tree_mesh_lod(key: TreeMeshKey, lod: TreeLod) -> TreeParts {
         key.species,
         key.variant as u64,
     );
-    bake_skeleton_lod(&skeleton, &profile, lod)
+    bake_skeleton_lod(&skeleton, &profile, lod, &species_foliage(key.species))
 }
 
 /// Bakes every branch and leaf of `skeleton`.
-pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> TreeParts {
-    bake_skeleton_lod(skeleton, profile, TreeLod::Near)
+pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile, species: u8) -> TreeParts {
+    bake_skeleton_lod(skeleton, profile, TreeLod::Near, &species_foliage(species))
 }
 
 /// [`bake_skeleton`] at a specific detail tier.
 ///
 /// Besides the geometry this writes the season attributes documented at the top
-/// of the module.
+/// of the module. `foliage` carries the species' atlas cell and its card
+/// tuning (see [`species_foliage`]).
 pub fn bake_skeleton_lod(
     skeleton: &TreeSkeleton,
     profile: &TreeProfile,
     lod: TreeLod,
+    foliage_bake: &FoliageBake,
 ) -> TreeParts {
     let mut wood_parts: Vec<Mesh> = Vec::new();
     let mut leaf_parts: Vec<Mesh> = Vec::new();
@@ -329,7 +380,10 @@ pub fn bake_skeleton_lod(
     let stride = lod.blob_stride();
     let min_blob = lod.min_blob_radius();
     let blob_scale = lod.blob_scale();
-    let cards = lod.cards_per_cluster();
+    // Per-species card count: a pinnate crown takes MORE, SMALLER cards, so
+    // its compound leaves cut the sky into many more pieces.
+    let cards =
+        ((lod.cards_per_cluster() as f32 * foliage_bake.cards_scale).round() as usize).max(1);
 
     for (index, foliage) in skeleton.foliage.iter().enumerate() {
         if index % stride != 0 {
@@ -341,8 +395,10 @@ pub fn bake_skeleton_lod(
         let center = Vec3::from_array(foliage.center);
         // The cluster's radius now sizes the CARDS rather than a ball: a card
         // spans the cluster's diameter, so a few of them cover the volume the
-        // sphere used to.
-        let cluster_radius = (foliage.radius * blob_scale).max(0.05);
+        // sphere used to. The reach scale pairs with the card count (more,
+        // smaller cards for the pinnate species) so the total coverage of one
+        // cluster stays put.
+        let cluster_radius = (foliage.radius * blob_scale * foliage_bake.reach_scale).max(0.05);
         leaf_parts.push(leaf_cards(
             center,
             cluster_radius,
@@ -350,6 +406,7 @@ pub fn bake_skeleton_lod(
             index,
             cards,
             top,
+            foliage_bake.cell,
         ));
     }
 
@@ -401,7 +458,8 @@ fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
 ///
 /// Cards are rotated about the vertical axis at even intervals plus a
 /// per-cluster offset, with a slow tilt, so a crown has cards facing every
-/// direction instead of a fan of parallel planes.
+/// direction instead of a fan of parallel planes. `cell` is the species'
+/// atlas (u0, u1) the card texture samples (see [`species_foliage`]).
 fn leaf_cards(
     center: Vec3,
     cluster_radius: f32,
@@ -409,6 +467,7 @@ fn leaf_cards(
     cluster: usize,
     cards: usize,
     top: f32,
+    cell: (f32, f32),
 ) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
@@ -517,7 +576,9 @@ fn leaf_cards(
             // Cards are drawn double-sided, so one normal per quad is enough;
             // the PBR shader flips it for back faces.
             normals.push(face_axis.to_array());
-            uvs.push([u, v]);
+            // Map the card's unit quad into this species' atlas cell: u is
+            // rescaled into (u0, u1), v spans the shared full height.
+            uvs.push([cell.0 + u * (cell.1 - cell.0), v]);
             colors.push([sway, 1.0, phase, 1.0]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -666,7 +727,9 @@ mod tests {
     fn leaf_mesh_is_quads_with_uvs() {
         // The leaf material samples a texture, so every leaf vertex needs a UV.
         // Without one the crown would sample a single texel and read as a solid
-        // rectangle, which is exactly the look the cards exist to remove.
+        // rectangle, which is exactly the look the cards exist to remove. The
+        // UVs span the species' ATLAS CELL (the atlas holds all three species;
+        // a card sampling the whole texture would read its neighbours' masks).
         let parts = bake_tree_mesh(TreeMeshKey {
             species: 0,
             variant: 0,
@@ -678,11 +741,19 @@ mod tests {
         };
         assert_eq!(uvs.len(), positions.len(), "every leaf vertex needs a UV");
         assert_eq!(positions.len() % 4, 0, "the leaf mesh is not made of quads");
+        let (cell_u0, cell_u1) = species_foliage(0).cell;
         let max_u = uvs.iter().map(|uv| uv[0]).fold(0.0_f32, f32::max);
         let max_v = uvs.iter().map(|uv| uv[1]).fold(0.0_f32, f32::max);
         assert!(
-            max_u >= 0.99 && max_v >= 0.99,
-            "UVs do not span the texture"
+            max_u >= cell_u1 - 1e-4 && max_v >= 0.99,
+            "UVs do not span the species' atlas cell"
+        );
+        // Every UV stays inside the species' own cell: one straying outside
+        // samples a neighbouring species' mask.
+        let min_u = uvs.iter().map(|uv| uv[0]).fold(f32::MAX, f32::min);
+        assert!(
+            min_u >= cell_u0 - 1e-4 && max_u <= cell_u1 + 1e-4,
+            "leaf UVs leave the species' atlas cell"
         );
     }
 
@@ -749,16 +820,20 @@ mod tests {
                 0,
             );
             let profile = TREE_PROFILES[species as usize];
-            let parts = bake_skeleton(&skeleton, &profile);
+            let parts = bake_skeleton(&skeleton, &profile, species);
             let positions = positions(&parts.leaves);
             let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
                 bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
                 other => panic!("unexpected uv layout: {other:?}"),
             };
 
-            // `leaf_cards` writes CARD_REACH_FRACTION-sized quads, 22 per cluster
-            // at the near tier, in skeleton order, so the cursor can be walked.
-            let cards = 22;
+            // `leaf_cards` writes CARD_REACH_FRACTION-sized quads at the near
+            // tier, in skeleton order, so the cursor can be walked. The count
+            // is per species now (the pinnate crown takes more, smaller cards).
+            let foliage = species_foliage(species);
+            let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
+                as usize)
+                .max(1);
             let mut cursor = 0usize;
             let mut checked = 0usize;
             for foliage in &skeleton.foliage {
@@ -1057,5 +1132,71 @@ mod tests {
             format!("{:?}", positions(&b.leaves)),
             "bake must be deterministic"
         );
+    }
+
+    #[test]
+    fn every_species_cards_sample_their_own_cell() {
+        // The shared atlas holds all three species' masks; one UV straying
+        // outside its species' cell samples a neighbour's mask, which is a
+        // silent wrong-shape bug (no error, just the wrong crown).
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let parts = bake_tree_mesh(TreeMeshKey {
+                species,
+                variant: 0,
+            });
+            let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+                bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+                other => panic!("unexpected uv layout: {other:?}"),
+            };
+            let (cell_u0, cell_u1) = species_foliage(species).cell;
+            for (i, uv) in uvs.iter().enumerate() {
+                assert!(
+                    (cell_u0..=cell_u1).contains(&uv[0]),
+                    "species {species}: uv[{i}] u {:.4} leaves its cell [{cell_u0:.4}, {cell_u1:.4}]",
+                    uv[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pinnate_crown_takes_more_smaller_cards() {
+        // Feihei's direction (2026-10-30): the locust's compound leaves should
+        // read as the finest, most fragmented silhouette. A pinnate unit is
+        // one small piece, so its crown takes MORE, SMALLER cards — asserted
+        // because it is a deliberate art direction a "sensible default"
+        // refactor would happily undo.
+        let sophora = species_foliage(1);
+        assert!(
+            sophora.cards_scale > 1.0 && sophora.reach_scale < 1.0,
+            "the pinnate crown lost its finer fragmentation"
+        );
+        let sophora_cards = bake_tree_mesh(TreeMeshKey {
+            species: 1,
+            variant: 0,
+        });
+        let poplar_cards = bake_tree_mesh(TreeMeshKey {
+            species: 0,
+            variant: 0,
+        });
+        let count = |parts: &TreeParts| parts.leaves.count_vertices() / 4;
+        assert!(
+            count(&sophora_cards) > count(&poplar_cards),
+            "species 1 must take more cards than species 0 ({} vs {})",
+            count(&sophora_cards),
+            count(&poplar_cards)
+        );
+        // The total tri budget still holds: cards are 2 triangles each, and a
+        // 1.5x card count on the pinnate species stays far below the budget.
+        let total: usize = (0..TREE_PROFILES.len() as u8)
+            .map(|s| {
+                let parts = bake_tree_mesh(TreeMeshKey {
+                    species: s,
+                    variant: 0,
+                });
+                parts.wood.count_vertices() / 3 + parts.leaves.count_vertices() / 3
+            })
+            .sum();
+        assert!(total < 20_000, "the species set bakes {total} triangles");
     }
 }

@@ -312,14 +312,68 @@ impl AlphaMask {
 /// The width follows [`LeafProfile::mask_aspect`], rounded to a multiple of 4 so
 /// the result sits cleanly in an atlas slot.
 pub fn bake_leaf_alpha(profile: &LeafProfile, height: u32) -> AlphaMask {
-    let width = (((height as f32) * profile.mask_aspect()).round() as u32).max(8);
-    let width = width.next_multiple_of(4);
+    let width = mask_width(profile, height);
     let mut mask = AlphaMask::new(width, height);
     match profile.shape {
         LeafShape::Simple => draw_simple_blade(&mut mask, profile),
         LeafShape::Pinnate => draw_pinnate(&mut mask, profile),
     }
     mask
+}
+
+/// The baker's own mask-width rule, shared with the atlas layout so the two
+/// can never disagree.
+fn mask_width(profile: &LeafProfile, height: u32) -> u32 {
+    (((height as f32) * profile.mask_aspect()).round() as u32)
+        .max(8)
+        .next_multiple_of(4)
+}
+
+/// Height the shared species atlas is baked at (`chunks.rs` builds the world's
+/// single leaf texture from this; `tree_mesh.rs` looks cells up at the same
+/// height, so the two can never disagree).
+pub const ATLAS_HEIGHT: u32 = 256;
+
+/// Bakes every species' mask side by side into ONE atlas.
+///
+/// The world's trees share a single leaf texture (one shared material is what
+/// makes a season switch one 32-byte uniform write, R3.5); each species'
+/// cards sample their own cell, resolved by [`species_cell`]. Cells follow the
+/// [`PROFILES`] table order at each species' own baked width.
+pub fn bake_species_atlas(height: u32) -> AlphaMask {
+    let widths: Vec<u32> = PROFILES.iter().map(|p| mask_width(p, height)).collect();
+    let total: u32 = widths.iter().sum();
+    let mut atlas = AlphaMask::new(total, height);
+    let mut x = 0u32;
+    for (profile, w) in PROFILES.iter().zip(&widths) {
+        let mask = bake_leaf_alpha(profile, height);
+        for y in 0..height {
+            for cx in 0..*w {
+                atlas.alpha[(y * total + x + cx) as usize] = mask.get(cx, y);
+            }
+        }
+        x += w;
+    }
+    atlas
+}
+
+/// The (u0, u1) sub-rect one species' cards sample in the shared atlas, with a
+/// half-texel inset so neighbouring cells do not bleed at mip levels.
+pub fn species_cell(species: &str, height: u32) -> (f32, f32) {
+    let widths: Vec<u32> = PROFILES.iter().map(|p| mask_width(p, height)).collect();
+    let total: u32 = widths.iter().sum();
+    let mut x = 0u32;
+    for (profile, w) in PROFILES.iter().zip(&widths) {
+        if profile.species == species {
+            let inset = 0.5 / total as f32;
+            return (
+                x as f32 / total as f32 + inset,
+                (x + w) as f32 / total as f32 - inset,
+            );
+        }
+        x += w;
+    }
+    (0.0, 1.0)
 }
 
 /// Draws one simple blade into `mask`.
@@ -1097,6 +1151,68 @@ mod tests {
         assert!(
             find_profile("palm_test").is_none(),
             "the probe must not be in the shipped table"
+        );
+    }
+
+    #[test]
+    fn the_species_atlas_cells_never_overlap_and_cover_every_species() {
+        // The world's trees share ONE texture; two species' cards sampling the
+        // same cell would render the wrong mask. The layout is the single
+        // source, so the baker and the lookup must agree: cells are disjoint,
+        // in table order, and every species resolves to one.
+        let height = crate::world::leaf_shape::ATLAS_HEIGHT;
+        let mut cells = Vec::new();
+        for profile in leaf_profiles() {
+            let (u0, u1) = species_cell(profile.species, height);
+            assert!(u1 > u0, "{}'s atlas cell is empty", profile.species);
+            cells.push((profile.species, u0, u1));
+        }
+        for pair in cells.windows(2) {
+            assert!(
+                pair[0].2 <= pair[1].1,
+                "{}'s cell overlaps {}'s",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn the_species_atlas_matches_the_standalone_bakes() {
+        // A cell must contain exactly its species' standalone mask: the atlas
+        // is a repack of the table, not a re-bake with drifted parameters.
+        let height = crate::world::leaf_shape::ATLAS_HEIGHT;
+        let atlas = bake_species_atlas(height);
+        for profile in leaf_profiles() {
+            let alone = bake_leaf_alpha(profile, height);
+            let (u0, u1) = species_cell(profile.species, height);
+            let x0 = (u0 * atlas.width as f32).floor() as u32;
+            let x1 = (u1 * atlas.width as f32).ceil() as u32;
+            for y in (0..height).step_by(7) {
+                for x in x0..x1 {
+                    assert_eq!(
+                        atlas.get(x, y),
+                        alone.get(x - x0, y),
+                        "{}: atlas cell (x{x}, y{y}) disagrees with the standalone bake",
+                        profile.species
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_atlas_needs_no_half_texel_margin_of_its_own() {
+        // The lookup insets each cell by half a texel so neighbouring cells do
+        // not bleed at mip levels: an inset of 0 would sample the neighbour's
+        // edge texel the moment a card's UV rounds outward.
+        let height = crate::world::leaf_shape::ATLAS_HEIGHT;
+        let (u0, u1) = species_cell("sophora", height);
+        let atlas = bake_species_atlas(height);
+        let inset = 0.5 / atlas.width as f32;
+        assert!(
+            u0 >= inset && u1 <= 1.0 - inset,
+            "the species cell has no half-texel inset; atlas bleed is possible"
         );
     }
 
