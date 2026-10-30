@@ -17,13 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::world::explored::ExploredBitmap;
 
-/// Season placeholder: the R3.5 system will fill this in; the field exists
-/// so the save format does not change when it does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum Season {
-    #[default]
-    Summer,
-}
+/// The season of a run (ADR-0001: fixed per run).
+///
+/// Re-exported from [`crate::world::season`] rather than defined here: the
+/// field has been in the format since R4.2 as a placeholder with `Summer` as
+/// its default and its only variant, and the real enum keeps that default and
+/// serializes by variant name, so every R4-era save still parses unchanged.
+pub use crate::world::season::Season;
 
 /// One saved game, exactly what R4.3 restores from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

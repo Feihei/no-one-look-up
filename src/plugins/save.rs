@@ -16,6 +16,7 @@ use crate::world::chunks::{ChunkManager, ChunkRoot, WorldSystems};
 use crate::world::collision::CollisionIndex;
 use crate::world::explored::ExploredBitmap;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
+use crate::world::season::SeasonState;
 
 pub use self::save_data::{
     AUTOSAVE_SLOT, SaveData, Season, list_slots, read_save, save_path, write_save,
@@ -123,6 +124,12 @@ fn handle_load_request(
     // reads it later (e.g. a menu-initiated restart).
     commands.insert_resource(HeadsUpSeed(data.seed));
 
+    // R3.5: restore the season with the world. This is the ONLY place a run's
+    // season can come from a file (ADR-0001: fixed for the run), and it runs
+    // before the chunks stream back in, so no tree is ever built for the wrong
+    // season.
+    commands.insert_resource(SeasonState::new(data.season));
+
     // Player pose: eye height, saved XZ, saved facing (pitch resets to the
     // golden-hour default; the format keeps room for it if that ever moves).
     if let Ok(mut transform) = players.single_mut() {
@@ -145,24 +152,43 @@ struct AutosaveState {
     pending_for: Option<f32>,
 }
 
-/// Captures the current game state from the world (shared by the autosave
-/// and the manual save path).
-fn capture_current(
-    cameras: &Query<&Transform, With<Camera3d>>,
-    players: &Query<&PlayerBody>,
-    bitmap: &ExploredBitmap,
-    seed: Option<&HeadsUpSeed>,
-) -> Option<SaveData> {
-    let camera = cameras.single().ok()?;
-    let yaw = players.single().map(|body| body.yaw).unwrap_or_default();
-    Some(SaveData::capture(
-        seed.map(|s| s.0)
-            .unwrap_or(crate::world::chunks::DEFAULT_SEED),
-        Season::default(),
-        bitmap,
-        [camera.translation.x, camera.translation.z],
-        yaw,
-    ))
+/// Everything a save has to capture, gathered once.
+///
+/// A `SystemParam` rather than seven arguments on each system: the autosave and
+/// the manual save need exactly the same inputs, and duplicating that list is
+/// how the two paths drifted apart (the manual path used to hard-code the seed
+/// and the season).
+#[derive(bevy::ecs::system::SystemParam)]
+struct SaveInputs<'w, 's> {
+    cameras: Query<'w, 's, &'static Transform, With<Camera3d>>,
+    players: Query<'w, 's, &'static PlayerBody>,
+    bitmap: Res<'w, ExploredBitmap>,
+    seed: Option<Res<'w, HeadsUpSeed>>,
+    season: Option<Res<'w, SeasonState>>,
+}
+
+impl SaveInputs<'_, '_> {
+    /// Captures the current game state.
+    fn capture(&self) -> Option<SaveData> {
+        let camera = self.cameras.single().ok()?;
+        let yaw = self
+            .players
+            .single()
+            .map(|body| body.yaw)
+            .unwrap_or_default();
+        Some(SaveData::capture(
+            self.seed
+                .as_deref()
+                .map(|s| s.0)
+                .unwrap_or(crate::world::chunks::DEFAULT_SEED),
+            // R3.5: the run's season, not a placeholder. A save restored with
+            // the wrong season would regrow a summer crown in a winter world.
+            self.season.as_deref().map(|s| s.season).unwrap_or_default(),
+            &self.bitmap,
+            [camera.translation.x, camera.translation.z],
+            yaw,
+        ))
+    }
 }
 
 /// Writes the autosave slot some seconds after the player changes chunks;
@@ -171,10 +197,7 @@ fn autosave(
     time: Res<Time>,
     mut state: ResMut<AutosaveState>,
     mut chunk_changes: MessageReader<crate::world::explored::PlayerChunkChanged>,
-    cameras: Query<&Transform, With<Camera3d>>,
-    players: Query<&PlayerBody>,
-    bitmap: Res<ExploredBitmap>,
-    seed: Option<Res<HeadsUpSeed>>,
+    inputs: SaveInputs,
 ) {
     // A chunk change arms (or re-arms) the timer.
     if chunk_changes.read().next().is_some() {
@@ -188,7 +211,7 @@ fn autosave(
         return;
     }
     state.pending_for = None;
-    let Some(data) = capture_current(&cameras, &players, &bitmap, seed.as_deref()) else {
+    let Some(data) = inputs.capture() else {
         return;
     };
     match write_save(AUTOSAVE_SLOT, &data) {
@@ -198,15 +221,9 @@ fn autosave(
 }
 
 /// Writes the current state to a requested slot.
-fn handle_save_requests(
-    mut requests: MessageReader<SaveGameRequest>,
-    cameras: Query<&Transform, With<Camera3d>>,
-    players: Query<&PlayerBody>,
-    bitmap: Res<ExploredBitmap>,
-    seed: Option<Res<HeadsUpSeed>>,
-) {
+fn handle_save_requests(mut requests: MessageReader<SaveGameRequest>, inputs: SaveInputs) {
     for request in requests.read() {
-        let Some(data) = capture_current(&cameras, &players, &bitmap, seed.as_deref()) else {
+        let Some(data) = inputs.capture() else {
             continue;
         };
         match write_save(request.slot, &data) {
@@ -405,5 +422,70 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(result.is_ok());
         assert!(elapsed.as_secs_f64() < 1.0, "generation took {elapsed:?}");
+    }
+
+    #[test]
+    fn season_survives_the_save_round_trip_and_reaches_the_world() {
+        // R3.5 regression: the season field existed in the format since R4.2
+        // but was a placeholder that always wrote `Summer`. A save made in
+        // autumn then restored a summer world -- a change no test noticed,
+        // because nothing read the field back into the world.
+        let mut app = app_with_world();
+        app.init_resource::<SeasonState>();
+        app.update();
+
+        // Pick autumn, then save through the live system rather than by
+        // hand-building a `SaveData`, so the capture path is the one under
+        // test.
+        *app.world_mut().resource_mut::<SeasonState>() =
+            SeasonState::new(crate::plugins::save::Season::Autumn);
+        app.world_mut().write_message(SaveGameRequest { slot: 997 });
+        app.update();
+        let saved = read_save(997).expect("the save system wrote the slot");
+        assert_eq!(
+            saved.season,
+            crate::plugins::save::Season::Autumn,
+            "the live season must reach the file"
+        );
+        let _ = std::fs::remove_file(save_path(997));
+
+        // Restoring that save must put the season back into the world.
+        *app.world_mut().resource_mut::<SeasonState>() =
+            SeasonState::new(crate::plugins::save::Season::Spring);
+        app.world_mut().write_message(LoadRequest(saved));
+        app.update();
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            crate::plugins::save::Season::Autumn,
+            "loading a save must restore its season"
+        );
+    }
+
+    #[test]
+    fn restored_season_is_applied_before_any_tree_streams() {
+        // The uniform is pushed in `Update`, so the ordering that matters is:
+        // restore season -> stream chunks -> build trees. A tree baked for the
+        // wrong season would keep the wrong crown until the next chunk cycle.
+        let mut app = app_with_world();
+        app.init_resource::<SeasonState>();
+        app.update();
+
+        let bitmap = app.world().resource::<ExploredBitmap>().clone();
+        let winter = SaveData::capture(
+            crate::world::chunks::DEFAULT_SEED,
+            Season::Winter,
+            &bitmap,
+            [CENTER, CENTER],
+            0.0,
+        );
+        app.world_mut().write_message(LoadRequest(winter));
+        app.update();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            Season::Winter,
+            "season must be restored with the world"
+        );
     }
 }

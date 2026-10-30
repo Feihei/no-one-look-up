@@ -18,11 +18,12 @@ use bevy::ui::Node;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::core::game_state::{GamePhase, SeedInput};
-use crate::core::input::PAUSE;
+use crate::core::input::{PAUSE, SEASON_CYCLE};
 use crate::plugins::save::{LoadRequest, SaveData, list_slots};
 use crate::world::chunks::DEFAULT_SEED;
 use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
 use crate::world::path_network::HeadsUpSeed;
+use crate::world::season::SeasonState;
 use crate::world::world_center;
 
 pub struct MenuPlugin;
@@ -81,6 +82,7 @@ fn text_node(line: &str, size: f32) -> (Text, TextFont, TextColor) {
 fn sync_ui_root(
     phase: Res<GamePhase>,
     seed_input: Res<SeedInput>,
+    season: Res<SeasonState>,
     bitmap: Res<ExploredBitmap>,
     mut root: ResMut<MenuUiRoot>,
     mut commands: Commands,
@@ -88,6 +90,7 @@ fn sync_ui_root(
 ) {
     if !phase.is_changed()
         && !seed_input.is_changed()
+        && !season.is_changed()
         && root.entity.is_some()
         && !bitmap.is_changed()
     {
@@ -105,6 +108,7 @@ fn sync_ui_root(
                 "HEADS-UP".to_string(),
                 String::new(),
                 "Seed (type digits, backspace): ".to_string() + &seed_input.0,
+                format!("Season: {} [Tab]", season.season.label()),
                 String::new(),
                 "[Enter] Start".to_string(),
                 "[L] Load autosave".to_string(),
@@ -155,6 +159,7 @@ fn menu_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut phase: ResMut<GamePhase>,
     mut seed_input: ResMut<SeedInput>,
+    mut season: ResMut<SeasonState>,
     mut commands: Commands,
     players: Query<&Transform, With<Camera3d>>,
     bitmap: Res<ExploredBitmap>,
@@ -181,6 +186,11 @@ fn menu_input(
             if keys.just_pressed(KeyCode::Backspace) {
                 seed_input.0.pop();
             }
+            // ADR-0001: the season is chosen when the walk starts and never
+            // changes during it, so this is the only place it is picked.
+            if keys.just_pressed(SEASON_CYCLE) {
+                season.season = season.season.next();
+            }
             // Enter starts a run: a fresh save through the restore flow
             // rebuilds the world from the typed (or default) seed.
             if keys.just_pressed(KeyCode::Enter) {
@@ -189,13 +199,8 @@ fn menu_input(
                     .single()
                     .map(|t| [t.translation.x, t.translation.z])
                     .unwrap_or([world_center(), world_center()]);
-                let fresh = SaveData::capture(
-                    seed,
-                    crate::plugins::save::Season::default(),
-                    &ExploredBitmap::default(),
-                    pose,
-                    0.0,
-                );
+                let fresh =
+                    SaveData::capture(seed, season.season, &ExploredBitmap::default(), pose, 0.0);
                 commands.insert_resource(HeadsUpSeed(seed));
                 commands.queue(|world: &mut World| {
                     world.write_message(LoadRequest(fresh));
@@ -238,7 +243,7 @@ fn menu_input(
                     let yaw = 0.0;
                     let data = SaveData::capture(
                         crate::world::chunks::DEFAULT_SEED,
-                        crate::plugins::save::Season::default(),
+                        season.season,
                         &bitmap,
                         [camera.translation.x, camera.translation.z],
                         yaw,
@@ -331,7 +336,10 @@ mod tests {
             crate::plugins::save::SavePlugin,
             MenuPlugin,
         ))
-        .init_resource::<ButtonInput<KeyCode>>();
+        .init_resource::<ButtonInput<KeyCode>>()
+        // The menu picks the season, so it reads `SeasonState`; the real app
+        // gets this from `SeasonPlugin`.
+        .init_resource::<SeasonState>();
         app.world_mut().spawn((
             Camera3d::default(),
             PlayerBody::default(),
@@ -374,6 +382,94 @@ mod tests {
         // rebuilding around the spawn pose.
         let bitmap = app.world().resource::<ExploredBitmap>();
         assert!(!bitmap.is_empty(), "the restored world explores the start");
+    }
+
+    #[test]
+    fn tab_picks_the_season_and_the_run_starts_with_it() {
+        // R3.5/R3.7: the menu is the only place a run's season is chosen
+        // (ADR-0001). The chain that matters is menu -> SeasonState -> the
+        // save the run starts from, because the run's season is restored from
+        // that save rather than read live.
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            crate::plugins::save::Season::default(),
+            "the menu must open on the default season"
+        );
+
+        // Tab once: default -> next in calendar order.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(SEASON_CYCLE);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        let picked = app.world().resource::<SeasonState>().season;
+        assert_eq!(picked, crate::plugins::save::Season::default().next());
+
+        // Start the run: the season must survive into the running world.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+
+        assert_eq!(*app.world().resource::<GamePhase>(), GamePhase::Playing);
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            picked,
+            "the run must start with the season the menu showed"
+        );
+    }
+
+    #[test]
+    fn the_season_cannot_change_mid_run() {
+        // ADR-0001: fixed for the run. The dev keys are gated on the phase, so
+        // pressing them while walking must do nothing.
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(*app.world().resource::<GamePhase>(), GamePhase::Playing);
+
+        let before = app.world().resource::<SeasonState>().season;
+        // Register the dev-shortcut system exactly as `SeasonPlugin` does and
+        // drive it with the key held down, so the gate (not the missing
+        // button) is what the test exercises.
+        app.add_systems(bevy::prelude::Update, crate::plugins::season::dev_keys);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(crate::core::input::DEV_SEASON_WINTER);
+        app.update();
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            before,
+            "a mid-run season change would break the run's invariant"
+        );
+
+        // And the same key DOES work outside a run, so the gate is not simply
+        // a dead system.
+        *app.world_mut().resource_mut::<GamePhase>() = GamePhase::MainMenu;
+        app.update();
+        assert_eq!(
+            app.world().resource::<SeasonState>().season,
+            crate::plugins::save::Season::Winter,
+            "the dev shortcut must still work from the menu"
+        );
     }
 
     #[test]
