@@ -216,6 +216,19 @@ pub struct Foliage {
     pub center: [f32; 3],
     /// Blob radius (m).
     pub radius: f32,
+    /// Unit vector the cluster grows ALONG: from the branch out to the leaf
+    /// tips.
+    ///
+    /// This is what makes a leaf card read as a leaf. A card is a texture with
+    /// a petiole at the bottom edge and a tip at the top, so its orientation is
+    /// not free: the bottom must face the branch and the tip must fan outward.
+    /// The first bake ignored this and the cards pointed in random directions,
+    /// which every viewer reads as "the texture is rotated wrong".
+    ///
+    /// Taken from the branch direction at the point the cluster attaches, so a
+    /// crown's cards fan outward along the limbs rather than all pointing the
+    /// same way.
+    pub outward: [f32; 3],
 }
 
 /// One straight branch segment.
@@ -453,6 +466,9 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
                 skeleton.foliage.push(Foliage {
                     center: add(center, offset),
                     radius: radius * rng.random_range(0.75..=1.15),
+                    // Leaves at a branch tip continue along the branch, which is
+                    // where a tip cluster actually points.
+                    outward: branch.dir,
                 });
             }
             for run in 1..=profile.run_clusters(branch.length) {
@@ -468,6 +484,10 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
                     // floating.
                     center: add(center, scale(side, radius * profile.leaf_spread)),
                     radius: radius * rng.random_range(0.8..=1.2),
+                    // A run cluster hangs off the SIDE of the limb, so its
+                    // petiole points back at the branch and its tip points away
+                    // along that side vector.
+                    outward: side,
                 });
             }
         }

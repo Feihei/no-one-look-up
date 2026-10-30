@@ -343,7 +343,14 @@ pub fn bake_skeleton_lod(
         // spans the cluster's diameter, so a few of them cover the volume the
         // sphere used to.
         let cluster_radius = (foliage.radius * blob_scale).max(0.05);
-        leaf_parts.push(leaf_cards(center, cluster_radius, index, cards, top));
+        leaf_parts.push(leaf_cards(
+            center,
+            cluster_radius,
+            Vec3::from_array(foliage.outward),
+            index,
+            cards,
+            top,
+        ));
     }
 
     TreeParts {
@@ -395,7 +402,14 @@ fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
 /// Cards are rotated about the vertical axis at even intervals plus a
 /// per-cluster offset, with a slow tilt, so a crown has cards facing every
 /// direction instead of a fan of parallel planes.
-fn leaf_cards(center: Vec3, cluster_radius: f32, cluster: usize, cards: usize, top: f32) -> Mesh {
+fn leaf_cards(
+    center: Vec3,
+    cluster_radius: f32,
+    outward: Vec3,
+    cluster: usize,
+    cards: usize,
+    top: f32,
+) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(cards * 4);
@@ -403,12 +417,7 @@ fn leaf_cards(center: Vec3, cluster_radius: f32, cluster: usize, cards: usize, t
     let mut indices: Vec<u32> = Vec::with_capacity(cards * 6);
 
     // Per-cluster sway phase, so neighbouring cards do not move in lockstep.
-    // Lockstep motion across a crown reads as the whole tree being dragged
-    // rather than as wind moving through it.
     let phase = ((cluster as f32 * 0.618_034).fract()).clamp(0.0, 1.0);
-    // Cluster-level yaw offset, so two clusters never stack their cards at the
-    // same angles.
-    let yaw0 = (cluster as f32 * 2.399_963) % std::f32::consts::TAU;
     let sway = SWAY_WEIGHT_FOLIAGE * (1.0 + SWAY_HEIGHT_GAIN * height_term(center.y, top));
 
     // Deterministic scatter, so the same tree always bakes the same cards.
@@ -420,41 +429,73 @@ fn leaf_cards(center: Vec3, cluster_radius: f32, cluster: usize, cards: usize, t
         (hash & 0xFFFF) as f32 / 65535.0
     };
 
-    for card in 0..cards {
-        let yaw = yaw0 + std::f32::consts::PI * card as f32 / cards as f32;
-        // A slow tilt keeps the cards from all being vertical slices; a card
-        // that is perfectly edge-on would disappear from an overhead view.
-        let tilt = (card as f32 * 0.7).sin() * 0.35;
-        let rotation = Quat::from_euler(EulerRot::YXZ, yaw, tilt, 0.0);
+    // The direction the leaves grow along: from the branch out toward the tips.
+    // A leaf card is not free to rotate -- its texture has a petiole at the
+    // BOTTOM edge and a tip at the TOP -- so this is the card's up axis. The
+    // first bake ignored it and the cards pointed everywhere, which reads as
+    // "the texture is rotated wrong" from any angle.
+    let up = if outward.length_squared() < 1e-6 {
+        Vec3::Y
+    } else {
+        outward.normalize()
+    };
+    // A stable "right" for the card plane. Any perpendicular will do, but it
+    // must not depend on the frame: picking one from the up axis keeps the bake
+    // deterministic.
+    let seed_axis = if up.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let right0 = up.cross(seed_axis).normalize();
+    let face0 = right0.cross(up).normalize();
 
-        // Cards sit on a SHELL, not throughout the volume.
+    for card in 0..cards {
+        // Fan the cards around the growth axis at even intervals, plus a
+        // per-cluster twist so two clusters never stack their cards at the same
+        // angles. Rotating about `up` leaves the petiole-to-tip direction
+        // intact, which is the whole point: every card's bottom still faces the
+        // branch.
+        let twist = (cluster as f32 * 2.399_963
+            + card as f32 * std::f32::consts::TAU / cards as f32)
+            % std::f32::consts::TAU;
+        // A little lean, so the fan has depth rather than being a flat rosette.
         //
-        // Scattering them through the volume was the second attempt and it did
-        // not fix the "solid clump" reading: cards near the middle are hidden by
-        // cards in front of them, so they cost triangles without ever showing.
-        // Real foliage does the same thing for the same reason -- leaves grow at
-        // the outside of a crown where light is -- so the shell is both cheaper
-        // and more truthful: the middle stays open, and a sightline through the
-        // crown goes: leaves, gap, leaves.
-        //
-        // The radius varies a little so the shell is a fuzzy ball rather than a
-        // paper lantern.
-        let dir = Vec3::new(
-            next_unit() * 2.0 - 1.0,
-            next_unit() * 2.0 - 1.0,
-            next_unit() * 2.0 - 1.0,
-        );
-        let dir = if dir.length_squared() < 1e-4 {
-            Vec3::Y
+        // The lean is capped well under 90 degrees on purpose: past that the
+        // card tips past perpendicular, its tip starts pointing BACK at the
+        // branch, and the leaf looks folded under. 35 degrees keeps every card
+        // visibly growing outward while still breaking the fan out of one plane.
+        let lean = (next_unit() * 2.0 - 1.0) * 0.6;
+        // Build the frame explicitly instead of composing two axis-angle
+        // rotations. Composing `from_axis_angle(up, twist)` with a lean about a
+        // perpendicular re-orthogonalises `up`, and the tilt then bleeds into
+        // the growth direction: measured on a real tree, a few cards ended up
+        // with their tips pointing back at the branch. Building the basis by
+        // rotating the two perpendicular vectors and then re-deriving the
+        // growth vector keeps the tilt purely cosmetic.
+        let (sin_t, cos_t) = twist.sin_cos();
+        let (sin_l, cos_l) = lean.sin_cos();
+        let right = right0 * cos_t + face0 * sin_t;
+        let face = face0 * cos_t - right0 * sin_t;
+        // Tip direction: mostly `up`, leaning toward the card's face.
+        let grow = (up * cos_l + face * sin_l).normalize();
+        // Re-orthogonalise the card's own axis so the quad stays planar.
+        let right = (right - grow * right.dot(grow)).normalize_or_zero();
+        let right = if right.length_squared() < 1e-6 {
+            right0
         } else {
-            dir.normalize()
+            right
         };
+        let face_axis = right.cross(grow).normalize();
+
+        // Cards sit on a SHELL, not throughout the volume: cards near the middle
+        // are hidden by the cards in front of them, so they cost triangles
+        // without ever showing. Foliage grows outside-in for the same reason,
+        // so the middle stays open and a sightline reads leaf-gap-leaf.
+        let dir = (face_axis + up * 0.35).normalize_or_zero();
+        let dir = if dir.length_squared() < 1e-6 { up } else { dir };
         let shell = cluster_radius * (0.72 + 0.28 * next_unit());
         let card_center = center + dir * shell;
 
         // A smaller card than the cluster, so several of them compose a clump.
         // Slightly taller than wide: a leaf unit (one blade or one pinnate leaf)
-        // is longer than it is wide, and the texture's own aspect does the rest.
+        // is longer than it is wide.
         let half_w = cluster_radius * CARD_REACH_FRACTION;
         let half_h = half_w * 1.15;
         let corners = [
@@ -468,11 +509,14 @@ fn leaf_cards(center: Vec3, cluster_radius: f32, cluster: usize, cards: usize, t
             .iter()
             .zip([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
         {
-            let local = rotation * Vec3::new(corner[0], corner[1], 0.0);
+            // Local x follows `right0` in the card's rotated frame, local y is
+            // the growth direction. `v = 0` is the TOP of the texture (the tip),
+            // so +y must be where the tip goes.
+            let local = right * corner[0] + grow * corner[1];
             positions.push((card_center + local).to_array());
             // Cards are drawn double-sided, so one normal per quad is enough;
             // the PBR shader flips it for back faces.
-            normals.push((rotation * Vec3::Z).to_array());
+            normals.push(face_axis.to_array());
             uvs.push([u, v]);
             colors.push([sway, 1.0, phase, 1.0]);
         }
@@ -687,6 +731,81 @@ mod tests {
         let phases: std::collections::HashSet<u32> =
             mask.iter().map(|c| (c[2] * 1000.0) as u32).collect();
         assert!(phases.len() > 1, "every card shares one sway phase");
+    }
+
+    #[test]
+    fn every_card_points_its_tip_outward_and_its_petiole_at_the_branch() {
+        // The texture has the petiole on its BOTTOM edge (v = 1) and the tip on
+        // its TOP edge (v = 0). So for every card, the tip edge must lie
+        // further along the cluster's growth direction than the petiole edge.
+        //
+        // Ignoring this was a real bug: cards were rotated freely, every leaf
+        // pointed somewhere different, and the crown read as "the texture is
+        // rotated wrong" no matter which way you looked at it.
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let skeleton = crate::world::tree_shape::grow_tree(
+                crate::world::tree_shape::TREE_SHAPE_SEED,
+                species,
+                0,
+            );
+            let profile = TREE_PROFILES[species as usize];
+            let parts = bake_skeleton(&skeleton, &profile);
+            let positions = positions(&parts.leaves);
+            let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+                bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+                other => panic!("unexpected uv layout: {other:?}"),
+            };
+
+            // `leaf_cards` writes CARD_REACH_FRACTION-sized quads, 22 per cluster
+            // at the near tier, in skeleton order, so the cursor can be walked.
+            let cards = 22;
+            let mut cursor = 0usize;
+            let mut checked = 0usize;
+            for foliage in &skeleton.foliage {
+                let outward = Vec3::from_array(foliage.outward).normalize_or_zero();
+                if outward.length_squared() < 1e-6 {
+                    continue;
+                }
+                if cursor + cards * 4 > positions.len() {
+                    break;
+                }
+                for card in 0..cards {
+                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
+                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
+                    // Compare the MIDPOINTS of the tip and petiole edges: taking
+                    // one corner from each measures a diagonal, which mixes in
+                    // the card's width and makes the check meaningless.
+                    let mut tip = Vec3::ZERO;
+                    let mut petiole = Vec3::ZERO;
+                    let (mut n_tip, mut n_petiole) = (0u32, 0u32);
+                    for (uv, p) in quad.iter().zip(pos.iter()) {
+                        if uv[1] < 0.5 {
+                            tip += Vec3::from_array(*p);
+                            n_tip += 1;
+                        } else {
+                            petiole += Vec3::from_array(*p);
+                            n_petiole += 1;
+                        }
+                    }
+                    if n_tip == 0 || n_petiole == 0 {
+                        continue;
+                    }
+                    let tip = tip / n_tip as f32;
+                    let petiole = petiole / n_petiole as f32;
+                    let along = (tip - petiole).dot(outward);
+                    assert!(
+                        along > 0.0,
+                        "species {species}: a card points its tip back at the branch (dot {along:.3})"
+                    );
+                    checked += 1;
+                }
+                cursor += cards * 4;
+            }
+            assert!(
+                checked > 50,
+                "species {species}: only {checked} cards were checked"
+            );
+        }
     }
 
     #[test]
