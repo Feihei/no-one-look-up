@@ -314,12 +314,12 @@ pub(crate) struct PlacementAssets {
     /// single `Mesh3d`, so a chunk costs one entity per tree per LOD tier.
     /// Indices follow `lod * TreeMeshKey::VARIANTS * TREE_PROFILES.len() +
     /// species * TreeMeshKey::VARIANTS + variant`.
-    tree_meshes: Vec<Handle<Mesh>>,
-    /// The season-aware tree material (R3.5): one handle shared by every tree
-    /// in the world, so a season switch is a single uniform write
-    /// (`plugins::season`). Trees used to share a plain `StandardMaterial`;
-    /// the extension keeps the same silhouette and adds sway + leaf density.
+    tree_meshes: Vec<(Handle<Mesh>, Handle<Mesh>)>,
+    /// Opaque silhouette material for the branches.
     tree_material: Handle<crate::plugins::season::TreeSeasonMaterial>,
+    /// Alpha-tested material for the foliage cards, textured with a species
+    /// leaf mask.
+    tree_leaf_material: Handle<crate::plugins::season::TreeSeasonMaterial>,
     /// One unit cube reused by every building and plaza pad; each instance
     /// scales it. Buildings used to call `meshes.add(Cuboid)` per object,
     /// which allocated a new mesh every time a chunk streamed in.
@@ -329,7 +329,13 @@ pub(crate) struct PlacementAssets {
 impl PlacementAssets {
     /// Baked mesh for a placement tree instance at one LOD tier, or `None` if
     /// out of range.
-    fn tree_mesh(&self, asset: u8, wear: f32, lod: TreeLod) -> Option<&Handle<Mesh>> {
+    /// `(wood, leaves)` meshes for a placement tree instance at one LOD tier.
+    fn tree_mesh(
+        &self,
+        asset: u8,
+        wear: f32,
+        lod: TreeLod,
+    ) -> Option<&(Handle<Mesh>, Handle<Mesh>)> {
         let key = crate::world::tree_mesh::TreeMeshKey::from_placement(asset, wear);
         let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
         let tier = TreeLod::ALL.iter().position(|t| *t == lod)?;
@@ -347,6 +353,7 @@ fn build_placement_assets(
     meshes: Option<ResMut<Assets<Mesh>>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
     tree_materials: Option<ResMut<Assets<crate::plugins::season::TreeSeasonMaterial>>>,
+    mut images: Option<ResMut<Assets<Image>>>,
     existing: Option<Res<PlacementAssets>>,
 ) {
     // Build ONCE. This system used to run every frame with no guard: it baked
@@ -400,13 +407,17 @@ fn build_placement_assets(
     // R3.9: trees are procedural, baked to one mesh per (species, variant).
     // 3 species x 4 variants = 12 meshes for the whole world, reused by every
     // chunk that spawns a tree.
+    // Each entry is (wood, leaves): two meshes per tree, because the branches
+    // stay opaque while the foliage cards are alpha-tested. See
+    // `world::tree_mesh`'s header for why they cannot share a material.
     let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
-    let mut tree_meshes = Vec::with_capacity(per_lod * TreeLod::ALL.len());
+    let mut tree_meshes: Vec<(Handle<Mesh>, Handle<Mesh>)> =
+        Vec::with_capacity(per_lod * TreeLod::ALL.len());
     for lod in TreeLod::ALL {
         for species in 0..TREE_PROFILES.len() as u8 {
             for variant in 0..TreeMeshKey::VARIANTS {
-                tree_meshes
-                    .push(meshes.add(bake_tree_mesh_lod(TreeMeshKey { species, variant }, lod)));
+                let parts = bake_tree_mesh_lod(TreeMeshKey { species, variant }, lod);
+                tree_meshes.push((meshes.add(parts.wood), meshes.add(parts.leaves)));
             }
         }
     }
@@ -418,6 +429,22 @@ fn build_placement_assets(
         base: crate::plugins::season::tree_base_material(),
         extension: Default::default(),
     });
+    // The foliage cards need a texture. Until the species atlas exists, one
+    // shared placeholder keeps every tree drawing.
+    // An `Image` store only exists once the render plugins are up; a headless
+    // test has none. Falling back to a texture-less card keeps the world
+    // building there, where nothing is drawn anyway -- and the test that counts
+    // tree entities is about streaming, not about what the crown looks like.
+    let leaf_texture = images.as_deref_mut().map(|images| {
+        let profiles = crate::world::leaf_shape::leaf_profiles();
+        let profile = crate::world::leaf_shape::find_profile("poplar")
+            .or_else(|| profiles.first())
+            .expect("the leaf table is never empty");
+        let mask = crate::world::leaf_shape::bake_leaf_alpha(profile, 256);
+        images.add(crate::world::leaf_shape::mask_to_image(&mask))
+    });
+    let tree_leaf_material =
+        tree_materials.add(crate::plugins::season::tree_leaf_material(leaf_texture));
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
     info!(
@@ -431,6 +458,7 @@ fn build_placement_assets(
         plaza_material,
         tree_meshes,
         tree_material,
+        tree_leaf_material,
         unit_cube,
     });
 }
@@ -498,23 +526,41 @@ fn spawn_chunk_content(
 
                 commands.entity(root).with_children(|parent| {
                     for lod in TreeLod::ALL {
-                        let Some(mesh) = assets.tree_mesh(tree.asset, object.wear, lod) else {
+                        let Some((wood, leaves)) = assets.tree_mesh(tree.asset, object.wear, lod)
+                        else {
                             continue;
                         };
-                        let mut entity = parent.spawn((
-                            Name::new(match lod {
-                                TreeLod::Near => "Tree",
-                                TreeLod::Mid => "TreeMid",
-                                TreeLod::Far => "TreeFar",
-                            }),
-                            Mesh3d(mesh.clone()),
-                            MeshMaterial3d(assets.tree_material.clone()),
-                            transform,
-                        ));
-                        // The near tier has nothing to fade from, so it needs
-                        // no range component at all.
-                        if lod != TreeLod::Near {
-                            entity.insert(lod.range());
+                        // Two entities per tier: the branches keep the opaque
+                        // silhouette material, the cards take the alpha-tested
+                        // leaf material. Same transform, so they stay together.
+                        let suffix = match lod {
+                            TreeLod::Near => "",
+                            TreeLod::Mid => "Mid",
+                            TreeLod::Far => "Far",
+                        };
+                        // The wood entity carries the tier's canonical name
+                        // (`Tree` / `TreeMid` / `TreeFar`) so the LOD and
+                        // streaming tests keep working; the leaf entity is
+                        // named alongside it.
+                        for (part_name, mesh, material) in [
+                            (format!("Tree{suffix}"), wood, &assets.tree_material),
+                            (
+                                format!("TreeLeaves{suffix}"),
+                                leaves,
+                                &assets.tree_leaf_material,
+                            ),
+                        ] {
+                            let mut entity = parent.spawn((
+                                Name::new(part_name),
+                                Mesh3d(mesh.clone()),
+                                MeshMaterial3d(material.clone()),
+                                transform,
+                            ));
+                            // The near tier has nothing to fade from, so it
+                            // needs no range component at all.
+                            if lod != TreeLod::Near {
+                                entity.insert(lod.range());
+                            }
                         }
                     }
                 });

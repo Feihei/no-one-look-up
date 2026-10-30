@@ -31,6 +31,7 @@ use crate::core::game_state::GamePhase;
 use crate::core::input::{
     DEV_SEASON_AUTUMN, DEV_SEASON_SPRING, DEV_SEASON_SUMMER, DEV_SEASON_WINTER,
 };
+use crate::world::leaf_shape::ALPHA_CUTOFF as LEAF_ALPHA_CUTOFF;
 use crate::world::season::{SWAY_PHASE_LEN, SWAY_SPEED, Season, SeasonState};
 use crate::world::tree_mesh::SILHOUETTE_BASE_COLOR_SRGB;
 
@@ -145,6 +146,40 @@ pub fn tree_base_material() -> StandardMaterial {
         // break the cut-out look the whole design rests on.
         reflectance: 0.0,
         ..default()
+    }
+}
+
+/// The material for the foliage cards: the silhouette colour, the species leaf
+/// mask, and an alpha test.
+///
+/// `AlphaMode::Mask` is what makes the leaf outline real rather than a picture
+/// inside a quad. It also keeps the depth prepass honest: Bevy's prepass reads
+/// the MATERIAL base colour times the base-colour texture and runs
+/// `prepass_alpha_discard` on the result, so the discarded texels leave no
+/// depth behind and the volumetric fog and clouds are not cut out around
+/// leaves nobody can see. A per-vertex alpha would not have that guarantee.
+///
+/// `double_sided` because a card is a plane: culling back faces would make half
+/// the crown vanish from any given viewpoint.
+///
+/// A `None` texture is for headless tests, which have no `Assets<Image>`: the
+/// material then has no alpha to test, so the cards render as solid quads. That
+/// is wrong visually and irrelevant there, where nothing is drawn.
+pub fn tree_leaf_material(texture: Option<Handle<Image>>) -> TreeSeasonMaterial {
+    TreeSeasonMaterial {
+        base: StandardMaterial {
+            base_color_texture: texture,
+            alpha_mode: AlphaMode::Mask(LEAF_ALPHA_CUTOFF),
+            double_sided: true,
+            // Cards are lit from both sides; a single-sided normal would leave
+            // one face flat black. `cull_mode: None` is what `double_sided`
+            // sets, and the shader flips the normal for back faces.
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            reflectance: 0.0,
+            ..tree_base_material()
+        },
+        extension: Default::default(),
     }
 }
 
@@ -477,18 +512,44 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_collapses_leaves_but_never_wood() {
-        // Winter must strip the crown and leave the tree standing. If the
-        // collapse stopped checking the foliage mask it would shrink the trunk
-        // to a point and the world would lose its trees every winter.
-        let src = tree_shader_source();
+    fn density_comes_from_the_texture_alpha_not_from_geometry() {
+        // History: winter used to collapse each foliage cluster toward its
+        // centre in the vertex shader, because the crowns were opaque and there
+        // was no alpha to work with. The cards carry a leaf texture now, so
+        // density is material alpha x texture alpha and the alpha test does the
+        // work.
+        //
+        // Both halves are asserted, because either one alone is a regression:
+        // bringing the collapse back would double-apply density, and losing the
+        // texture would leave the cards as solid quads.
+        let shader = tree_shader_source();
+        let code: String = shader
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
         assert!(
-            src.contains("vertex_color.g <= 0.5"),
-            "the foliage mask gate disappeared; wood would collapse with the leaves"
+            !code.contains("tint_density.a - 1.0"),
+            "the geometry collapse is back; density would be applied twice"
+        );
+
+        let material = tree_leaf_material(None);
+        assert!(
+            matches!(material.base.alpha_mode, AlphaMode::Mask(cutoff) if (cutoff - LEAF_ALPHA_CUTOFF).abs() < 1e-6),
+            "the foliage material must alpha-test at the mask cutoff"
         );
         assert!(
-            src.contains("season.tint_density.a - 1.0"),
-            "the density collapse must scale the offset by (density - 1)"
+            material.base.double_sided,
+            "a card is a plane; culling back faces would erase half of every crown"
+        );
+        // The branches keep the opaque material: the same alpha mode there
+        // would delete the trunk, which has no texture to test against.
+        assert!(
+            matches!(tree_base_material().alpha_mode, AlphaMode::Opaque),
+            "the branch material must stay opaque"
         );
     }
 
