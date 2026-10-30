@@ -17,6 +17,8 @@
 //! Output: plain PPM (P6) plus a small stored-deflate PNG writer, so the
 //! example needs no image crate.
 
+use bevy::prelude::{EulerRot, Quat, Vec3};
+
 use heads_up_bevy::world::tree_shape::{TREE_PROFILES, TreeSkeleton, grow_tree};
 
 const WIDTH: usize = 2400;
@@ -99,38 +101,6 @@ impl Canvas {
                 }
             }
         }
-    }
-
-    /// Fills a pixel-space sphere with simple lit-rim shading.
-    fn blob(&mut self, center: (f32, f32), radius: f32, depth: f32) -> bool {
-        if radius < 0.9 {
-            return false;
-        }
-        // Light from upper-left, matching the sky's sun side.
-        let light = normalize3([-0.45, 0.75, 0.5]);
-        let ci = center.0 as i32;
-        let cj = center.1 as i32;
-        let ri = radius.ceil() as i32;
-        for dy in -ri..=ri {
-            for dx in -ri..=ri {
-                let nx = dx as f32 / radius;
-                let ny = dy as f32 / radius;
-                let d2 = nx * nx + ny * ny;
-                if d2 > 1.0 {
-                    continue;
-                }
-                // Fake normal of a sphere seen head-on (y is screen-down).
-                let nz = (1.0 - d2).sqrt();
-                let facing = nx * light[0] - ny * light[1] + nz * light[2];
-                let lambert = facing.max(0.0) * 0.7 + 0.3;
-                let base = [0.11, 0.31, 0.17];
-                let color = [base[0] * lambert, base[1] * lambert, base[2] * lambert];
-                // Slight bias toward the camera: opaque foliage sits in front
-                // of its own branches.
-                self.put(ci + dx, cj + dy, depth - radius * 0.01, color);
-            }
-        }
-        true
     }
 
     fn put(&mut self, x: i32, y: i32, depth: f32, color: [f32; 3]) {
@@ -217,11 +187,6 @@ fn glyph(ch: char) -> [u8; 7] {
     }
 }
 
-fn normalize3(v: [f32; 3]) -> [f32; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
-    [v[0] / l, v[1] / l, v[2] / l]
-}
-
 /// Orthographic sheet projection: world metres -> sheet pixels.
 struct Sheet {
     /// Pixels per metre.
@@ -252,7 +217,12 @@ impl Sheet {
 }
 
 /// Draws one tree into the canvas on its sheet.
-fn draw_tree(canvas: &mut Canvas, tree: &TreeSkeleton, sheet: &Sheet) {
+fn draw_tree(
+    canvas: &mut Canvas,
+    tree: &TreeSkeleton,
+    sheet: &Sheet,
+    mask: &heads_up_bevy::world::leaf_shape::AlphaMask,
+) {
     for branch in &tree.branches {
         let (a, da) = sheet.project(branch.start);
         let (b, db) = sheet.project(branch.end);
@@ -277,16 +247,130 @@ fn draw_tree(canvas: &mut Canvas, tree: &TreeSkeleton, sheet: &Sheet) {
             tint,
         );
     }
+    // Foliage as the game now draws it: crossed leaf cards, not blobs.
+    //
+    // The sheet used to draw shaded spheres because that WAS the shipped
+    // geometry. Cards are what ships now, and a sphere sheet would flatter the
+    // design -- the whole point of the switch is the outline, which a blob
+    // cannot show. Each card is rasterised as a textured quad sampling the
+    // species' alpha mask, so what this sheet shows is what the GPU draws.
     for foliage in &tree.foliage {
-        let (center, depth) = sheet.project(foliage.center);
-        canvas.blob(center, foliage.radius * sheet.scale, depth);
+        draw_leaf_cards(canvas, foliage, sheet, mask);
     }
+}
+
+/// Rasterises a cluster's leaf cards the way the GPU does: textured quads with
+/// an alpha test, not outlines.
+///
+/// The first version of this sheet drew card BORDERS, which made the crown look
+/// like a wireframe of big rectangles -- the opposite of what ships. It also
+/// hid a real problem: the cards were as large as the cluster, so even with a
+/// texture they would read as slabs. Drawing the texture is what makes this
+/// sheet worth having.
+fn draw_leaf_cards(
+    canvas: &mut Canvas,
+    foliage: &heads_up_bevy::world::tree_shape::Foliage,
+    sheet: &Sheet,
+    mask: &heads_up_bevy::world::leaf_shape::AlphaMask,
+) {
+    let cluster_radius = foliage.radius.max(0.05);
+    let cards = 14usize;
+    let center = Vec3::from_array(foliage.center);
+    let yaw0 = 0.0_f32;
+    let mut hash = 0x9E37_79B9u32;
+    let mut next_unit = || {
+        hash ^= hash << 13;
+        hash ^= hash >> 17;
+        hash ^= hash << 5;
+        (hash & 0xFFFF) as f32 / 65535.0
+    };
+
+    for card in 0..cards {
+        let yaw = yaw0 + std::f32::consts::PI * card as f32 / cards as f32;
+        let tilt = (card as f32 * 0.7).sin() * 0.35;
+        let rotation = Quat::from_euler(EulerRot::YXZ, yaw, tilt, 0.0);
+        let spread = cluster_radius * 0.75;
+        let offset = Vec3::new(
+            (next_unit() * 2.0 - 1.0) * spread,
+            (next_unit() * 2.0 - 1.0) * spread,
+            (next_unit() * 2.0 - 1.0) * spread,
+        );
+        let card_center = center + offset;
+        let half_w = cluster_radius * 0.42;
+        let half_h = half_w * 1.15;
+
+        let corners = [
+            (-half_w, -half_h, 0.0f32, 1.0f32),
+            (half_w, -half_h, 1.0, 1.0),
+            (half_w, half_h, 1.0, 0.0),
+            (-half_w, half_h, 0.0, 0.0),
+        ];
+        let projected: Vec<((f32, f32), f32, f32, f32)> = corners
+            .iter()
+            .map(|(x, y, u, v)| {
+                let world = card_center + rotation * Vec3::new(*x, *y, 0.0);
+                let (px, depth) = sheet.project(world.to_array());
+                (px, depth, *u, *v)
+            })
+            .collect();
+
+        // Two triangles, barycentric fill, alpha-tested against the mask.
+        for tri in [[0usize, 1, 2], [0, 2, 3]] {
+            let p0 = projected[tri[0]];
+            let p1 = projected[tri[1]];
+            let p2 = projected[tri[2]];
+            let min_x = p0.0.0.min(p1.0.0).min(p2.0.0).floor() as i32;
+            let max_x = p0.0.0.max(p1.0.0).max(p2.0.0).ceil() as i32;
+            let min_y = p0.0.1.min(p1.0.1).min(p2.0.1).floor() as i32;
+            let max_y = p0.0.1.max(p1.0.1).max(p2.0.1).ceil() as i32;
+            let area = edge(p0.0, p1.0, p2.0);
+            if area.abs() < 1e-6 {
+                continue;
+            }
+            for py in min_y..=max_y {
+                for px in min_x..=max_x {
+                    let p = (px as f32 + 0.5, py as f32 + 0.5);
+                    let w0 = edge(p1.0, p2.0, p) / area;
+                    let w1 = edge(p2.0, p0.0, p) / area;
+                    let w2 = edge(p0.0, p1.0, p) / area;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let u = w0 * p0.2 + w1 * p1.2 + w2 * p2.2;
+                    let v = w0 * p0.3 + w1 * p1.3 + w2 * p2.3;
+                    let tx = (u * mask.width as f32).clamp(0.0, mask.width as f32 - 1.0) as u32;
+                    let ty = (v * mask.height as f32).clamp(0.0, mask.height as f32 - 1.0) as u32;
+                    if mask.get(tx, ty) < 128 {
+                        continue;
+                    }
+                    let depth = w0 * p0.1 + w1 * p1.1 + w2 * p2.1;
+                    canvas.put(px, py, depth, [0.10, 0.20, 0.10]);
+                }
+            }
+        }
+    }
+}
+
+/// Signed area of the triangle (a, b, c): positive for one winding.
+fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
 
 fn main() {
     let mut canvas = Canvas::new(WIDTH, HEIGHT);
 
+    // Which leaf mask a species draws. The three shipped species map onto the
+    // baked masks by position; a species without one falls back to the first.
+    let masks: Vec<heads_up_bevy::world::leaf_shape::AlphaMask> =
+        heads_up_bevy::world::leaf_shape::leaf_profiles()
+            .iter()
+            .map(|p| heads_up_bevy::world::leaf_shape::bake_leaf_alpha(p, 256))
+            .collect();
+
     for (species, profile) in TREE_PROFILES.iter().enumerate() {
+        let mask = masks
+            .get(species)
+            .unwrap_or_else(|| masks.first().expect("at least one leaf mask"));
         let top = species * (SHEET_HEIGHT + SHEET_GAP);
         canvas.fill_rect(0, top, WIDTH, SHEET_HEIGHT, [0.13, 0.15, 0.21]);
 
@@ -340,7 +424,7 @@ fn main() {
                 ground_y,
                 yaw: SHEET_YAW,
             };
-            draw_tree(&mut canvas, tree, &sheet);
+            draw_tree(&mut canvas, tree, &sheet, mask);
             canvas.text(
                 sheet.origin_x - 30.0,
                 ground_y + 12.0,
