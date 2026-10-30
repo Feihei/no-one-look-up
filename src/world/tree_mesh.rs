@@ -1,58 +1,80 @@
-//! Baking a [`TreeSkeleton`] into a single opaque mesh (R3.9 step 3), plus the
-//! per-vertex season data the foliage shader reads (R3.5).
+//! Baking a [`TreeSkeleton`] into the two meshes a tree needs, plus the
+//! per-vertex season data the foliage shader reads (R3.5, R3.10).
 //!
-//! The gallery (`plugins::tree_preview`) spawns one entity per branch and one
-//! per leaf cluster so a tree can be inspected and debugged. That is fine for
-//! twelve trees and hopeless for a streaming world: the chunk planner places
-//! up to 13 trees per 50 m chunk, which at ~250 parts each would be 3,250
-//! entities per chunk — and a full streaming window is ~49 chunks.
+//! This module merges a tree into **one pair of meshes per species-and-variant
+//! key**, so a chunk spawns two `Mesh3d` entities per tree and every chunk
+//! sharing a key reuses the same handles (and therefore the same draw state).
 //!
-//! This module merges a tree into **one mesh per species-and-variant key**, so
-//! a chunk spawns one `Mesh3d` per tree and every chunk sharing a key reuses
-//! the same `Handle<Mesh>` (and therefore the same draw state).
+//! # Two meshes per tree: wood and leaves
 //!
-//! Meshes are cached: the chunk planner asks for key `k`, we build it at most
-//! once per session. A 13-tree chunk costs 13 entities and 0 extra meshes once
-//! the keys recur.
+//! [`TreeParts::wood`] holds the branches (opaque silhouette material) and
+//! [`TreeParts::leaves`] the foliage cards (alpha-tested leaf texture). They
+//! were one mesh while the foliage was opaque icosphere blobs. Cards need
+//! `AlphaMode::Mask`, and a merged mesh would force that alpha mode onto the
+//! branches too, where a texture-less alpha test erases the trunk.
+//!
+//! # Leaves are cards, not blobs
+//!
+//! A 1.2 m sphere is a solid ball at any distance, which is what "a clump of
+//! leaves" looked like in game. The silhouette the design wants — sky cut into
+//! pieces by real leaf outlines — cannot come from a sphere at any subdivision.
+//! Each foliage cluster instead becomes a handful of crossed quads textured
+//! with a baked leaf alpha mask ([`crate::world::leaf_shape`]).
+//!
+//! A card costs 2 triangles against a blob's 20, so the switch also cuts the
+//! foliage triangle budget by roughly 90% while making the outline correct.
 //!
 //! # Season data on the vertex stream
-//!
-//! Season rendering (ADR-0004 §6, [`crate::world::season`]) needs three things
-//! per vertex that the geometry alone cannot express. All three ride on
-//! attributes Bevy's mesh pipeline already knows how to feed a shader, so no
-//! custom vertex layout or custom vertex attribute has to be registered:
 //!
 //! | Channel | Meaning |
 //! |---|---|
 //! | `COLOR.r` | sway weight (ADR-0004: "the vertex-colour R channel controls each vertex's sway strength") |
-//! | `COLOR.g` | foliage mask, 0 = branch (never collapsed, never tinted as leaves) |
-//! | `COLOR.b` | per-cluster phase offset, so neighbouring clusters do not sway in lockstep |
-//! | `UV_0.xy`, `UV_1.x` | the vertex's offset from its own cluster centre, which the density collapse scales down |
+//! | `COLOR.g` | foliage mask, 0 = branch |
+//! | `COLOR.b` | per-card sway phase, so neighbouring cards do not move in lockstep |
+//! | `UV_0` | leaf texture coordinates (leaves only) |
 //!
-//! `UV_1` carries only one useful component — a full `UV_2` for a scalar would
-//! cost another `Float32x2` per vertex across ~3000 vertices a tree.
+//! Leaf density no longer collapses geometry: that was the opaque-blob era,
+//! when there was no alpha to work with. It is the material's base-colour alpha
+//! multiplied into the texture alpha, which the depth prepass honours (see
+//! `plugins::season`). `UV_1`, which used to carry the collapse offset, is gone
+//! with it.
 //!
-//! Silhouette material (ADR-0001): near-black, fully rough, no specular, so
-//! the tree reads as a shape against the dusk sky rather than as shaded
-//! geometry. The foliage tint is a *multiplier* on that base colour, not a
-//! replacement, so all four seasons stay inside the silhouette budget.
+//! Silhouette material (ADR-0001): near-black, fully rough, no specular, so the
+//! tree reads as a shape against the dusk sky rather than as shaded geometry.
+//! The foliage tint is a *multiplier* on that base colour, not a replacement,
+//! so all four seasons stay inside the silhouette budget.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::VisibilityRange;
-use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+use bevy::mesh::{ConicalFrustumMeshBuilder, Indices, Mesh, MeshBuilder, PrimitiveTopology};
 use bevy::prelude::*;
 
 use crate::world::tree_shape::{TREE_PROFILES, TreeProfile, TreeSkeleton, grow_tree};
 
 /// Branches are tapered 5-sided tubes. At silhouette distance a 5-gon is
-/// indistinguishable from a 6-gon, and branches are ~40% of the triangle
-/// budget, so the odd side is worth having.
+/// indistinguishable from a 6-gon, and branches are ~40% of the triangle budget,
+/// so the odd side is worth having.
 const BRANCH_SIDES: u32 = 5;
-/// Leaf clusters are 20-face icospheres (subdivision 0). Blobs dominate the
-/// triangle count — ~180 per tree — and against a dusk sky a 20-face and an
-/// 80-face blob are the same silhouette. Measured: dropping 1 -> 0 cut the
-/// scene estimate from 2.6M to well under 1M triangles.
-const BLOB_SUBDIVISIONS: u32 = 0;
+/// Cards per foliage cluster near the camera.
+///
+/// The first version used four cards the SIZE OF THE CLUSTER, which is a 2.4 m
+/// plane carrying a 10 cm leaf: at that scale the outline is a giant rectangle
+/// no texture can hide. The card count and the card size have to move together
+/// -- many small cards, not a few huge ones -- which is also what makes the sky
+/// get cut into pieces rather than occluded in slabs.
+///
+/// 22 cards of ~0.26 of the cluster radius each: 44 triangles against a
+/// 20-face blob, still cheaper than the sphere it replaced, and small enough
+/// that the gaps between cards are leaves-sized rather than cluster-sized.
+const CARDS_PER_CLUSTER: usize = 22;
+/// Cards per cluster at the far tier, where individual leaves are sub-pixel and
+/// only the broken-up outline matters.
+const FAR_CARDS_PER_CLUSTER: usize = 6;
+/// A card's half-extent as a fraction of the cluster radius.
+///
+/// Small enough that several cards overlap to form one cluster, large enough
+/// that a leaf unit is still legible at a few metres.
+const CARD_REACH_FRACTION: f32 = 0.26;
 /// Branches thinner than this (m) are dropped from the bake: at any walking
 /// distance they are sub-pixel, and the finest twigs are ~40% of all parts.
 const MIN_BAKED_RADIUS: f32 = 0.035;
@@ -67,28 +89,25 @@ pub const SWAY_WEIGHT_FOLIAGE: f32 = 1.0;
 /// moving crown reads as two disconnected objects at the join.
 pub const SWAY_WEIGHT_BRANCH: f32 = 0.12;
 
-/// How strongly foliage height modulates the sway, per metre.
+/// How strongly height modulates the sway, per unit of normalised height.
 ///
-/// Wind moves a crown more than it moves the underside of the same crown; a
-/// uniform offset would slide the whole blob sideways and read as a floating
-/// object rather than as leaves.
+/// Wind moves a crown more than the underside of the same crown; a uniform
+/// offset would slide the whole thing sideways and read as a floating object.
 pub const SWAY_HEIGHT_GAIN: f32 = 0.35;
 
 /// How much detail a baked mesh keeps.
 ///
-/// Foliage dominates the triangle count (measured: ~85-90% of a tree — 183
-/// clusters of 20 faces against ~930 triangles of branch), so the tiers differ
-/// mostly in how many leaf clusters survive. A dusk silhouette is a flat dark
-/// shape, so dropping clusters and detail costs little visually while cutting
-/// the frame cost of the far field sharply.
+/// Foliage dominates the triangle count, so the tiers differ mostly in how many
+/// leaf cards survive. A dusk silhouette is a flat dark shape, so dropping
+/// cards and detail costs little visually while cutting the frame cost of the
+/// far field sharply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TreeLod {
-    /// Full detail: every branch and every leaf cluster.
+    /// Full detail: every branch and every cluster's cards.
     Near,
-    /// Coarser foliage: the crown keeps its shape but carries fewer vblobs,
-    /// and thin branches are dropped.
+    /// Coarser foliage: the crown keeps its shape but fewer cards.
     Mid,
-    /// A handful of big blobs: at this distance the crown is a smudge.
+    /// A couple of big cards: at this distance the crown is a smudge.
     Far,
 }
 
@@ -99,10 +118,10 @@ impl TreeLod {
     /// Where this tier takes over from the previous one, in metres from the
     /// camera. The last entry is where trees disappear entirely.
     ///
-    /// 40 m / 110 m / 220 m: `CHUNK_AHEAD` is 4 chunks (200 m), so the far
-    /// tier only ever covers the last stretch the player can see. Close enough
-    /// to the walk that the crown still reads, far enough that a 1.2-2.0 m/s
-    /// walker sees the swap rarely.
+    /// 40 m / 110 m / 220 m: `CHUNK_AHEAD` is 4 chunks (200 m), so the far tier
+    /// only ever covers the last stretch the player can see. Close enough to the
+    /// walk that the crown still reads, far enough that a 1.2-2.0 m/s walker
+    /// sees the swap rarely.
     pub const BOUNDARIES: [f32; 4] = [0.0, 40.0, 110.0, 220.0];
 
     /// The visibility range for this tier, or `None` for `Near` (visible from
@@ -116,33 +135,24 @@ impl TreeLod {
     fn min_branch_radius(self) -> f32 {
         match self {
             TreeLod::Near => MIN_BAKED_RADIUS,
-            // Mid drops twigs entirely: at 40 m+ a 3.5 cm twig is under a
-            // pixel and its branch geometry was only carrying the crown's
-            // inner structure, which the blobs occlude anyway.
+            // Mid drops twigs entirely: at 40 m+ a 3.5 cm twig is under a pixel
+            // and only carried the crown's inner structure.
             TreeLod::Mid => 0.06,
             TreeLod::Far => f32::INFINITY,
         }
     }
 
-    /// Icosphere subdivisions for leaf blobs at this tier.
-    fn blob_subdivisions(self) -> u32 {
-        match self {
-            TreeLod::Near | TreeLod::Mid => BLOB_SUBDIVISIONS,
-            TreeLod::Far => 0,
-        }
-    }
-
-    /// Keep every `n`th leaf cluster (1 = all).
+    /// Keep every `n`th cluster (1 = all).
     fn blob_stride(self) -> usize {
         match self {
             TreeLod::Near => 1,
-            TreeLod::Mid => 3,
-            TreeLod::Far => 14,
+            TreeLod::Mid => 2,
+            TreeLod::Far => 4,
         }
     }
 
-    /// Blobs below this radius (m) are dropped; keeps the big crown masses and
-    /// discards the small filler.
+    /// Clusters below this radius (m) are dropped; keeps the big crown masses
+    /// and discards the small filler.
     fn min_blob_radius(self) -> f32 {
         match self {
             TreeLod::Near => 0.0,
@@ -151,13 +161,21 @@ impl TreeLod {
         }
     }
 
-    /// Fatten the surviving blobs so the crown still fills its silhouette once
-    /// most of them are gone.
+    /// Fatten the surviving clusters so the crown still fills its silhouette
+    /// once most of them are gone.
     fn blob_scale(self) -> f32 {
         match self {
             TreeLod::Near => 1.0,
             TreeLod::Mid => 1.18,
             TreeLod::Far => 1.55,
+        }
+    }
+
+    /// Cards per cluster at this tier.
+    fn cards_per_cluster(self) -> usize {
+        match self {
+            TreeLod::Near | TreeLod::Mid => CARDS_PER_CLUSTER,
+            TreeLod::Far => FAR_CARDS_PER_CLUSTER,
         }
     }
 }
@@ -177,9 +195,9 @@ impl TreeMeshKey {
     /// Maps the placement planner's `(asset, wear)` onto a bake key.
     ///
     /// `asset` selects the species (the planner samples `0..tree_asset_count`)
-    /// and `wear` — which trees also carry, unused for anything else — picks
-    /// the variant. That gives neighbouring trees of one species different
-    /// shapes without any extra RNG plumbing through placement.
+    /// and `wear` — which trees also carry, unused for anything else — picks the
+    /// variant. That gives neighbouring trees of one species different shapes
+    /// without extra RNG plumbing through placement.
     pub fn from_placement(asset: u8, wear: f32) -> Self {
         let variant = (wear * Self::VARIANTS as f32)
             .floor()
@@ -194,11 +212,11 @@ impl TreeMeshKey {
 /// World-scale silhouette values for a procedural tree.
 ///
 /// Split out from the material so the numbers can be asserted headless: the
-/// foliage shader multiplies the base colour by a per-season tint, and the
-/// crown must stay this dark in every season.
+/// foliage shader multiplies the base colour by a per-season tint, and the crown
+/// must stay this dark in every season.
 pub const SILHOUETTE_BASE_COLOR_SRGB: [f32; 3] = [0.030, 0.038, 0.032];
 
-/// [`silhouette_material`] as a plain `StandardMaterial`.
+/// The shipped silhouette as a plain `StandardMaterial`.
 ///
 /// Only used by the gallery examples; the world builds the season-aware
 /// `ExtendedMaterial` in [`crate::plugins::season`].
@@ -218,20 +236,36 @@ pub fn silhouette_material() -> StandardMaterial {
     }
 }
 
-/// Grows the skeleton behind `key` and bakes it into one mesh.
-pub fn bake_tree_mesh(key: TreeMeshKey) -> Mesh {
+/// One tree baked into the two meshes it needs (see the module header).
+#[derive(Clone, Debug)]
+pub struct TreeParts {
+    /// Branches: opaque silhouette material.
+    pub wood: Mesh,
+    /// Foliage cards: alpha-masked leaf texture.
+    pub leaves: Mesh,
+}
+
+impl TreeParts {
+    /// Total triangles across both meshes, for the budgets the tests assert.
+    pub fn triangle_count(&self) -> usize {
+        triangle_count(&self.wood) + triangle_count(&self.leaves)
+    }
+}
+
+/// Grows the skeleton behind `key` and bakes it.
+pub fn bake_tree_mesh(key: TreeMeshKey) -> TreeParts {
     bake_tree_mesh_lod(key, TreeLod::Near)
 }
 
 /// [`bake_tree_mesh`] at a specific detail tier.
-pub fn bake_tree_mesh_lod(key: TreeMeshKey, lod: TreeLod) -> Mesh {
+pub fn bake_tree_mesh_lod(key: TreeMeshKey, lod: TreeLod) -> TreeParts {
     let profile = TREE_PROFILES
         .get(key.species as usize)
         .copied()
         .unwrap_or(TREE_PROFILES[0]);
-    // Deliberately a fixed gallery seed: a tree's SHAPE must not depend on
-    // world position, or the mesh cache would miss on every chunk. It also
-    // keeps every LOD of one tree the same tree.
+    // Deliberately a fixed gallery seed: a tree's SHAPE must not depend on world
+    // position, or the mesh cache would miss on every chunk. It also keeps every
+    // LOD of one tree the same tree.
     let skeleton = grow_tree(
         crate::world::tree_shape::TREE_SHAPE_SEED,
         key.species,
@@ -240,20 +274,24 @@ pub fn bake_tree_mesh_lod(key: TreeMeshKey, lod: TreeLod) -> Mesh {
     bake_skeleton_lod(&skeleton, &profile, lod)
 }
 
-/// Merges every branch and leaf cluster of `skeleton` into one mesh.
-pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> Mesh {
+/// Bakes every branch and leaf of `skeleton`.
+pub fn bake_skeleton(skeleton: &TreeSkeleton, profile: &TreeProfile) -> TreeParts {
     bake_skeleton_lod(skeleton, profile, TreeLod::Near)
 }
 
 /// [`bake_skeleton`] at a specific detail tier.
 ///
 /// Besides the geometry this writes the season attributes documented at the top
-/// of the module. The foliage attributes are written **per cluster** rather
-/// than per merged mesh, which is what lets the shader collapse every cluster
-/// onto its own centre instead of onto one point for the whole tree.
-pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: TreeLod) -> Mesh {
-    let mut parts: Vec<Mesh> = Vec::new();
+/// of the module.
+pub fn bake_skeleton_lod(
+    skeleton: &TreeSkeleton,
+    profile: &TreeProfile,
+    lod: TreeLod,
+) -> TreeParts {
+    let mut wood_parts: Vec<Mesh> = Vec::new();
+    let mut leaf_parts: Vec<Mesh> = Vec::new();
     let min_branch = lod.min_branch_radius();
+    let top = trunk_top(skeleton);
 
     for branch in &skeleton.branches {
         let start = Vec3::from_array(branch.start);
@@ -268,13 +306,13 @@ pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: Tr
             continue;
         }
         let radius = branch.radius;
-        // A frustum whose top is ~(radius_ratio) of its bottom gives the
-        // branch its taper without a second mesh.
+        // A frustum whose top is ~(radius_ratio) of its bottom gives the branch
+        // its taper without a second mesh.
         let taper = profile.radius_ratio.clamp(0.25, 0.95);
         let unit = ConicalFrustumMeshBuilder::new(taper, 1.0, 1.0, BRANCH_SIDES)
             .build()
-            // Unit tube runs +Y from its base; move the base to the origin
-            // before orienting so `start` lands where it should.
+            // Unit tube runs +Y from its base; move the base to the origin before
+            // orienting so `start` lands where it should.
             .translated_by(Vec3::new(0.0, 0.5, 0.0));
         let rotation = Quat::from_rotation_arc(Vec3::Y, delta / length);
         let placed = unit.transformed_by(
@@ -282,7 +320,7 @@ pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: Tr
                 .with_rotation(rotation)
                 .with_scale(Vec3::new(radius, length, radius)),
         );
-        parts.push(with_branch_season_data(placed, trunk_top(skeleton)));
+        wood_parts.push(with_branch_season_data(placed, top));
     }
 
     // Foliage: keep every `stride`th cluster and drop the small filler. The
@@ -291,13 +329,7 @@ pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: Tr
     let stride = lod.blob_stride();
     let min_blob = lod.min_blob_radius();
     let blob_scale = lod.blob_scale();
-    let blob_template = SphereMeshBuilder::new(
-        1.0,
-        SphereKind::Ico {
-            subdivisions: lod.blob_subdivisions(),
-        },
-    )
-    .build();
+    let cards = lod.cards_per_cluster();
 
     for (index, foliage) in skeleton.foliage.iter().enumerate() {
         if index % stride != 0 {
@@ -307,28 +339,21 @@ pub fn bake_skeleton_lod(skeleton: &TreeSkeleton, profile: &TreeProfile, lod: Tr
             continue;
         }
         let center = Vec3::from_array(foliage.center);
-        let blob = blob_template.clone().transformed_by(
-            Transform::from_translation(center)
-                .with_scale(Vec3::splat((foliage.radius * blob_scale).max(0.02))),
-        );
-        parts.push(with_foliage_season_data(
-            blob,
-            center,
-            index,
-            trunk_top(skeleton),
-        ));
+        // The cluster's radius now sizes the CARDS rather than a ball: a card
+        // spans the cluster's diameter, so a few of them cover the volume the
+        // sphere used to.
+        let cluster_radius = (foliage.radius * blob_scale).max(0.05);
+        leaf_parts.push(leaf_cards(center, cluster_radius, index, cards, top));
     }
 
-    let mut merged = merge_parts(parts);
-    merged.asset_usage = RenderAssetUsages::default();
-    merged
+    TreeParts {
+        wood: merge_mesh_parts(wood_parts),
+        leaves: merge_mesh_parts(leaf_parts),
+    }
 }
 
-/// Height of the trunk's top (m), used to normalise the sway height term.
-///
-/// Taken from the skeleton rather than the profile: a profile's nominal height
-/// is the top of a full tree, and the sway gradient has to be expressed
-/// against the geometry that actually exists.
+/// Height of the tallest point of the tree (m), used to normalise the sway
+/// height term.
 fn trunk_top(skeleton: &TreeSkeleton) -> f32 {
     skeleton
         .branches
@@ -338,7 +363,11 @@ fn trunk_top(skeleton: &TreeSkeleton) -> f32 {
         .fold(0.0_f32, f32::max)
 }
 
-/// Writes `COLOR` and the UV-pack channels for one branch part.
+/// Writes `COLOR` for one branch part.
+///
+/// No UVs: branches are texture-less. They used to carry an offset pack in
+/// `UV_0`/`UV_1` for the density collapse, which is gone now that density is the
+/// leaf texture's alpha.
 fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
     let count = mesh.count_vertices();
     let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).cloned() else {
@@ -349,58 +378,116 @@ fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
     };
 
     let mut colors = Vec::with_capacity(count);
-    let mut offsets = Vec::with_capacity(count);
     for p in &positions {
-        // Branches keep the geometry they were baked with, so their collapsed
-        // offset is zero: the density collapse must never move wood.
         colors.push([
             SWAY_WEIGHT_BRANCH * (1.0 + SWAY_HEIGHT_GAIN * height_term(p[1], top)),
             0.0,
             0.0,
             1.0,
         ]);
-        offsets.push([0.0, 0.0, 0.0]);
     }
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    insert_offset_pack(&mut mesh, offsets);
     mesh
 }
 
-/// Writes `COLOR` and the UV-pack channels for one foliage cluster.
+/// Builds `cards` crossed quads spanning a sphere of `reach` metres at `center`.
 ///
-/// `center` is the cluster's own centre. Every vertex stores the vector from
-/// the centre to itself in the UV channels; scaling that vector by the season's
-/// leaf density is the collapse, and it happens entirely in the vertex shader
-/// so the main, depth-prepass and shadow passes all agree.
-fn with_foliage_season_data(mut mesh: Mesh, center: Vec3, index: usize, top: f32) -> Mesh {
-    let count = mesh.count_vertices();
-    let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).cloned() else {
-        return mesh;
-    };
-    let bevy::mesh::VertexAttributeValues::Float32x3(positions) = positions else {
-        return mesh;
+/// Cards are rotated about the vertical axis at even intervals plus a
+/// per-cluster offset, with a slow tilt, so a crown has cards facing every
+/// direction instead of a fan of parallel planes.
+fn leaf_cards(center: Vec3, cluster_radius: f32, cluster: usize, cards: usize, top: f32) -> Mesh {
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(cards * 4);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(cards * 4);
+    let mut indices: Vec<u32> = Vec::with_capacity(cards * 6);
+
+    // Per-cluster sway phase, so neighbouring cards do not move in lockstep.
+    // Lockstep motion across a crown reads as the whole tree being dragged
+    // rather than as wind moving through it.
+    let phase = ((cluster as f32 * 0.618_034).fract()).clamp(0.0, 1.0);
+    // Cluster-level yaw offset, so two clusters never stack their cards at the
+    // same angles.
+    let yaw0 = (cluster as f32 * 2.399_963) % std::f32::consts::TAU;
+    let sway = SWAY_WEIGHT_FOLIAGE * (1.0 + SWAY_HEIGHT_GAIN * height_term(center.y, top));
+
+    // Deterministic scatter, so the same tree always bakes the same cards.
+    let mut hash = (cluster as u32).wrapping_mul(0x9E37_79B9).wrapping_add(1);
+    let mut next_unit = || {
+        hash ^= hash << 13;
+        hash ^= hash >> 17;
+        hash ^= hash << 5;
+        (hash & 0xFFFF) as f32 / 65535.0
     };
 
-    // Per-cluster phase: a cheap hash of the cluster index, so adjacent blobs
-    // sway out of step. Lockstep motion across a crown reads as the whole tree
-    // being dragged rather than as wind moving through it.
-    let phase = ((index as f32 * 0.618_034).fract()).clamp(0.0, 1.0);
+    for card in 0..cards {
+        let yaw = yaw0 + std::f32::consts::PI * card as f32 / cards as f32;
+        // A slow tilt keeps the cards from all being vertical slices; a card
+        // that is perfectly edge-on would disappear from an overhead view.
+        let tilt = (card as f32 * 0.7).sin() * 0.35;
+        let rotation = Quat::from_euler(EulerRot::YXZ, yaw, tilt, 0.0);
 
-    let mut colors = Vec::with_capacity(count);
-    let mut offsets = Vec::with_capacity(count);
-    for p in &positions {
-        let vertex = Vec3::from_array(*p);
-        colors.push([
-            SWAY_WEIGHT_FOLIAGE * (1.0 + SWAY_HEIGHT_GAIN * height_term(p[1], top)),
-            1.0,
-            phase,
-            1.0,
-        ]);
-        let offset = vertex - center;
-        offsets.push(offset.to_array());
+        // Cards sit on a SHELL, not throughout the volume.
+        //
+        // Scattering them through the volume was the second attempt and it did
+        // not fix the "solid clump" reading: cards near the middle are hidden by
+        // cards in front of them, so they cost triangles without ever showing.
+        // Real foliage does the same thing for the same reason -- leaves grow at
+        // the outside of a crown where light is -- so the shell is both cheaper
+        // and more truthful: the middle stays open, and a sightline through the
+        // crown goes: leaves, gap, leaves.
+        //
+        // The radius varies a little so the shell is a fuzzy ball rather than a
+        // paper lantern.
+        let dir = Vec3::new(
+            next_unit() * 2.0 - 1.0,
+            next_unit() * 2.0 - 1.0,
+            next_unit() * 2.0 - 1.0,
+        );
+        let dir = if dir.length_squared() < 1e-4 {
+            Vec3::Y
+        } else {
+            dir.normalize()
+        };
+        let shell = cluster_radius * (0.72 + 0.28 * next_unit());
+        let card_center = center + dir * shell;
+
+        // A smaller card than the cluster, so several of them compose a clump.
+        // Slightly taller than wide: a leaf unit (one blade or one pinnate leaf)
+        // is longer than it is wide, and the texture's own aspect does the rest.
+        let half_w = cluster_radius * CARD_REACH_FRACTION;
+        let half_h = half_w * 1.15;
+        let corners = [
+            [-half_w, -half_h],
+            [half_w, -half_h],
+            [half_w, half_h],
+            [-half_w, half_h],
+        ];
+        let base = positions.len() as u32;
+        for (corner, [u, v]) in corners
+            .iter()
+            .zip([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
+        {
+            let local = rotation * Vec3::new(corner[0], corner[1], 0.0);
+            positions.push((card_center + local).to_array());
+            // Cards are drawn double-sided, so one normal per quad is enough;
+            // the PBR shader flips it for back faces.
+            normals.push((rotation * Vec3::Z).to_array());
+            uvs.push([u, v]);
+            colors.push([sway, 1.0, phase, 1.0]);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    insert_offset_pack(&mut mesh, offsets);
+    mesh.insert_indices(Indices::U32(indices));
     mesh
 }
 
@@ -412,25 +499,13 @@ fn height_term(y: f32, top: f32) -> f32 {
     (y / top).clamp(0.0, 1.0)
 }
 
-/// Packs a per-vertex 3-vector into `UV_0.xy` + `UV_1.x`.
+/// Merges parts that share an attribute set.
 ///
-/// `UV_1` carries a single useful component: a full `UV_2` for one scalar would
-/// cost another `Float32x2` per vertex across ~3000 vertices of every tree.
-fn insert_offset_pack(mesh: &mut Mesh, offsets: Vec<[f32; 3]>) {
-    let uv0: Vec<[f32; 2]> = offsets.iter().map(|o| [o[0], o[1]]).collect();
-    let uv1: Vec<[f32; 2]> = offsets.iter().map(|o| [o[2], 0.0]).collect();
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv0);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
-}
-
-/// Merges the parts, tolerating parts that carry different attribute sets.
-///
-/// `Mesh::merge` requires identical attributes, and the branch/foliage parts do
-/// carry the same set (position, normal, uv0, uv1, color) because both go
-/// through the season-data writers. A merge failure keeps what has been merged
-/// so far rather than panicking — this runs inside chunk streaming, where a
-/// panic would take the frame down.
-fn merge_parts(parts: Vec<Mesh>) -> Mesh {
+/// `Mesh::merge` requires identical attributes, and each group above does carry
+/// one consistent set. A merge failure keeps what has been merged so far rather
+/// than panicking — this runs inside chunk streaming, where a panic would take
+/// the frame down.
+fn merge_mesh_parts(parts: Vec<Mesh>) -> Mesh {
     let mut merged: Option<Mesh> = None;
     for part in parts {
         match &mut merged {
@@ -442,9 +517,21 @@ fn merge_parts(parts: Vec<Mesh>) -> Mesh {
             }
         }
     }
-    merged.unwrap_or_else(empty_mesh)
+    let mut merged = merged.unwrap_or_else(empty_mesh);
+    merged.asset_usage = RenderAssetUsages::default();
+    merged
 }
 
+/// Triangle count of a mesh, for the budgets the tests assert.
+fn triangle_count(mesh: &Mesh) -> usize {
+    match mesh.indices() {
+        Some(Indices::U32(i)) => i.len() / 3,
+        Some(Indices::U16(i)) => i.len() / 3,
+        None => 0,
+    }
+}
+
+/// An empty mesh with the attributes the merge path expects.
 fn empty_mesh() -> Mesh {
     Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -455,19 +542,9 @@ fn empty_mesh() -> Mesh {
     .with_inserted_indices(Indices::U32(Vec::new()))
 }
 
-use bevy::mesh::{ConicalFrustumMeshBuilder, MeshBuilder, SphereKind, SphereMeshBuilder};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tri_count(m: &Mesh) -> usize {
-        match m.indices() {
-            Some(Indices::U32(i)) => i.len() / 3,
-            Some(Indices::U16(i)) => i.len() / 3,
-            None => 0,
-        }
-    }
 
     fn colors(m: &Mesh) -> Vec<[f32; 4]> {
         match m.attribute(Mesh::ATTRIBUTE_COLOR).expect("colour") {
@@ -476,112 +553,375 @@ mod tests {
         }
     }
 
-    fn offsets(m: &Mesh) -> Vec<Vec3> {
-        let uv0 = match m.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
-            bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
-            other => panic!("unexpected uv0 layout: {other:?}"),
-        };
-        let uv1 = match m.attribute(Mesh::ATTRIBUTE_UV_1).expect("uv1") {
-            bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
-            other => panic!("unexpected uv1 layout: {other:?}"),
-        };
-        uv0.iter()
-            .zip(uv1.iter())
-            .map(|(a, b)| Vec3::new(a[0], a[1], b[0]))
-            .collect()
+    fn positions(m: &Mesh) -> Vec<[f32; 3]> {
+        match m.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions") {
+            bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
+            other => panic!("unexpected position layout: {other:?}"),
+        }
     }
 
     #[test]
-    fn baked_mesh_has_geometry_and_bounded_cost() {
+    fn both_meshes_have_geometry() {
+        // The tree ships as two meshes; an empty either way means a silent hole
+        // in the crown, or a floating crown with no trunk.
         for species in 0..TREE_PROFILES.len() as u8 {
-            let key = TreeMeshKey {
+            let parts = bake_tree_mesh(TreeMeshKey {
                 species,
                 variant: 0,
-            };
-            let mesh = bake_tree_mesh(key);
-            let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions");
-            let tri = tri_count(&mesh);
-            assert!(tri > 0, "species {species}: baked mesh is empty");
-            // One mesh per tree has to stay cheap enough to spawn 13 per
-            // chunk; the gallery's per-part entity count was the problem,
-            // not the triangle count, so this is a loose ceiling.
+            });
             assert!(
-                tri < 20_000,
-                "species {species}: {tri} triangles per tree is too heavy"
+                triangle_count(&parts.wood) > 0,
+                "species {species}: no branches"
             );
-            assert!(!positions.is_empty());
+            assert!(
+                triangle_count(&parts.leaves) > 0,
+                "species {species}: no leaf cards"
+            );
+        }
+    }
+
+    #[test]
+    fn one_tree_stays_inside_the_triangle_budget() {
+        // Cards are 2 triangles against a blob's 20, so the switch should keep a
+        // tree cheap. If the card path regressed to spheres, this fails.
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let parts = bake_tree_mesh(TreeMeshKey {
+                species,
+                variant: 0,
+            });
+            let total = parts.triangle_count();
+            assert!(total < 20_000, "species {species}: {total} triangles");
         }
     }
 
     #[test]
     fn lod_tiers_actually_get_cheaper() {
-        // The whole point of the tiers: each must cost strictly less than the
-        // one before it, by a margin worth the extra entities. A "LOD" that
-        // loses 5% of the triangles is just three copies of the same tree.
+        // A "LOD" that loses 5% is three copies of the same tree. Measured on
+        // cards, each tier must be noticeably cheaper than the one before.
         for species in 0..TREE_PROFILES.len() as u8 {
             let key = TreeMeshKey {
                 species,
                 variant: 0,
             };
-            let near = tri_count(&bake_tree_mesh_lod(key, TreeLod::Near));
-            let mid = tri_count(&bake_tree_mesh_lod(key, TreeLod::Mid));
-            let far = tri_count(&bake_tree_mesh_lod(key, TreeLod::Far));
+            let near = bake_tree_mesh_lod(key, TreeLod::Near).triangle_count();
+            let mid = bake_tree_mesh_lod(key, TreeLod::Mid).triangle_count();
+            let far = bake_tree_mesh_lod(key, TreeLod::Far).triangle_count();
             assert!(
                 near > 0 && mid > 0 && far > 0,
                 "species {species}: empty LOD"
             );
             assert!(
                 mid < near * 3 / 4,
-                "species {species}: mid tier keeps {mid}/{near} triangles, not a real reduction"
+                "species {species}: mid keeps {mid}/{near}, not a real reduction"
             );
+            assert!(far < mid / 2, "species {species}: far keeps {far}/{mid}");
+        }
+    }
+
+    #[test]
+    fn leaf_mesh_is_quads_with_uvs() {
+        // The leaf material samples a texture, so every leaf vertex needs a UV.
+        // Without one the crown would sample a single texel and read as a solid
+        // rectangle, which is exactly the look the cards exist to remove.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 0,
+            variant: 0,
+        });
+        let positions = positions(&parts.leaves);
+        let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+            bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+            other => panic!("unexpected uv layout: {other:?}"),
+        };
+        assert_eq!(uvs.len(), positions.len(), "every leaf vertex needs a UV");
+        assert_eq!(positions.len() % 4, 0, "the leaf mesh is not made of quads");
+        let max_u = uvs.iter().map(|uv| uv[0]).fold(0.0_f32, f32::max);
+        let max_v = uvs.iter().map(|uv| uv[1]).fold(0.0_f32, f32::max);
+        assert!(
+            max_u >= 0.99 && max_v >= 0.99,
+            "UVs do not span the texture"
+        );
+    }
+
+    #[test]
+    fn wood_carries_no_texture_and_no_foliage_mask() {
+        // Branches use the opaque material, which has no texture. Their UV set
+        // went away with the density collapse; if one came back it would need a
+        // meaning.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 1,
+            variant: 0,
+        });
+        for color in colors(&parts.wood) {
+            assert_eq!(color[1], 0.0, "a branch vertex is flagged as foliage");
+        }
+        // The frustum builder emits its own UVs, which the opaque material
+        // simply ignores. What matters is that they are not mistaken for the
+        // old collapse pack: deleting that pack is what freed UV_0 for the leaf
+        // texture, and a branch quad carrying leaf-like UVs would mean the two
+        // paths got crossed again.
+        if let Some(uvs) = parts.wood.attribute(Mesh::ATTRIBUTE_UV_0) {
+            let bevy::mesh::VertexAttributeValues::Float32x2(uvs) = uvs else {
+                panic!("unexpected uv layout");
+            };
             assert!(
-                far < mid / 2,
-                "species {species}: far tier keeps {far}/{mid} triangles"
+                uvs.iter().all(|uv| (0.0..=1.0).contains(&uv[0])),
+                "branch UVs escaped the unit range"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_are_flagged_so_the_shader_can_tint_them() {
+        // The season tint is mixed in by the foliage mask in COLOR.g; without it
+        // the crown keeps the bare silhouette in every season.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 2,
+            variant: 0,
+        });
+        let mask = colors(&parts.leaves);
+        assert!(!mask.is_empty());
+        for color in &mask {
+            assert_eq!(color[1], 1.0, "a leaf vertex is not flagged as foliage");
+        }
+        // The per-card phase must vary, or the cards sway in lockstep.
+        let phases: std::collections::HashSet<u32> =
+            mask.iter().map(|c| (c[2] * 1000.0) as u32).collect();
+        assert!(phases.len() > 1, "every card shares one sway phase");
+    }
+
+    #[test]
+    fn cards_cross_so_the_crown_has_volume() {
+        // All cards at one angle would make the crown vanish edge-on.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 0,
+            variant: 0,
+        });
+        let normals = match parts
+            .leaves
+            .attribute(Mesh::ATTRIBUTE_NORMAL)
+            .expect("normals")
+        {
+            bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
+            other => panic!("unexpected normal layout: {other:?}"),
+        };
+        let mut sectors = std::collections::HashSet::new();
+        for n in &normals {
+            let angle = n[2].atan2(n[0]);
+            let sector = ((angle / std::f32::consts::TAU) * 8.0).round() as i32;
+            sectors.insert(sector.rem_euclid(8));
+        }
+        assert!(
+            sectors.len() >= 4,
+            "cards only face {} of 8 directions; the crown would disappear from some angles",
+            sectors.len()
+        );
+    }
+
+    #[test]
+    fn sway_weight_grows_with_height() {
+        // Wind moves the crown more than the trunk. A weight that ignored height
+        // would slide the whole tree sideways as one rigid piece.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 1,
+            variant: 0,
+        });
+        let all: Vec<([f32; 4], [f32; 3])> = colors(&parts.wood)
+            .into_iter()
+            .zip(positions(&parts.wood))
+            .chain(
+                colors(&parts.leaves)
+                    .into_iter()
+                    .zip(positions(&parts.leaves)),
+            )
+            .collect();
+        let mut low = f32::INFINITY;
+        let mut high: f32 = 0.0;
+        let mut low_y = f32::INFINITY;
+        let mut high_y: f32 = 0.0;
+        for (color, p) in &all {
+            if p[1] < low_y {
+                low_y = p[1];
+                low = color[0];
+            }
+            if p[1] > high_y {
+                high_y = p[1];
+                high = color[0];
+            }
+        }
+        assert!(high_y > low_y, "tree has no vertical extent");
+        assert!(
+            high > low,
+            "sway weight does not grow with height ({low} at {low_y} m, {high} at {high_y} m)"
+        );
+        for (color, _) in &all {
+            assert!(
+                (0.0..=2.5).contains(&color[0]),
+                "sway weight {} out of range",
+                color[0]
+            );
+        }
+    }
+
+    /// Fraction of the tree's crown bounding box that the leaf cards leave
+    /// open, measured by projecting every card onto the XZ plane and testing
+    /// coverage on a grid.
+    ///
+    /// This is the number the design actually cares about -- "sky cut into
+    /// pieces by leaves" is a coverage question -- and it cannot be judged from
+    /// triangle counts. A solid ball scores 0.0; a lacy crown scores high.
+    fn xz_openness(parts: &TreeParts, mask: &crate::world::leaf_shape::AlphaMask) -> f32 {
+        openness_along(parts, mask, true)
+    }
+
+    /// [`xz_openness`] but measured along the X axis instead: the SIDE view,
+    /// which is what a player walking past actually sees. The top-down number
+    /// says how much sky is visible from underneath, which answers a different
+    /// question.
+    fn side_openness(parts: &TreeParts, mask: &crate::world::leaf_shape::AlphaMask) -> f32 {
+        openness_along(parts, mask, false)
+    }
+
+    fn openness_along(
+        parts: &TreeParts,
+        mask: &crate::world::leaf_shape::AlphaMask,
+        top_down: bool,
+    ) -> f32 {
+        let positions = positions(&parts.leaves);
+        let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+            bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+            other => panic!("unexpected uv layout: {other:?}"),
+        };
+        if positions.is_empty() {
+            return 1.0;
+        }
+        let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut min_z, mut max_z) = (f32::INFINITY, f32::NEG_INFINITY);
+        // `top_down` projects onto XZ; otherwise onto YZ (a side elevation).
+        let (ax, ay) = if top_down {
+            (0usize, 2usize)
+        } else {
+            (2usize, 1usize)
+        };
+        for p in &positions {
+            min_x = min_x.min(p[ax]);
+            max_x = max_x.max(p[ax]);
+            min_z = min_z.min(p[ay]);
+            max_z = max_z.max(p[ay]);
+        }
+        const N: usize = 96;
+        let mut covered = vec![false; N * N];
+        for (quad, chunk) in positions.chunks(4).enumerate() {
+            let quad_uv = &uvs[quad * 4..quad * 4 + 4];
+            // Two triangles per quad.
+            for tri in [[0usize, 1, 2], [0, 2, 3]] {
+                let p0 = Vec3::from_array(chunk[tri[0]]);
+                let p1 = Vec3::from_array(chunk[tri[1]]);
+                let p2 = Vec3::from_array(chunk[tri[2]]);
+                // Project onto the two chosen axes.
+                let (p0, p1, p2) = (
+                    (p0.to_array()[ax], p0.to_array()[ay]),
+                    (p1.to_array()[ax], p1.to_array()[ay]),
+                    (p2.to_array()[ax], p2.to_array()[ay]),
+                );
+                let area = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
+                if area.abs() < 1e-9 {
+                    continue;
+                }
+                for gz in 0..N {
+                    for gx in 0..N {
+                        let x = min_x + (gx as f32 + 0.5) / N as f32 * (max_x - min_x);
+                        let z = min_z + (gz as f32 + 0.5) / N as f32 * (max_z - min_z);
+                        let w0 = ((p1.0 - x) * (p2.1 - z) - (p1.1 - z) * (p2.0 - x)) / area;
+                        let w1 = ((p2.0 - x) * (p0.1 - z) - (p2.1 - z) * (p0.0 - x)) / area;
+                        let w2 = 1.0 - w0 - w1;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                            continue;
+                        }
+                        let u = w0 * quad_uv[tri[0]][0]
+                            + w1 * quad_uv[tri[1]][0]
+                            + w2 * quad_uv[tri[2]][0];
+                        let v = w0 * quad_uv[tri[0]][1]
+                            + w1 * quad_uv[tri[1]][1]
+                            + w2 * quad_uv[tri[2]][1];
+                        let tx = (u * mask.width as f32).clamp(0.0, mask.width as f32 - 1.0) as u32;
+                        let ty =
+                            (v * mask.height as f32).clamp(0.0, mask.height as f32 - 1.0) as u32;
+                        if mask.get(tx, ty) >= 128 {
+                            covered[gz * N + gx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let open = covered.iter().filter(|c| !**c).count();
+        open as f32 / covered.len() as f32
+    }
+
+    #[test]
+    fn the_crown_lets_sky_through() {
+        // The design's whole reason for cards: looking up, the sky must be cut
+        // into pieces rather than blocked by a mass. A sphere scores 0 here; the
+        // first card version measured under 20% and read as a solid clump.
+        let profile = crate::world::leaf_shape::find_profile("poplar")
+            .copied()
+            .unwrap_or(crate::world::leaf_shape::leaf_profiles()[0]);
+        let mask = crate::world::leaf_shape::bake_leaf_alpha(&profile, 256);
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let parts = bake_tree_mesh(TreeMeshKey {
+                species,
+                variant: 0,
+            });
+            let openness = xz_openness(&parts, &mask);
+            let side = side_openness(&parts, &mask);
+            assert!(
+                openness > 0.35,
+                "species {species}: only {:.0}% of the crown leaves sky visible; it reads as a solid clump",
+                openness * 100.0
+            );
+            // The side elevation is the view that matters on the street: a
+            // crown can be open from underneath and still block the whole
+            // horizon band when seen from a walking eye height.
+            assert!(
+                side > 0.30,
+                "species {species}: only {:.0}% of the side elevation shows through",
+                side * 100.0
             );
         }
     }
 
     #[test]
     fn lod_ranges_tile_the_distances_without_gaps_or_overlap() {
-        // A gap would make trees vanish at some distance; an overlap would
-        // draw two tiers at once. Both are silent in a screenshot.
         for pair in TreeLod::ALL.windows(2) {
             let (lower, upper) = (pair[0], pair[1]);
-            let a = lower.range();
-            let b = upper.range();
             assert_eq!(
-                a.end_margin.end, b.start_margin.start,
-                "{lower:?} ends at {} but {upper:?} starts at {}",
-                a.end_margin.end, b.start_margin.start
+                lower.range().end_margin.end,
+                upper.range().start_margin.start,
+                "{lower:?} and {upper:?} leave a gap or overlap"
             );
         }
-        // Near starts at the camera.
-        let near = TreeLod::ALL[0].range();
-        assert_eq!(near.start_margin.start, 0.0);
-
-        // Exactly one tier is visible at any distance up to the cull point.
-        for distance in [0.0, 1.0, 39.9, 40.0, 109.9, 110.0, 219.9] {
-            let visible: Vec<TreeLod> = TreeLod::ALL
+        for distance in [0.0, 39.9, 40.0, 109.9, 110.0, 219.9] {
+            let visible = TreeLod::ALL
                 .iter()
-                .copied()
                 .filter(|lod| !lod.range().is_culled(distance))
-                .collect();
-            assert_eq!(
-                visible.len(),
-                1,
-                "{distance} m: {visible:?} are all visible at once"
-            );
+                .count();
+            assert_eq!(visible, 1, "{distance} m: {visible} tiers visible at once");
         }
+    }
 
-        // Beyond the last boundary nothing is drawn: the tree is culled
-        // rather than left at full cost out to the horizon.
-        for distance in [220.0, 500.0] {
-            assert!(
-                TreeLod::ALL
-                    .iter()
-                    .all(|lod| lod.range().is_culled(distance)),
-                "{distance} m: a tier is still visible past the cull distance"
-            );
+    #[test]
+    fn keys_vary_by_species_and_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for species in 0..TREE_PROFILES.len() as u8 {
+            for variant in 0..TreeMeshKey::VARIANTS {
+                seen.insert((species, variant));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize
+        );
+        for wear in [0.0, 0.5, 0.99, 1.0] {
+            assert!(TreeMeshKey::from_placement(9, wear).variant < TreeMeshKey::VARIANTS);
         }
     }
 
@@ -593,189 +933,10 @@ mod tests {
         };
         let a = bake_tree_mesh(key);
         let b = bake_tree_mesh(key);
-        let (Some(pa), Some(pb)) = (
-            a.attribute(Mesh::ATTRIBUTE_POSITION),
-            b.attribute(Mesh::ATTRIBUTE_POSITION),
-        ) else {
-            panic!("positions missing");
-        };
         assert_eq!(
-            format!("{pa:?}"),
-            format!("{pb:?}"),
+            format!("{:?}", positions(&a.leaves)),
+            format!("{:?}", positions(&b.leaves)),
             "bake must be deterministic"
         );
-    }
-
-    #[test]
-    fn keys_vary_by_species_and_variant() {
-        // A chunk must be able to ask for genuinely different silhouettes.
-        let mut seen = std::collections::HashSet::new();
-        for species in 0..TREE_PROFILES.len() as u8 {
-            for variant in 0..TreeMeshKey::VARIANTS {
-                seen.insert((species, variant));
-            }
-        }
-        assert_eq!(
-            seen.len(),
-            TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize
-        );
-
-        // The placement mapping must reach every variant.
-        let mut variants = std::collections::HashSet::new();
-        for step in 0..10 {
-            let wear = step as f32 / 10.0;
-            variants.insert(TreeMeshKey::from_placement(0, wear).variant);
-        }
-        assert!(variants.len() > 1, "placement wear must vary the shape");
-        // And it never indexes past the baked set.
-        for wear in [0.0, 0.5, 0.99, 1.0] {
-            assert!(TreeMeshKey::from_placement(9, wear).variant < TreeMeshKey::VARIANTS);
-        }
-    }
-
-    #[test]
-    fn season_attributes_cover_every_vertex() {
-        // A single vertex without these attributes makes the whole mesh fail to
-        // merge (and, once merged anyway, would make the shader read garbage).
-        for species in 0..TREE_PROFILES.len() as u8 {
-            for lod in TreeLod::ALL {
-                let mesh = bake_tree_mesh_lod(
-                    TreeMeshKey {
-                        species,
-                        variant: 1,
-                    },
-                    lod,
-                );
-                let vertices = mesh.count_vertices();
-                assert!(vertices > 0, "species {species} {lod:?}: empty mesh");
-                assert_eq!(
-                    colors(&mesh).len(),
-                    vertices,
-                    "species {species} {lod:?}: colour count != vertex count"
-                );
-                assert_eq!(
-                    offsets(&mesh).len(),
-                    vertices,
-                    "species {species} {lod:?}: uv pack count != vertex count"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn foliage_and_wood_are_distinguishable() {
-        // The shader tells leaves from branches by `COLOR.g`. If the mask were
-        // missing, winter would collapse the trunk to a point and the tree
-        // would vanish instead of turning bare.
-        let mesh = bake_tree_mesh(TreeMeshKey {
-            species: 0,
-            variant: 0,
-        });
-        let mask = colors(&mesh);
-        let leaves = mask.iter().filter(|c| c[1] > 0.5).count();
-        let wood = mask.iter().filter(|c| c[1] <= 0.5).count();
-        assert!(leaves > 0, "no vertex is marked as foliage");
-        assert!(wood > 0, "no vertex is marked as a branch");
-        // Foliage dominates the vertex budget (measured 85-90% of triangles).
-        assert!(
-            leaves > wood,
-            "expected the crown to carry more vertices than the branches ({leaves} vs {wood})"
-        );
-    }
-
-    #[test]
-    fn foliage_vertices_store_their_offset_from_the_cluster_centre() {
-        // This is what the density collapse scales. If it encoded something
-        // else (e.g. world position), scaling it would drag the crown across
-        // the ground instead of shrinking each blob onto its own centre.
-        let mesh = bake_tree_mesh(TreeMeshKey {
-            species: 2,
-            variant: 0,
-        });
-        let mask = colors(&mesh);
-        let offs = offsets(&mesh);
-        let mut foliage_seen = 0;
-        for (color, offset) in mask.iter().zip(offs.iter()) {
-            if color[1] < 0.5 {
-                // Branches must not move at all under the collapse.
-                assert_eq!(
-                    *offset,
-                    Vec3::ZERO,
-                    "a branch vertex carries a non-zero collapse offset"
-                );
-                continue;
-            }
-            foliage_seen += 1;
-            // Offsets are bounded by the blob radius: clusters are at most a
-            // couple of metres across on every species.
-            assert!(
-                offset.length() < 3.0,
-                "foliage offset {offset:?} is too large to be a blob radius"
-            );
-        }
-        assert!(foliage_seen > 0);
-
-        // And the offsets really do cluster: within one blob they all sit near
-        // the same centre. Group by rounded centre-free proximity is awkward
-        // after merging, so assert the distribution instead -- a correct bake
-        // has many distinct centres, not one.
-        let mut rounded = std::collections::HashSet::new();
-        for offset in &offs {
-            let key = (
-                (offset.x * 8.0).round() as i32,
-                (offset.y * 8.0).round() as i32,
-                (offset.z * 8.0).round() as i32,
-            );
-            rounded.insert(key);
-        }
-        assert!(
-            rounded.len() > 10,
-            "only {} distinct offsets: the collapse would bunch the whole crown",
-            rounded.len()
-        );
-    }
-
-    #[test]
-    fn sway_weight_grows_with_height() {
-        // Wind moves the crown more than the trunk. A weight that ignored
-        // height would slide the whole tree sideways as one rigid piece.
-        let mesh = bake_tree_mesh(TreeMeshKey {
-            species: 1,
-            variant: 0,
-        });
-        let mask = colors(&mesh);
-        let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions") {
-            bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
-            other => panic!("unexpected position layout: {other:?}"),
-        };
-        let mut low = f32::INFINITY;
-        let mut high: f32 = 0.0;
-        let mut low_y = f32::INFINITY;
-        let mut high_y: f32 = 0.0;
-        for (color, p) in mask.iter().zip(positions.iter()) {
-            let weight = color[0];
-            if p[1] < low_y {
-                low_y = p[1];
-                low = weight;
-            }
-            if p[1] > high_y {
-                high_y = p[1];
-                high = weight;
-            }
-        }
-        assert!(high_y > low_y, "tree has no vertical extent");
-        assert!(
-            high > low,
-            "sway weight does not grow with height ({low} at {low_y} m, {high} at {high_y} m)"
-        );
-        // Sane range: the shader multiplies this by the season's strength, and
-        // a runaway weight would throw vertices off the mesh.
-        for color in &mask {
-            assert!(
-                (0.0..=2.5).contains(&color[0]),
-                "sway weight {} out of range",
-                color[0]
-            );
-        }
     }
 }

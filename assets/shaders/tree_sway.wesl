@@ -62,29 +62,6 @@ struct SeasonParams {
 
 @group(3) @binding(100) var<uniform> season: SeasonParams;
 
-// Collapses a foliage vertex toward its own cluster centre as the leaf density
-// falls: at 1 the baked position, at 0 the whole cluster becomes a point and
-// only the branch skeleton is left.
-//
-// This replaces the original project's `ALPHA = texel.a * leaf_density`. The
-// Bevy trees are opaque, and Bevy's prepass decides alpha discard from the
-// MATERIAL colour rather than from a vertex, so an alpha-based winter would
-// erase foliage in the colour pass while leaving it solid in the depth buffer --
-// fog and volumetric clouds would be cut out around leaves nobody can see.
-//
-// Wood (`foliage_mask` 0) never collapses: winter must leave a tree standing,
-// not delete it.
-fn collapsed_local_position(
-    local_position: vec3<f32>,
-    offset_from_centre: vec3<f32>,
-    vertex_color: vec4<f32>,
-) -> vec3<f32> {
-    if vertex_color.g <= 0.5 {
-        return local_position;
-    }
-    return local_position + offset_from_centre * (season.tint_density.a - 1.0);
-}
-
 // Peak sway displacement (m) for one vertex.
 //
 // `weight` is the vertex-colour R channel (ADR-0004's art interface): foliage
@@ -114,17 +91,21 @@ fn sway_offset(world_position: vec3<f32>, weight: f32, phase: f32) -> vec3<f32> 
 // The one displacement function both stages call: local position in, world
 // position out.
 //
-// Sway is added in WORLD space and driven by the world position, so nearby
-// clusters move coherently; driving it from the local position would make every
-// blob oscillate about its own origin instead of with the tree.
+// Sway is added in WORLD space and driven by the world position, so neighbouring
+// cards move coherently; driving it from the local position would make every
+// card oscillate about its own origin instead of with the tree.
+//
+// The geometry itself is NOT displaced any more. Leaf density used to collapse
+// each cluster toward its centre, which was how an opaque crown lost its leaves
+// in winter. The cards now carry a leaf texture, so density is the material's
+// base-colour alpha times the texture alpha, and the alpha test does the work --
+// with correct depth, because Bevy's prepass honours texture alpha.
 fn season_world_position(
     world_from_local: mat4x4<f32>,
     local_position: vec3<f32>,
-    offset_from_centre: vec3<f32>,
     vertex_color: vec4<f32>,
 ) -> vec3<f32> {
-    let collapsed = collapsed_local_position(local_position, offset_from_centre, vertex_color);
-    let world = (world_from_local * vec4<f32>(collapsed, 1.0)).xyz;
+    let world = (world_from_local * vec4<f32>(local_position, 1.0)).xyz;
     return world + sway_offset(world, vertex_color.r, vertex_color.b);
 }
 
@@ -143,27 +124,17 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
 @else
     let v = vertex_no_morph;
 
-    // Seasonal displacement needs three per-vertex inputs the bake wrote: the
-    // colour channels (sway weight / foliage mask / cluster phase) and the
-    // vector to the cluster centre, packed into the two UV sets.
+    // The bake writes the sway weight, foliage mask and per-card phase into
+    // COLOR. UVs now belong to the leaf texture and mean nothing to the sway,
+    // so this stage reads none of them.
     //
-    // Every read stays behind its shader def: the struct field genuinely does
-    // not exist when the layout lacks the attribute.
+    // The read stays behind its shader def: the field genuinely does not exist
+    // when the layout lacks the attribute.
     var color = vec4<f32>(1.0, 0.0, 0.0, 1.0);
-    var offset_from_centre = vec3<f32>(0.0);
 @if(VERTEX_COLORS)
     color = v.color;
-@if(VERTEX_UVS_A)
-    offset_from_centre = vec3<f32>(v.uv.x, v.uv.y, 0.0);
-@if(VERTEX_UVS_B)
-    offset_from_centre = vec3<f32>(offset_from_centre.x, offset_from_centre.y, v.uv_b.x);
 
-    let world_position = season_world_position(
-        world_from_local,
-        v.position,
-        offset_from_centre,
-        color,
-    );
+    let world_position = season_world_position(world_from_local, v.position, color);
 
     out.world_position = vec4<f32>(world_position, 1.0);
 @if(PREPASS_PIPELINE)

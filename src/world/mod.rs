@@ -15,6 +15,7 @@ pub mod debug_viz;
 pub mod explored;
 pub mod geometry;
 pub mod layout_graph;
+pub mod leaf_shape;
 pub mod path_network;
 pub mod placement;
 pub mod season;
