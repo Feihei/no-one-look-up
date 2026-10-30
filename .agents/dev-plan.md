@@ -112,7 +112,7 @@
 > **碰撞修复**：合并块内缩后的周长会出现轻微凹陷（实测顶点 3/5/7 的叉积为负），`push_out` 依赖凸性，导致 770 次高速穿墙尝试中有 13 次进入块内。改为对 `convex_hull(polygon)` 做碰撞后降为 0 次；代价是碰撞体比可见轮廓大出凹陷深度（±4m 扰动下可忽略）。已加回归测试。
 - [x] 3.1 放置偏差（2026-10-22）：**完整放置**——原版 ADR footprint（公寓 25-40×12-14m / 厂房 50×50m）只有块深 ≥ `w/2 + setback + depth` 时成立，本项目剖分可给「厂房」单 cell（内缩后仅 ~39m），参数表尺寸放不下。改为：逐边采样整排建筑可用深度（`block_depth_along_pub`，从外部入射的射线扫描，非凸多边形安全），先试参数表尺寸，放不下降级为 4-6m 模块节奏，整排放不下再丢弃。`LayoutEdge` 补 `left_block/right_block`（2.13 遗留）；`street_segments` 改为**每 unit edge 一条 segment**（原合并成 1900m 长边会让放置只有 1 个锚点，整条街正面永远放不出）。三重剔除保留（走廊 / block 凸多边形 + 凸包 / 地图边界）；树资产仅 3 种，按可用集合抽样
 - [x] 3.2 树木放置偏差：3 种 glTF 懒加载（`WorldAssetRoot` + `GltfAssetLabel::Scene(0)`），行道树概率 20/60/80%、FOREST 8m 密、PLAZA 稀疏（上限 2 棵）；树不带碰撞；资产未就绪时该 chunk 无树（`trees_ready` 标记，重 plan）
-- [ ] 3.5 `season.rs` + 树 `MaterialExtension` WESL：共享 storage buffer 承载 leaf_density/leaf_color/sway_strength；保留顶点色 R 通道摆动接口（sway_speed/sway_strength/sway_phase_len）——**顺延至 R4 之后（2026-10-24 用户决策）**：当前剪影+天空观感下季节仅有叶子有无差异，投入产出低
+- [x] 3.5 `season.rs` + 树 `MaterialExtension` WESL：共享 uniform 承载 leaf_density/leaf_tint/sway_strength；保留顶点色 R 通道摆动接口（2026-10-29 完成，见下方 R3.5 小节）
 - [ ] 3.6 建筑做旧材质：BoxMesh 占位 + `StandardMaterial` 扩展（脏污/褪色/风化）——**当前下一步**
 - [ ] 3.9 **程序化树形态原型（步骤 1–2）**：现状是半透明 alpha 卡片，剪影偏“纸片”。新建 `world/tree_shape.rs`（纯数据 L-system/BFS 生长模型，`StdRng` 确定性）产出「枝条骨架 + 叶簇球」；`plugins/tree_preview.rs` 用 Gizmos 在出生点前方摆 3 物种 × 4 变体画廊，F7 开关；`examples/tree_gallery.rs` headless 渲染对照图（自写 PPM→PNG，无新增依赖），`examples/tree_stats.rs` 输出高度/宽度/枝数/代理三角数。
   - [x] 步骤 1：骨架生成器 + 确定性/预算单元测试（4 个测试：同 seed 复现、跨 id/物种不同、预算区间、逐级变细）
@@ -172,8 +172,35 @@
     - 新增 `f7_toggle_actually_builds_the_gallery_in_front_of_the_player`：**驱动 `sync_tree_preview` 本身**，断言能建成、距玩家 <80 m、在朝向前方、立于地面、变体横向排开。已验证**把任一 bug 放回去该测试即失败**（Bug A 报“built no gallery”，Bug B 报“588 m from the player”）
   - **验证缺口（重要）**：`tests/tree_preview_screenshot.rs` 的 `frame` 在本机 headless 精简插件栈下恒为清屏色，即使换成 HDR 目标 + 完整 `GoldenHourCamera` bundle 也不出画面，与 `sky_screenshot.rs` 同栈却正常，差异未定位。**因此「游戏内观感」只有 Feihei 本人 `cargo run` + F7 才是有效证据**；本文所有形态结论均来自 `examples/tree_gallery.rs`（纯 CPU 光栅化）。
   - **已知验证缺口**：`tests/tree_preview_screenshot.rs` 在精简插件栈下能跑通（F7 生效、12 棵树生成），但截图为空——HDR 相机在这套栈里没有产出画面（`sky_screenshot.rs` 的栈可正常出图，差异未定位）。**桥接测试只覆盖逻辑层，不覆盖“游戏内可见”**；游戏内观感待 Feihei 本地按 F7 人工确认。
-- [ ] 3.7 季节切换快捷键（1/2/3/4，开发期）——随 3.5 顺延
+- [x] 3.7 季节切换快捷键（1/2/3/4，开发期）+ 菜单 Tab 选择（2026-10-29，见 R3.5 小节）
 - [x] 3.8 headless 验证（碰撞围合部分）：`walking_every_street_reaches_the_far_end`——沿全部路网边（2112 条 × 4 seed）按 0.5m 步长模拟步行，断言不卡死、不穿块、不出世界、单调前进。**该测试暴露并驱动修复**：环路中线格点扰动、图节点坐标错位、左右归属按基准格点判定、row_fits 与放置偏移不一致（完整链路见 2.9 修订）。修复后全城建筑 2787 → 10091（此前静默丢弃 ~90% 放置）。四季树形态部分随 3.5 顺延
+
+### R3.5 季节系统（2026-10-29，方案 A：顶点色 + MaterialExtension）
+
+**与原 ADR-0004 的关键差异（必须记录）**：ADR 的季节是建立在 Godot **alpha 卡片树叶**上的（`ALPHA = albedo.a * leaf_density`，冬天乘 0 让叶面透明）。R3.9 之后树是**不透明程序化网格**（枝干锥台 + 叶簇二十面球合并成单 mesh），没有贴图也没有 alpha 通道，那条路径已不存在。
+
+差点走错的一步：直接用顶点 alpha 做密度。**Bevy 的深度预通道只按「材质基色」判 alpha 丢弃**（`pbr_prepass_functions.wesl` 的 `prepass_sample_color_and_alpha_discard`），从不读顶点色；而体积雾与云的 pass 都读这份预通道深度。用顶点 alpha 会在颜色通道抹掉叶子、却在深度缓冲里留着实体 —— 雾和云会在「看不见的叶子」周围被切出空洞。
+
+**实际做法：密度用几何塌缩，不用 alpha。** 烘焙时把「顶点到本叶簇中心的偏移」写进 `UV_0.xy` + `UV_1.x`，顶点着色器按 `(density - 1)` 缩放该偏移：密度 1 是原样，0 时整簇收成一个点，只剩枝干骨架 —— 正好是 ADR 要的冬季观感，且塌缩发生在写顶点位置之前，主通道/预通道/阴影通道天然一致。
+
+- `world/season.rs`：四季参数表（逐值对齐 ADR-0004 §6）+ `SeasonState` Resource。`foliage_tint()` 归一化到**单位亮度**（GPU 侧是乘子，绝对亮度由材质基色提供），`foliage_linear()` 供测试与文档读绝对值
+- **修正一处 17 倍错误**：`SILHOUETTE_LUMINANCE` 最初按 sRGB 数字（0.042）写，但 `Color::srgb(0.030,0.038,0.032)` 的**线性**亮度是 0.0028；照原样会把整片树点亮 17 倍，直接违反 ADR-0001 的剪影观感。已加测试把常量与被测材质对齐
+- 顶点色通道（ADR 的「艺术接口」保留）：`r` 摆动权重（叶 ~1.0 / 枝 ~0.12，随高度增益）、`g` 叶掩码（0=枝干，永不塌缩）、`b` 每簇相位（相邻叶簇不同步）
+- `assets/shaders/tree_sway.wesl`：**一个文件同时服务主通道与预通道**，靠 `PREPASS_PIPELINE` def 切换 io/裁剪空间。文件唯一性就是「两通道位移逐位一致」的结构性保证——前向管线对预通道深度用 `GreaterEqual` 测试，只要主通道把顶点放到预通道后面一点，就会成片丢弃
+- 片元**不接管**：继续走内置 `pbr.wesl`。`pbr_fragment.wesl` 本来就有 `base_color = in.color * material.base_color`，所以季节色作为顶点色进入光照，光照/距离雾/色调映射/延迟路径全部原样保留
+- `plugins/season.rs`：`SeasonUniform`（32 B，两个 `vec4`）+ `TreeSeasonExtension`（binding 100）+ `push_uniform`。**时钟也放在这个 uniform 里**（`sway.w`）：`globals.time` 在前向是 binding 11、预通道是 binding 1，一个文件无法两处都声明
+- 零开销切换：全天下的树共享**一个** `Handle<TreeSeasonMaterial>`，切季只改这一个 32 B uniform（ADR 要求「禁止逐材质实例遍历」）；代价是每帧一次 32 B 上载——省掉的是遍历，不是上载
+- 菜单：主菜单显示 `Season: X [Tab]`，Tab 循环；开局把季节写进 `SaveData`；读档时 `SeasonState` 随之恢复（R3.5 前该字段恒为 `Summer`，等于读档会把秋天变回夏天）
+- 开发快捷键 1/2/3/4 **只在非游戏态生效**（ADR-0001：单局季节不变）
+- **替换了 `capture_current` 的七个参数**：改为 `SaveInputs`（`SystemParam`），自动存档与手动存档共用同一份采集逻辑（此前两条路径各自硬编码 seed/season，正是它们分叉的来源）
+
+**测试（新增 20 个，总数 141）**：参数表逐值对齐 ADR；冬季唯一无叶；四季亮度都落在剪影预算内；四季色互不相同；`foliage_tint` 亮度恒为 1；uniform 32 B/16 B 对齐且字段偏移正确；时钟推进；切季确实改写共享材质；顶点色与 UV 打包覆盖每个顶点；叶/枝可区分；偏移确实以簇心为原点；摆动权重随高度增长；shader 单入口；shader 的 uniform 声明与 Rust 侧一致；shader 不收枝干；shader 时钟不来自 globals；存档往返带季节（已双向验证：改回旧行为即失败）；读档先恢复季节再流式；菜单 Tab 选季并带进 run；单局内不可改季。
+
+**踩到并修复的两个 shader 问题（都只在运行时暴露，cargo 无能为力）**：
+1. `import package::prepass::io` → 报 `module not found`。`package::` 指向「拥有该 shader 的 crate」，而本项目 shader 的 module path 是 `shaders::tree_sway`。必须写 `bevy_pbr::`（与 `cirrus.wesl` 一致）
+2. `decompress_vertex` 只在预通道的 io 模块里 → 共用代码里无条件调用会找不到声明。改为按 `PREPASS_PIPELINE` 分支取 `v`
+
+**验证缺口（重要）**：`cargo run` 已实测启动零 shader / 零管线创建错误，证明两条通道的着色器都编译通过、管线都建起来了（树在主菜单下就已流式存在，管线必然被创建）。但**四季的实际观感、摆动幅度、冬季裸枝是否好看，仍需 Feihei 本地 `cargo run` + 菜单 Tab/1-4 亲自确认**——截图冒烟栈在 R3.9 就已被证明不出画面，本项沿用该结论，不作自动化视觉断言。
 
 ### 可验证
 
@@ -389,14 +416,14 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 R0: 骨架与依赖锁定   [██████████] 完成（2026-10-20）
 R1: 天空系统迁移     [████████░░] 完成（2026-10-20，色调饱和度待人眼迭代）
 R2: 布局图与Chunk    [██████████] 完成（2.1–2.15，2026-10-21）
-R3: 放置碰撞与季节   [████████░░] 基本完成（3.1-3.4, 3.6, 3.8 碰撞围合 done 2026-10-24；3.5/3.7 顺延）
+R3: 放置碰撞与季节   [██████████] 完成（3.1-3.8 全部 done；3.5/3.7 季节系统 2026-10-29）
 R4: 存档与菜单       [██████████] 完成（4.1-4.6，2026-10-24；可点击按钮/完成弹窗接线留 R5.6）
 R5: 声音与润色       [░░░░░░░░░░] 待开始（原 M5 顺延）
 R3.9 程序化树         [██████████] 完成：形态 + 烘焙单 mesh + chunk 流式 + 三层 LOD（2026-10-27）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
 ```
 
-**下一步**：R5 声音与润色（原 M5 顺延：脚步声/风声/环境音/配乐/LOD/打磨/跨平台）。季节（3.5/3.7）顺延至 R4 后。2026-10-24：R3.8 步行测试暴露的街道几何一致性修复见 2.9 修订（环路格点钉死、图节点用扰动坐标、归属按几何侧、curb 逐街宽）。
+**下一步**：R5 声音与润色（原 M5 顺延：脚步声/风声/环境音/配乐/LOD/打磨/跨平台）。2026-10-29：季节系统（3.5/3.7）已完成并补齐存档/菜单接线，见上方 R3.5 小节；余下待办是 Feihei 人眼验收四季观感与摆动幅度。
 
 ## 风险与依赖
 
