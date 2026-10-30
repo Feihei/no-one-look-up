@@ -35,6 +35,10 @@ pub const DEV_PANEL_UP: KeyCode = KeyCode::ArrowUp;
 pub const DEV_PANEL_DOWN: KeyCode = KeyCode::ArrowDown;
 pub const DEV_PANEL_LEFT: KeyCode = KeyCode::ArrowLeft;
 pub const DEV_PANEL_RIGHT: KeyCode = KeyCode::ArrowRight;
+/// Main menu: cycles the season for the run about to start (ADR-0001: the
+/// season is chosen at the start and is fixed for the whole walk).
+pub const SEASON_CYCLE: KeyCode = KeyCode::Tab;
+
 pub const DEV_SEASON_SPRING: KeyCode = KeyCode::Digit1;
 pub const DEV_SEASON_SUMMER: KeyCode = KeyCode::Digit2;
 pub const DEV_SEASON_AUTUMN: KeyCode = KeyCode::Digit3;

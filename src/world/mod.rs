@@ -17,6 +17,7 @@ pub mod geometry;
 pub mod layout_graph;
 pub mod path_network;
 pub mod placement;
+pub mod season;
 pub mod tree_mesh;
 pub mod tree_shape;
 pub mod world_grid;

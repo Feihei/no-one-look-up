@@ -20,7 +20,7 @@ use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::placement;
-use crate::world::tree_mesh::{self, TreeLod, TreeMeshKey, bake_tree_mesh_lod};
+use crate::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
 use crate::world::tree_shape::TREE_PROFILES;
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
 
@@ -315,8 +315,11 @@ pub(crate) struct PlacementAssets {
     /// Indices follow `lod * TreeMeshKey::VARIANTS * TREE_PROFILES.len() +
     /// species * TreeMeshKey::VARIANTS + variant`.
     tree_meshes: Vec<Handle<Mesh>>,
-    /// Shared near-black silhouette material for every procedural tree.
-    tree_material: Handle<StandardMaterial>,
+    /// The season-aware tree material (R3.5): one handle shared by every tree
+    /// in the world, so a season switch is a single uniform write
+    /// (`plugins::season`). Trees used to share a plain `StandardMaterial`;
+    /// the extension keeps the same silhouette and adds sway + leaf density.
+    tree_material: Handle<crate::plugins::season::TreeSeasonMaterial>,
     /// One unit cube reused by every building and plaza pad; each instance
     /// scales it. Buildings used to call `meshes.add(Cuboid)` per object,
     /// which allocated a new mesh every time a chunk streamed in.
@@ -343,6 +346,7 @@ fn build_placement_assets(
     mut commands: Commands,
     meshes: Option<ResMut<Assets<Mesh>>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
+    tree_materials: Option<ResMut<Assets<crate::plugins::season::TreeSeasonMaterial>>>,
     existing: Option<Res<PlacementAssets>>,
 ) {
     // Build ONCE. This system used to run every frame with no guard: it baked
@@ -359,7 +363,15 @@ fn build_placement_assets(
     // R3.9: no `AssetServer` needed any more. Trees are baked procedurally
     // from `tree_shape`, not loaded from glTF — which also means the world
     // gets trees in a headless test, so streaming is actually testable.
-    let (Some(mut meshes), Some(mut materials)) = (meshes, materials) else {
+    //
+    // The season material store is a separate requirement: it only exists once
+    // `SeasonPlugin` has registered the `MaterialPlugin` (which headless tests
+    // do add, so trees stay testable). Waiting for it — instead of returning
+    // after the meshes have been allocated — is what keeps this system
+    // idempotent; returning late would leak a fresh set of meshes every frame.
+    let (Some(mut meshes), Some(mut materials), Some(mut tree_materials)) =
+        (meshes, materials, tree_materials)
+    else {
         return;
     };
     let palette = placement::StylePalette::default();
@@ -398,7 +410,14 @@ fn build_placement_assets(
             }
         }
     }
-    let tree_material = materials.add(tree_mesh::silhouette_material());
+    // R3.5: the season-aware material replaces the plain silhouette. Every
+    // tree in the world shares this one handle, which is what makes a season
+    // switch a single 32-byte uniform write instead of a walk over every tree
+    // entity (ADR-0004 §6 "no per-material traversal").
+    let tree_material = tree_materials.add(crate::plugins::season::TreeSeasonMaterial {
+        base: crate::plugins::season::tree_base_material(),
+        extension: Default::default(),
+    });
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
     info!(
@@ -509,6 +528,13 @@ pub struct WorldPlugin;
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<crate::world::explored::ExploredBitmap>()
+            // The tree material store is registered here rather than by
+            // `SeasonPlugin`: `Assets<T>` must exist before
+            // `build_placement_assets` runs, and the headless tests build the
+            // world without the render plugins. Registering the asset type
+            // twice is a no-op, so the real app (which also has the
+            // `MaterialPlugin` that needs it) is unaffected.
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>()
             .add_message::<crate::world::explored::PlayerChunkChanged>()
             .add_systems(Startup, generate_layout)
             .add_systems(PreUpdate, build_placement_assets)
@@ -691,7 +717,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, super::WorldPlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<StandardMaterial>>();
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
         app.world_mut().spawn((
             Camera3d::default(),
             Transform::from_xyz(CENTER, 1.6, CENTER),
@@ -735,7 +762,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, super::WorldPlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<StandardMaterial>>();
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
         app.world_mut().spawn((
             Camera3d::default(),
             Transform::from_xyz(CENTER, 1.6, CENTER),
@@ -809,7 +837,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, super::WorldPlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<StandardMaterial>>();
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
         app.world_mut().spawn((
             Camera3d::default(),
             Transform::from_xyz(CENTER, 1.6, CENTER),
@@ -851,7 +880,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, super::WorldPlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<StandardMaterial>>();
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
         app.world_mut().spawn((
             Camera3d::default(),
             Transform::from_xyz(CENTER, 1.6, CENTER),
