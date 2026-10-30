@@ -5,8 +5,10 @@
 //!
 //! One terrain exists at a time (a second `Terrain` entity logs a warning and is ignored). It is
 //! centred on its entity's `Transform`: the grid's minimum corner is `translation.xz − extent / 2`
-//! and a stored height `h` is the world height `translation.y + h`. Rotation and scale are not
-//! supported.
+//! and a stored height `h` is the height `translation.y + h` above the entity's origin, all in
+//! the metre frame (world ÷ [`ElementsUnits::units_per_metre`](crate::ElementsUnits): the
+//! entity's translation is read through it, the patches are written ×units). Rotation and scale
+//! are not supported.
 
 mod gpu;
 #[cfg(test)]
@@ -14,6 +16,7 @@ mod gpu_tests;
 pub(crate) mod lod;
 mod material;
 pub(crate) mod model;
+mod textures;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -22,9 +25,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::gpu::grid::zeroed_buffer;
 use crate::gpu::readback::{Readbacks, decode};
-use crate::plugin::{ElementsQuality, ElementsSystems, ElementsView, ensure_gpu_core};
+use crate::plugin::{
+    ElementsFocus, ElementsQuality, ElementsSystems, ElementsUnits, ElementsView, ensure_gpu_core,
+};
 use crate::query::EnvironmentSnapshot;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
+use bevy::shader::load_shader_library;
 use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::NoAutoAabb;
 use bevy::math::UVec4;
@@ -33,20 +39,22 @@ use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
 use bevy::render::render_resource::{ShaderType, TextureFormat};
 use bevy::render::storage::ShaderBuffer;
-use bevy::shader::load_shader_library;
 use bevy::transform::TransformSystems;
 pub(crate) use gpu::TerrainDispatch;
 use lod::{BoundsTree, LodConfig, Patch, select_patches};
 pub use material::{
-    GroundExtension, GroundMaterial, GroundParams, TerrainExtension, TerrainMaterial,
-    TerrainMaterialParams,
+    GroundExtension, GroundMaterial, GroundParams, TerrainExtension, TerrainExtensionKey,
+    TerrainLook, TerrainMaterial, TerrainMaterialParams,
 };
-pub(crate) use material::{NO_TERRAIN, insert_placeholder, lod_uniform, shadow_inputs};
+pub(crate) use material::{
+    NO_TERRAIN, insert_placeholder, lod_centre_uniform, lod_uniform, shadow_inputs,
+};
 use model::{
     F_HALF, GAIN, LACUNARITY, LEAF_CELLS, OCTAVE_ROTATION, R_LOW, R_SPAN, octave_count,
     resolve_resolution, seed_mix,
 };
 pub use model::{TerrainGrid, TerrainSnapshot};
+pub use textures::{GroundLayerTextures, TerrainTextures};
 
 /// Largest readback edge: a larger simulation grid is box-averaged down by 2 first.
 const READBACK_MAX_CELLS: u32 = 1024;
@@ -152,8 +160,9 @@ pub enum TerrainRender {
 }
 
 /// The terrain. Spawn one entity with it. It is centred on the entity's `Transform` (the grid's
-/// minimum corner is `translation.xz − extent / 2`, a stored height `h` is the world height
-/// `translation.y + h`); rotation and scale are ignored. One terrain exists at a time: a second
+/// minimum corner is `translation.xz − extent / 2` and a stored height `h` is the height
+/// `translation.y + h`, both read through [`ElementsUnits`](crate::ElementsUnits): `Terrain`'s
+/// own lengths are metres); rotation and scale are ignored. One terrain exists at a time: a second
 /// `Terrain` entity logs a warning and is ignored.
 #[derive(Component, Clone, Debug, PartialEq)]
 #[require(Transform, Visibility)]
@@ -164,8 +173,9 @@ pub struct Terrain {
     pub extent_m: Vec2,
     /// Cells per axis: clamped to
     /// [`ElementsQuality::terrain_max_resolution`] and rounded down to a power of two. Cells
-    /// are square: when `extent_m` and `resolution` disagree about the cell size, the row count
-    /// is re-derived from the column count (with a warning). Default 1024².
+    /// are square: when `extent_m` and `resolution` disagree about the cell size, the coarser
+    /// axis's cell is kept and both counts are re-derived from it (with a warning), so neither
+    /// exceeds the cap. Default 1024².
     pub resolution: UVec2,
     /// Who draws it.
     pub render: TerrainRender,
@@ -253,8 +263,8 @@ pub struct TerrainState {
     pub cells: Handle<ShaderBuffer>,
     /// The packed water-render buffer, `array<vec4<f32>>`: velocity xy, turbidity, spare.
     pub flow_cells: Handle<ShaderBuffer>,
-    /// Surface height per readback cell, `array<f32>` (`readback_size` cells; the grid
-    /// box-averaged by 2 above 1024²).
+    /// Surface height and sediment thickness per readback cell, `array<vec2<f32>>`
+    /// (`readback_size` cells; the grid box-averaged by 2 above 1024²).
     pub height_readback: Handle<ShaderBuffer>,
     /// Bounds of every 32 × 32-cell leaf, `array<vec4<f32>>`: surface min, surface max, water
     /// surface max, water depth max.
@@ -334,9 +344,13 @@ pub(crate) struct TerrainGpu {
     pub state: TerrainState,
     pub params: TerrainParamsGpu,
     pub source: GenerateSource,
-    /// Set by anything that changed bedrock, sediment or water: the pack, bounds and readback
-    /// kernels run once on the next frame. The generation itself sets it.
-    pub dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// Bumped by anything that changed bedrock, sediment or water this frame; the render world
+    /// runs the pack, bounds and readback kernels while it is ahead of `packed`. Extracted by
+    /// value, so a later frame's bump never reaches an earlier render frame. Starts at 1: the
+    /// generation itself is a change.
+    pub changes: u64,
+    /// The `changes` value the render world last packed.
+    pub packed: Arc<std::sync::atomic::AtomicU64>,
     /// Set by the render world once the generator has run.
     pub generated: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -377,6 +391,24 @@ pub(crate) struct TerrainRuntime {
     pub(crate) water_box: Option<BoundsTree>,
     /// Water depth max of every node (both entries): `get(..).1` is the deepest cell's depth.
     pub(crate) water_depth: Option<BoundsTree>,
+    /// What the patches are selected and morphed about under an orthographic followed camera,
+    /// metre frame (`docs/research/orthographic-lod.md` Model 1); `None`: the eye.
+    pub(crate) lod_centre: Option<Vec3>,
+}
+
+impl TerrainRuntime {
+    /// Whether the crate draws the active terrain with its own patches (not a consumer's mesh).
+    pub(crate) fn draws_ground(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|(_, terrain, _)| terrain.render == TerrainRender::Owned)
+    }
+
+    /// The point the patches are selected and morphed about for a followed camera at `eye`
+    /// (metre frame).
+    pub(crate) fn morph_centre(&self, eye: Vec3) -> Vec3 {
+        self.lod_centre.unwrap_or(eye)
+    }
 }
 
 /// Heightmap formats the generator reads linearly, and whether the kernel is the integer one.
@@ -404,23 +436,30 @@ pub struct TerrainPlugin;
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         ensure_gpu_core(app);
-        load_shader_library!(app, "common.wesl");
         embedded_asset!(app, "generate.wesl");
         embedded_asset!(app, "heightmap.wesl");
         embedded_asset!(app, "pack.wesl");
         embedded_asset!(app, "flow.wesl");
         embedded_asset!(app, "render.wesl");
         embedded_asset!(app, "ground.wesl");
+        // The ground's detail textures' hex-tiling, imported by `render.wesl`.
+        load_shader_library!(app, "textures.wesl");
         app.add_plugins((
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<GroundMaterial>::default(),
         ))
         .init_resource::<TerrainRuntime>()
-        .add_systems(Update, ensure_terrain.in_set(ElementsSystems::Simulation))
+        .init_resource::<textures::GroundTexturePack>()
+        .init_resource::<TerrainLook>()
+        .add_systems(
+            Update,
+            (ensure_terrain, update_lod_centre).in_set(ElementsSystems::Simulation),
+        )
         .add_systems(
             Update,
             (
                 read_terrain.in_set(ElementsSystems::Readback),
+                textures::pack_terrain_textures,
                 material::update_materials,
             )
                 .chain()
@@ -439,6 +478,7 @@ fn ensure_terrain(
     mut commands: Commands,
     quality: Res<ElementsQuality>,
     terrains: Query<(Entity, &Terrain, &Transform, Option<&GlobalTransform>)>,
+    units: Res<ElementsUnits>,
     asset_server: Res<AssetServer>,
     images: Res<Assets<Image>>,
     state: Option<ResMut<TerrainState>>,
@@ -475,6 +515,8 @@ fn ensure_terrain(
         runtime.warned_extra = true;
     }
     let transform = global.map_or(*local, |g| g.compute_transform());
+    // The grid lives in the metre frame; the entity's translation is in world units.
+    let translation = units.point_to_metres(transform.translation);
     if !runtime.warned_transform
         && (transform.rotation.angle_between(Quat::IDENTITY) > 1e-4
             || (transform.scale - Vec3::ONE).abs().max_element() > 1e-4)
@@ -491,10 +533,10 @@ fn ensure_terrain(
     // The grid follows the transform every frame; the layers are rebuilt only when what they
     // were built from changes.
     let grid = TerrainGrid {
-        origin: transform.translation.xz() - size.as_vec2() * cell * 0.5,
+        origin: translation.xz() - size.as_vec2() * cell * 0.5,
         cell_m: cell,
         size,
-        y0: transform.translation.y,
+        y0: translation.y,
     };
     if runtime.active.as_ref() == Some(&wanted) {
         if let (Some(mut state), Some(mut gpu)) = (state, gpu) {
@@ -583,8 +625,8 @@ fn ensure_terrain(
     };
     if adjusted {
         warn!(
-            "terrain extent {:?} and resolution {:?} give non-square cells; the rows are re-derived as {} for {:.3} m cells",
-            terrain.extent_m, terrain.resolution, size.y, cell
+            "terrain extent {:?} and resolution {:?} give non-square cells; the grid is re-derived as {} for {:.3} m cells",
+            terrain.extent_m, terrain.resolution, size, cell
         );
     }
 
@@ -615,7 +657,7 @@ fn ensure_terrain(
         height_readback: zeroed_buffer(
             &mut buffers,
             "elements_terrain_height_readback",
-            u64::from(readback_size.x) * u64::from(readback_size.y) * 4,
+            u64::from(readback_size.x) * u64::from(readback_size.y) * 8,
         ),
         leaf_bounds: zeroed_buffer(&mut buffers, "elements_terrain_leaf_bounds", leaves * 16),
         readback_size,
@@ -625,7 +667,8 @@ fn ensure_terrain(
         state: new_state.clone(),
         params: TerrainParamsGpu::new(&grid, ds, true),
         source,
-        dirty: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        changes: 1,
+        packed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         generated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let cells_handle = new_state.cells.clone();
@@ -658,12 +701,15 @@ fn ensure_terrain(
                 cells: cells_handle,
                 cover: NO_TERRAIN,
                 cloud_shadow: None,
+                trail: None,
+                ground: None,
+                path: None,
             },
         });
         // Hidden until the first selection puts a patch in a slot.
         let analytic = Aabb::from_min_max(
-            Vec3::new(0.0, low - 2.0, 0.0),
-            Vec3::new(1.0, high + 2.0, 1.0),
+            Vec3::new(0.0, units.world(low - 2.0), 0.0),
+            Vec3::new(1.0, units.world(high + 2.0), 1.0),
         );
         let mut slots = Vec::with_capacity(POOL_CAPACITY);
         commands.entity(entity).with_children(|parent| {
@@ -781,18 +827,56 @@ pub(crate) fn assign_slots(
     (assigned, used)
 }
 
-/// The transform of a patch relative to the terrain entity: its corner on the grid, scaled to
-/// its edge.
+/// The transform of a patch relative to the terrain entity: its corner on the vertex lattice
+/// (the node's tile half a cell in from the grid's corner, so the vertices sit on the height
+/// samples), scaled to its edge.
 pub(crate) fn patch_transform(lod: &LodConfig, extent: Vec2, patch: Patch) -> (Vec3, Vec3) {
     let size = lod.node_m(patch.level);
+    let offset = lod.sample_offset();
     (
         Vec3::new(
-            patch.ix as f32 * size - extent.x * 0.5,
+            patch.ix as f32 * size + offset - extent.x * 0.5,
             0.0,
-            patch.iz as f32 * size - extent.y * 0.5,
+            patch.iz as f32 * size + offset - extent.y * 0.5,
         ),
         Vec3::new(size, 1.0, size),
     )
+}
+
+/// Find what the patches are selected and morphed about this frame
+/// (`docs/research/orthographic-lod.md` Model 1). Under a perspective followed camera, the eye
+/// (`None`): Bevy's vertex stage morphs about the view's own translation. Under an orthographic
+/// one, whose eye stands far back from what it shows, its [`ElementsFocus`], or without one
+/// where its forward ray first meets the ground; a view that meets no ground keeps the eye.
+pub(crate) fn update_lod_centre(
+    mut runtime: ResMut<TerrainRuntime>,
+    view: Res<ElementsView>,
+    snapshot: Res<EnvironmentSnapshot>,
+    cameras: Query<(&Projection, &GlobalTransform, Has<ElementsFocus>)>,
+) {
+    let centre = view
+        .entity
+        .and_then(|entity| cameras.get(entity).ok())
+        .and_then(|(projection, transform, focused)| {
+            if !matches!(projection, Projection::Orthographic(_)) {
+                return None;
+            }
+            // A focus that resolved to the eye (an entity without a transform) is no focus.
+            if focused && view.position != view.eye {
+                return Some(view.position);
+            }
+            let snap = snapshot.terrain.as_ref()?;
+            let (lo, hi) = runtime.bounds.as_ref()?.extremes();
+            snap.ray_hit(
+                view.eye,
+                transform.forward().as_vec3(),
+                snap.grid.y0 + lo,
+                snap.grid.y0 + hi,
+            )
+        });
+    if runtime.lod_centre != centre {
+        runtime.lod_centre = centre;
+    }
 }
 
 /// Select the patches for the followed camera and write them into the pool, touching only the
@@ -802,6 +886,7 @@ pub(crate) fn update_patches(
     mut runtime: ResMut<TerrainRuntime>,
     state: Option<Res<TerrainState>>,
     view: Res<ElementsView>,
+    units: Res<ElementsUnits>,
     snapshot: Res<EnvironmentSnapshot>,
     mut patches: Query<(&mut Transform, &mut Visibility, &mut MeshTag, &mut Aabb)>,
 ) {
@@ -840,10 +925,13 @@ pub(crate) fn update_patches(
         return;
     };
     let grid = state.grid;
+    // The same centre the vertex stage morphs about: the eye, Bevy's `lod_view_world_position`,
+    // or the uniform `lod_centre` under an orthographic camera.
+    let centre = runtime.morph_centre(view.eye);
     let camera = Vec3::new(
-        view.position.x - grid.origin.x,
-        view.position.y - grid.y0,
-        view.position.z - grid.origin.y,
+        centre.x - grid.origin.x,
+        centre.y - grid.y0,
+        centre.z - grid.origin.y,
     );
     let mut wanted = select_patches(&lod, &tree, camera);
     if wanted.len() > POOL_CAPACITY {
@@ -881,7 +969,12 @@ pub(crate) fn update_patches(
         let Ok((mut transform, mut visibility, mut tag, mut aabb)) = patches.get_mut(entity) else {
             continue;
         };
+        // The patch is placed in the world: its metre-frame corner and edge × units.
         let (translation, scale) = patch_transform(&lod, extent, patch);
+        let (translation, scale) = (
+            units.point_to_world(translation),
+            Vec3::new(units.world(scale.x), scale.y, units.world(scale.z)),
+        );
         if transform.translation != translation || transform.scale != scale {
             transform.translation = translation;
             transform.scale = scale;
@@ -891,8 +984,8 @@ pub(crate) fn update_patches(
         }
         let (low, high) = tree.get(patch.level, patch.ix, patch.iz);
         let bounds = Aabb::from_min_max(
-            Vec3::new(0.0, low - model::AABB_PAD_M, 0.0),
-            Vec3::new(1.0, high + model::AABB_PAD_M, 1.0),
+            Vec3::new(0.0, units.world(low - model::AABB_PAD_M), 0.0),
+            Vec3::new(1.0, units.world(high + model::AABB_PAD_M), 1.0),
         );
         if *aabb != bounds {
             *aabb = bounds;
@@ -953,15 +1046,17 @@ fn read_terrain(
             "terrain_height",
             state.height_readback.clone(),
             move |bytes, snapshot| {
-                let Some(surface) = decode::<f32>(bytes) else {
+                let Some(cells) = decode::<[f32; 2]>(bytes) else {
                     return;
                 };
-                if surface.len() < expected {
+                if cells.len() < expected {
                     return;
                 }
+                let cells = &cells[..expected];
                 snapshot.terrain = Some(TerrainSnapshot {
                     grid,
-                    surface: surface[..expected].into(),
+                    surface: cells.iter().map(|c| c[0]).collect(),
+                    sediment: cells.iter().map(|c| c[1]).collect(),
                     version,
                 });
             },

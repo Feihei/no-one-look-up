@@ -1,12 +1,39 @@
-# Local patches to bevy_elements 0.5.3
+# Local patches to bevy_elements 0.6.0
 
-This directory is a vendored copy of `bevy_elements` 0.5.3, wired in through
+This directory is a vendored copy of `bevy_elements` 0.6.0, wired in through
 `[patch.crates-io]` in the root `Cargo.toml`. Only the cloud shading differs
 from upstream; everything else is untouched.
 
 Every change is marked `[PATCH heads-up]` in the source. **Re-apply these on
 upgrade** — a straight `cargo update` would silently restore upstream
 behaviour and the cloud artefacts would come back.
+
+## 0.5.3 → 0.6.0 re-port (2026-10-30)
+
+The three patches were originally applied to vendored 0.5.3. Upgrading to
+0.6.0 replaced the vendored source wholesale (0.6.0 is a large rewrite of
+`celestial` and the cloud shaders), and **all three defects are still present
+upstream in 0.6.0**, so the patches were re-ported onto the new code:
+
+- `src/clouds/common.wesl`: 0.6.0 split the density into a stratiform path
+  (`cloud_gradient`) and a cumuliform path (`cumulus_envelope` + 
+  `cumulus_profile`). The dome defects exist on both paths:
+  - `cloud_gradient(f, kind, dome, dome_jitter)` — the kind ramp is
+    `smoothstep(0.05, 0.55, kind)` (upstream: `clamp(kind * 4, 0, 1)`, which
+    saturates at `kind >= 0.25`), the profile is `pow(dome, 0.62)` modulated
+    by `dome_jitter` from the base noise's green channel (upstream: bare
+    `sqrt(dome)`, a clean half-ellipse), and both call sites
+    (the coarse march and the fine march) pass `b4.g` as the jitter.
+  - `cumulus_envelope` — `sqrt(dome)` → `pow(dome, 0.62)`, matching the
+    stratiform profile change, so the cumuliform top does not round off as a
+    half-ellipse either.
+- `src/clouds/weather.wesl`: `DOME_WIDTH` 0.37 → 0.30 (unchanged from the
+  0.5.3 patch; upstream 0.6.0 still ships 0.37).
+- `src/celestial/mod.rs`: `sky_gain()` still returns
+  `total * (1 / sun_cloud_factor)` with no horizon awareness — the "sky gets
+  brighter as cloud rises" inversion at dusk. The dusk fade
+  (`dusk_gain_fade`, smoothstep 2°–25° sun altitude) is re-applied inside
+  `sky_gain`.
 
 ## Why fork at all
 
@@ -19,7 +46,7 @@ a specific line before patching:
 
 ### 1 + 3: the dome factor saturated and was a clean half-ellipse
 
-`src/clouds/common.wesl`, `cloud_gradient()`:
+`src/clouds/common.wesl`:
 
 ```wgsl
 let lean = clamp(kind * 4.0, 0.0, 1.0);          // saturates at kind >= 0.25
@@ -49,7 +76,7 @@ Patch:
 `composite.wesl` multiplies sky pixels by it:
 
 ```wgsl
-cloud.a *= mix(1.0, params.sky.x, smoothstep(OPAQUE_BELOW, SKY_ABOVE, cloud.a));
+cloud.a *= mix(1.0, p.sky.x, smoothstep(OPAQUE_BELOW, SKY_ABOVE, cloud.a));
 ```
 
 `beam = 1 - cover^3.4`, so the gain climbs steeply with cover — 1.19 at cover
@@ -64,9 +91,11 @@ at the golden hour the gain is 1.0 and cloud cover stops brightening the sky.
 
 ## Verified
 
-- `cargo test` in the game crate: 102 pass.
-- Game runs 20 s with zero warnings and zero errors, which also confirms both
-  WGSL files compile — a shader error surfaces at pipeline creation.
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`: all green (155 lib tests + integration).
+- `cargo test --test sky_screenshot -- --ignored` (physical GPU): passes —
+  which also confirms the re-ported cloud shader compiles into pipelines and
+  the golden-hour frame assertions hold (2026-10-30, RTX 2070 / Vulkan).
 
 ## Not patched (deliberate)
 

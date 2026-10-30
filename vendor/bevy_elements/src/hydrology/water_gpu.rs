@@ -21,7 +21,8 @@ use bevy::render::texture::GpuImage;
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 use super::water::{
-    FOAM_OCTAVES, NORMAL_MIPS, NORMAL_OCTAVES, NORMAL_SLOPE_GAIN, NORMAL_TEXELS, WaterState,
+    FOAM_OCTAVES, NORMAL_BASE_TEXELS, NORMAL_MIPS, NORMAL_OCTAVES, NORMAL_SLOPE_GAIN,
+    NORMAL_TEXELS, WaterState,
 };
 use crate::gpu::kernel::{Kernel, groups, queue_kernel, ready};
 
@@ -49,7 +50,12 @@ pub(crate) struct NormalParams {
 /// normal, flat, with a foam alpha of 0.5.
 pub(crate) fn octaves_kept(level: u32) -> (u32, u32) {
     let two = 2u32 << level;
-    let height = (0..NORMAL_OCTAVES).filter(|o| (64u32 >> o) >= two).count() as u32;
+    // The base octave's wavelength in texels of the full-resolution map: the map's finest band
+    // must stay at four texels (the kernel's limit), so the ladder starts at 16
+    // (`docs/research/water-surface.md`, Model 2).
+    let height = (0..NORMAL_OCTAVES)
+        .filter(|o| (NORMAL_BASE_TEXELS >> o) >= two)
+        .count() as u32;
     let foam = (0..FOAM_OCTAVES).filter(|j| (128u32 >> j) >= two).count() as u32;
     (height, foam)
 }
@@ -192,15 +198,16 @@ fn dispatch(
 mod tests {
     use super::octaves_kept;
 
-    /// The octaves a mip keeps: all five down to level 1 (the finest wavelength is 4 texels), two
-    /// fewer at level 3, none from level 6.
+    /// The octaves a mip keeps: all three down to level 1 (the finest wavelength is 4 texels of
+    /// the full-resolution map), one fewer at level 3, none from level 4
+    /// (`docs/research/water-surface.md`, Model 2).
     #[test]
     fn mips_drop_the_octaves_they_cannot_resolve() {
-        assert_eq!(octaves_kept(0).0, 5);
-        assert_eq!(octaves_kept(1).0, 5);
-        assert_eq!(octaves_kept(2).0, 4);
-        assert_eq!(octaves_kept(3).0, 3);
-        assert_eq!(octaves_kept(5).0, 1);
+        assert_eq!(octaves_kept(0).0, 3);
+        assert_eq!(octaves_kept(1).0, 3);
+        assert_eq!(octaves_kept(2).0, 2);
+        assert_eq!(octaves_kept(3).0, 1);
+        assert_eq!(octaves_kept(4).0, 0);
         assert_eq!(octaves_kept(9), (0, 0));
         assert_eq!(octaves_kept(0).1, 4);
     }

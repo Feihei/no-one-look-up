@@ -19,15 +19,23 @@ struct NormalParams {
 
 // Texels of the full-resolution map: the height is a function of the texel on this lattice.
 const BASE_TEXELS: i32 = 512;
-// Height amplitude ratio per octave: 0.7 / 2, so that the *slope* (amplitude × frequency) of
-// octave o is 0.7^o of the first (the note's slope gain).
-const OCTAVE_GAIN: f32 = 0.35;
-const BASE_CELLS: f32 = 8.0;
+// Height amplitude ratio per octave: 0.5, so that every octave's *slope* (amplitude ×
+// frequency) is the same — a flat slope spectrum, as a surface's appearance depends on the slope
+// and not on the height (Lagae et al. 2010 §4). The map's total rms slope is unchanged (Cox &
+// Munk 1954); only its distribution over the spectrum changes
+// (`docs/research/water-surface.md`, Model 1).
+const OCTAVE_GAIN: f32 = 0.5;
+// Lattice cells of the base octave across the tile: 16, so the map's wavelengths run 0.25 m to
+// 6.25 cm (three octaves, the finest at the kernel's four-texel limit). A sheltered body has no
+// fetch and no metre-scale wind chop; the metre band is the wave field's (`waves`, fitted to
+// Airy's dispersion), and duplicating it here is what smeared the reflection into blobs
+// (`water-surface.md`, Model 2).
+const BASE_CELLS: f32 = 16.0;
 const FOAM_CELLS: f32 = 4.0;
 const FOAM_STRETCH: f32 = 2.5;
 
-// Height at integer texel `t` of the full-resolution map, wrapped. Octave `o` has `8·2^o` lattice
-// cells across the tile (wavelength `64/2^o` texels) and the same period, so the sum tiles.
+// Height at integer texel `t` of the full-resolution map, wrapped. Octave `o` has `16·2^o` lattice
+// cells across the tile (wavelength `32/2^o` texels) and the same period, so the sum tiles.
 fn height(t: vec2<i32>) -> f32 {
     let w = vec2<i32>(t.x & (BASE_TEXELS - 1), t.y & (BASE_TEXELS - 1));
     let u = (vec2<f32>(w) + 0.5) / f32(BASE_TEXELS);

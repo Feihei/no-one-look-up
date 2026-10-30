@@ -317,6 +317,14 @@ fn flow_phases_hide_the_restart() {
     assert_eq!(flow_offset(Vec2::ZERO, period, tile, limit), Vec2::ZERO);
 }
 
+/// Height amplitude ratio per octave of the normal map: 0.5, so every octave's slope is the
+/// same (a flat slope spectrum; `docs/research/water-surface.md`, Model 1). Mirrors
+/// `OCTAVE_GAIN` in `water_normals.wesl`.
+const OCTAVE_GAIN: f32 = 0.5;
+/// Lattice cells of the base octave across the tile: 16 (0.25 m wavelength at the 8 m tile).
+/// Mirrors `BASE_CELLS` in `water_normals.wesl`.
+const BASE_CELLS: f32 = 16.0;
+
 /// Height of the normal map at integer texel `t` of the full-resolution lattice (mirror of
 /// `height` in `water_normals.wesl`).
 fn map_height(t: IVec2, octaves: u32) -> f32 {
@@ -326,13 +334,13 @@ fn map_height(t: IVec2, octaves: u32) -> f32 {
     let mut h = 0.0;
     let mut amplitude = 1.0;
     for o in 0..octaves {
-        let cells = 8.0 * (1u32 << o) as f32;
+        let cells = BASE_CELLS * (1u32 << o) as f32;
         h += amplitude
             * perlin3_periodic(
                 Vec3::new(u.x * cells, u.y * cells, 0.5 + o as f32),
                 cells as i32,
             );
-        amplitude *= 0.35;
+        amplitude *= OCTAVE_GAIN;
     }
     h
 }
@@ -387,10 +395,20 @@ fn mips_keep_the_expected_share_of_the_slope() {
     let mip3 = rms_slope(3, k, 1);
     let ratio = mip3 / mip0;
     println!("mip 3 / mip 0 rms slope: {ratio}");
-    assert!(close(ratio, 0.953, 0.02), "mip 3 / mip 0 = {ratio}");
-    // The closed form: the share of the amplitudes of the kept octaves.
-    let weights = |n: u32| (0..n).map(|o| 0.49f32.powi(o as i32)).sum::<f32>();
-    assert!(close((weights(3) / weights(5)).sqrt(), 0.953, 1e-3));
+    // Mip 3 keeps one octave of the three (16, 8 and 4 texels over the 8 m tile; a mip 3 texel
+    // is 8 of the full-resolution ones, so the 4-texel band is gone). The slope spectrum is
+    // flat, so the kept octave carries 1/3 of the slope energy
+    // (`docs/research/water-surface.md`, Model 1); the mip's own central difference runs over
+    // 8 texels, which carries a little more than the octave's own share.
+    assert!(close(ratio, 0.594, 0.02), "mip 3 / mip 0 = {ratio}");
+    // The mip's own central difference spans 8 of the full-resolution texels, so it is a
+    // low-pass of the kept band: it keeps less of it than the band's own energy share
+    // (0.76 for one octave of three, a rms of 0.87) and lands at 0.59. The closed form of the
+    // band share is the bound the measurement must sit under.
+    let weights = |n: u32| (0..n).map(|o| 0.25f32.powi(o as i32)).sum::<f32>();
+    let share = (weights(1) / weights(3)).sqrt();
+    assert!(ratio < share, "the mip keeps more than its band: {ratio} against {share}");
+    assert!(ratio > 0.5, "the mip lost its band: {ratio}");
     let flat = map_slope(IVec2::ZERO, 9, k);
     assert!(flat.length() < 0.01, "mip 9 slope {flat}");
     // The foam alpha is centred.
@@ -403,7 +421,7 @@ fn mips_keep_the_expected_share_of_the_slope() {
         .sum::<f32>()
         / 4096.0;
     assert!((0.3..=0.7).contains(&mean), "foam alpha mean {mean}");
-    assert_eq!(NORMAL_OCTAVES, 5);
+    assert_eq!(NORMAL_OCTAVES, 3);
 }
 
 /// Validation 7: the height field tiles, so the map has no seam.

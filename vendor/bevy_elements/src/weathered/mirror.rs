@@ -1,15 +1,21 @@
 //! CPU transliteration of `src/surface_cover.wesl` (f32, same operation order), used by the tests
-//! to check the shading numbers of `docs/research/wetness.md` and
+//! to check the shading numbers of `docs/research/wetness.md`, `docs/research/wet-ground.md` and
 //! `docs/research/snow-cover.md`.
 
-use bevy::math::{IVec3, Vec2, Vec3, Vec3Swizzles};
+use bevy::math::{IVec3, Vec2, Vec3, Vec3Swizzles, Vec4};
 
 use crate::gpu::noise_mirror::{hash33, perlin3_d};
 
 pub(crate) const SNOW_ALBEDO: Vec3 = Vec3::new(0.80, 0.83, 0.88);
 pub(crate) const SNOW_ROUGHNESS: f32 = 0.9;
-pub(crate) const WET_ALBEDO_LOSS: f32 = 0.5;
+pub(crate) const WET_FILM_R_E: f32 = 0.0659;
+pub(crate) const WET_FILM_R_I: f32 = 0.4720;
+pub(crate) const DRENCHED_ALBEDO: f32 = 0.3;
 pub(crate) const WET_ROUGHNESS: f32 = 0.1;
+pub(crate) const WET_GLOSS_BOOST: f32 = 0.4;
+pub(crate) const WET_LEAF_SATURATE: f32 = 0.25;
+pub(crate) const CANOPY_EXG_LOW: f32 = 0.10;
+pub(crate) const CANOPY_EXG_HIGH: f32 = 0.80;
 pub(crate) const PUDDLE_ROUGHNESS: f32 = 0.02;
 pub(crate) const WATER_REFLECTANCE: f32 = 0.353_553_39;
 pub(crate) const RIPPLE_STRENGTH: f32 = 0.35;
@@ -137,8 +143,19 @@ pub(crate) fn weather_surface(
     };
     let wet = wetness.max(puddle).min(DRENCHED_MAX);
     if wet > 0.0 {
-        s.base_color = base_color * (1.0 - WET_ALBEDO_LOSS * wet * porosity(roughness, metallic));
-        s.roughness = mix(roughness, roughness.min(WET_ROUGHNESS), saturate(wet));
+        let phi = porosity(roughness, metallic);
+        let soaked = wet.min(1.0);
+        let drenched = saturate((wet - 1.0) / (DRENCHED_MAX - 1.0));
+        let filmed = (1.0 - WET_FILM_R_E) * (1.0 - WET_FILM_R_I) * base_color
+            / (Vec3::ONE - WET_FILM_R_I * base_color);
+        s.base_color = mix3(
+            mix3(base_color, filmed, soaked * phi),
+            base_color * DRENCHED_ALBEDO,
+            drenched * phi,
+        );
+        let porous = roughness * (1.0 - WET_GLOSS_BOOST * soaked * phi);
+        let film = (1.0 - phi) * soaked + phi * drenched;
+        s.roughness = mix(porous, porous.min(WET_ROUGHNESS), film);
     }
     if puddle > 0.0 {
         s.roughness = mix(s.roughness, PUDDLE_ROUGHNESS, puddle);
@@ -153,8 +170,33 @@ pub(crate) fn weather_surface(
     s
 }
 
-pub(crate) fn cloud_shadow_ratio(t: f32, camera_transmittance: f32) -> f32 {
+pub(crate) fn wet_canopy(colour: Vec3, wetness: f32) -> Vec3 {
+    if wetness <= 0.0 {
+        return colour;
+    }
+    saturated(colour, 1.0 + WET_LEAF_SATURATE * wetness)
+}
+
+pub(crate) fn saturated(colour: Vec3, s: f32) -> Vec3 {
+    let grey = Vec3::splat(colour.dot(Vec3::new(0.2126, 0.7152, 0.0722)));
+    (grey + (colour - grey) * s).max(Vec3::ZERO)
+}
+
+pub(crate) fn graded(albedo: Vec3, look: Vec4) -> Vec3 {
+    saturated(albedo, look.w.max(0.0)) * look.truncate()
+}
+
+pub(crate) fn canopy_share(colour: Vec3) -> f32 {
+    let sum = colour.x + colour.y + colour.z;
+    if sum <= 1e-6 {
+        return 0.0;
+    }
+    let c = colour / sum;
+    smoothstep(CANOPY_EXG_LOW, CANOPY_EXG_HIGH, 2.0 * c.y - c.x - c.z)
+}
+
+pub(crate) fn cloud_shadow_ratio(t: f32, mean_transmittance: f32) -> f32 {
     let here = 0.25 + 0.75 * t;
-    let camera = (0.25 + 0.75 * camera_transmittance).max(0.01);
-    (here / camera).clamp(0.0, 4.0)
+    let lights = (0.25 + 0.75 * mean_transmittance).max(0.01);
+    (here / lights).clamp(0.0, 4.0)
 }

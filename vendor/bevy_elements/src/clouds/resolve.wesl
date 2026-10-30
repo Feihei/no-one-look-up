@@ -4,7 +4,9 @@
 // See docs/research/clouds.md ("Temporal reprojection").
 
 import bevy_render::view::View;
-import bevy_elements::clouds::common::{CloudParams, ray_dir, shell_range, slot_offset};
+import bevy_elements::clouds::common::{
+    CloudParams, is_orthographic, shell_range, slot_offset, view_ray,
+};
 
 /// Mirrors Bevy's `PreviousViewData`.
 struct PreviousView {
@@ -44,8 +46,16 @@ fn cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
-    let cam = view.world_position;
-    let dir = ray_dir(uv, view.world_from_clip, cam);
+    let ray = view_ray(
+        uv,
+        view.world_from_clip,
+        view.world_position,
+        is_orthographic(view.clip_from_view),
+        params.camera.xyz,
+        params.units.x,
+    );
+    let cam = ray.origin;
+    let dir = ray.dir;
     let big_r = params.camera.w;
     let shell = shell_range(big_r + cam.y, dir.y, params.layer.x, params.layer.y, big_r);
     if shell.y <= shell.x {
@@ -54,7 +64,8 @@ fn cloud_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // Where this pixel's cloud was on the previous screen: the point of the shell it enters.
-    let clip = previous.clip_from_world * vec4<f32>(cam + dir * shell.x, 1.0);
+    // The shell point is in metres; the previous view's matrices take world units.
+    let clip = previous.clip_from_world * vec4<f32>((cam + dir * shell.x) * params.units.x, 1.0);
     let ndc = clip.xy / clip.w;
     if clip.w <= 0.0 || any(abs(ndc) > vec2<f32>(1.0)) {
         textureStore(history_out, vec2<i32>(id.xy), fresh);

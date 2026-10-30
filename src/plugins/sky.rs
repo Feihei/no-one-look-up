@@ -19,9 +19,9 @@ use bevy::prelude::*;
 
 use bevy_elements::{
     CivilDate, Climate, CloudLayer, DustPlugin, ElementsCamera, ElementsPlugins, ElementsSystems,
-    GeoLocation, GroundCoverPlugin, HydrologyPlugin, LightningPlugin, PrecipitationPlugin,
-    TerrainPlugin, WaterPlugin, WeatherDirector, WeatherPreset, WeatheredPlugin, WindPlugin,
-    WorldClock,
+    GeoLocation, GroundCoverPlugin, HydrologyPlugin, LightningPlugin, PathsPlugin,
+    PrecipitationPlugin, RocksPlugin, TerrainPlugin, TrailsPlugin, WaterPlugin, WavesPlugin,
+    WeatherDirector, WeatherPreset, WeatheredPlugin, WindPlugin, WorldClock,
 };
 
 /// A named low-cloud look.
@@ -252,11 +252,17 @@ impl Plugin for SkyPlugin {
                 ElementsPlugins
                     .build()
                     // R1.4: the game has no weather changes — drop everything
-                    // outside climate/celestial/fog/cloud (ADR-0001).
+                    // outside climate/celestial/fog/cloud (ADR-0001). 0.6.0
+                    // added Trails/Paths/Waves/Rocks to the default group; the
+                    // game uses none of them.
                     .disable::<WindPlugin>()
                     .disable::<PrecipitationPlugin>()
                     .disable::<LightningPlugin>()
                     .disable::<DustPlugin>()
+                    .disable::<TrailsPlugin>()
+                    .disable::<PathsPlugin>()
+                    .disable::<WavesPlugin>()
+                    .disable::<RocksPlugin>()
                     .disable::<TerrainPlugin>()
                     .disable::<HydrologyPlugin>()
                     .disable::<WaterPlugin>()
@@ -411,6 +417,7 @@ impl Default for GoldenHourCamera {
         Self {
             elements_camera: ElementsCamera {
                 auto_exposure: false,
+                ..ElementsCamera::default()
             },
             exposure: Exposure {
                 ev100: HeadsUpSky::default().exposure_ev100,
@@ -506,10 +513,16 @@ mod tests {
         0.5 * (1.0 - stratus) * (1.0 - towering) + towering
     }
 
-    /// The shader's dome factor (`common.wesl::cloud_gradient`): 0 = no dome,
-    /// 1 = full "half an egg" rounding. It saturates at `kind >= 0.25`.
+    /// Mirror of the vendored crate's dome ramp (`common.wesl::cloud_gradient`,
+    /// patched): `smoothstep(0.05, 0.55, kind)`. 0 = no dome, 1 = full
+    /// cumulus rounding. Saturation now sits at `kind >= 0.55`; the sheet-like
+    /// kinds keep well clear of it.
     fn dome_strength(kind: f32) -> f32 {
-        (kind * 4.0).clamp(0.0, 1.0)
+        fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+            let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        smoothstep(0.05, 0.55, kind)
     }
 
     #[test]

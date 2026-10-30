@@ -36,7 +36,7 @@ use crate::climate::weathering::update_weathering;
 use crate::climate::{Climate, LAPSE_RATE_C_PER_M, SurfaceWeathering, Weather};
 use crate::gpu::grid::zeroed_buffer;
 use crate::gpu::readback::{ReadbackTick, Readbacks, decode};
-use crate::plugin::{ElementsSystems, ElementsView, ensure_gpu_core};
+use crate::plugin::{ElementsSystems, ElementsUnits, ElementsView, ensure_gpu_core};
 use crate::precipitation::model::{marshall_palmer_lambda, water_weighted_fall_speed};
 use crate::precipitation::{BlockerGpu, PrecipitationBlocker, nearest_blockers};
 use crate::query::EnvironmentSnapshot;
@@ -224,7 +224,7 @@ pub(crate) struct CoverParams {
     wind: Vec4,
     /// x: wetness per mm. y: dry rate, 1/h. z: relative humidity. w: sun factor.
     wet: Vec4,
-    /// x: wind speed for evaporation, m/s.
+    /// x: wind speed for evaporation, m/s. y: `Weather::snow_possible`.
     air: Vec4,
     /// xy: horizontal velocity of falling rain (the wind), m/s. w: its fall speed, m/s.
     rain: Vec4,
@@ -232,6 +232,8 @@ pub(crate) struct CoverParams {
     snow_ray: Vec4,
     /// x: blockers uploaded. z: readback downsample factor.
     flags: UVec4,
+    /// The snowpack `cover_seed` writes: depth (m), SWE (m), wetness.
+    seed: Vec4,
 }
 
 /// This frame's work and the GPU's progress; extracted to the render world every frame.
@@ -263,6 +265,21 @@ pub(crate) struct CoverGpu {
     pub ready: Arc<AtomicBool>,
     /// A first readback kernel has run: the readback buffer holds the maps.
     pub live: Arc<AtomicBool>,
+    /// The seed asked for (extracted with `params.seed`, so the render world never sees a
+    /// request before its parameters) and the last one carried out (render world): the maps are
+    /// set from `params.seed` once whenever `seeded` is behind `seed_epoch`.
+    pub seed_epoch: u64,
+    pub seeded: Arc<AtomicU64>,
+    /// `seed_epoch` for the main world's readback callbacks, which outlive the frame that asked.
+    /// The render world never reads it.
+    pub seed_current: Arc<AtomicU64>,
+}
+
+impl CoverGpu {
+    /// A seed was asked for and has not run yet.
+    pub(crate) fn seed_due(&self) -> bool {
+        self.seeded.load(Ordering::Relaxed) < self.seed_epoch
+    }
 }
 
 /// What the shelter mask was built for; it is rebuilt when this changes.
@@ -286,12 +303,17 @@ struct CoverRuntime {
     shelter_epoch: u64,
     shelter_key: ShelterKey,
     blockers: Vec<BlockerGpu>,
+    /// The snowpack the maps are seeded from (`CoverParams::seed`), and the seed request it is
+    /// for.
+    seed: Vec4,
+    seed_epoch: u64,
 }
 
 /// Ground cover: snow and wetness maps, their kernels and their readback.
 ///
 /// Needs a [`Terrain`](crate::Terrain); idles without one. Inserts, if absent,
-/// [`SnowSettings`], [`WetnessSettings`] and [`CoverStats`]. Add it with
+/// [`SnowSettings`], [`WetnessSettings`], [`CoverStats`], [`Climate`], [`WorldClock`] and
+/// [`SurfaceWeathering`]. Add it with
 /// [`ElementsPlugins`](crate::ElementsPlugins).
 pub struct GroundCoverPlugin;
 
@@ -307,7 +329,14 @@ impl Plugin for GroundCoverPlugin {
             .init_resource::<CoverStats>()
             .init_resource::<Climate>()
             .init_resource::<WorldClock>()
+            .init_resource::<SurfaceWeathering>()
             .init_resource::<CoverRuntime>()
+            .add_systems(
+                Update,
+                seed_from_restored
+                    .before(update_weathering)
+                    .in_set(ElementsSystems::Weather),
+            )
             .add_systems(
                 Update,
                 (ensure_cover, run_cover)
@@ -335,11 +364,13 @@ fn readback_downsample(size: UVec2) -> u32 {
 }
 
 /// Create the cover layers when a terrain appears or is rebuilt, and drop everything when it
-/// goes.
+/// goes. New layers are seeded from the point snowpack of [`SurfaceWeathering`].
+#[allow(clippy::too_many_arguments)]
 fn ensure_cover(
     mut commands: Commands,
     terrain: Option<Res<TerrainState>>,
     gpu: Option<Res<CoverGpu>>,
+    ground: Res<SurfaceWeathering>,
     mut runtime: ResMut<CoverRuntime>,
     mut stats: ResMut<CoverStats>,
     mut snapshot: ResMut<EnvironmentSnapshot>,
@@ -368,6 +399,8 @@ fn ensure_cover(
     *runtime = CoverRuntime {
         built_for: Some(terrain.water.id()),
         shelter_epoch: 1,
+        seed: ground.pack_seed(),
+        seed_epoch: 1,
         ..CoverRuntime::default()
     };
     *stats = CoverStats::default();
@@ -397,7 +430,30 @@ fn ensure_cover(
         dropped: Arc::new(AtomicU64::new(0)),
         ready: Arc::new(AtomicBool::new(false)),
         live: Arc::new(AtomicBool::new(false)),
+        seed_epoch: 1,
+        seeded: Arc::new(AtomicU64::new(0)),
+        seed_current: Arc::new(AtomicU64::new(1)),
     });
+}
+
+/// A [`SurfaceWeathering`] read back from a save re-seeds existing layers from its snowpack, and
+/// the map's readback of the snow it replaces is dropped (`docs/research/snow-season.md`).
+fn seed_from_restored(
+    ground: Res<SurfaceWeathering>,
+    gpu: Option<Res<CoverGpu>>,
+    mut runtime: ResMut<CoverRuntime>,
+    mut snapshot: ResMut<EnvironmentSnapshot>,
+) {
+    // Layers built later are seeded from the pack when they are created.
+    if !ground.is_restored() || gpu.is_none() {
+        return;
+    }
+    runtime.seed = ground.pack_seed();
+    runtime.seed_epoch += 1;
+    // The seeded layers start on the loaded clock: no catch-up across the gap since the save.
+    runtime.last_hours = None;
+    runtime.pending_s = 0.0;
+    snapshot.cover = None;
 }
 
 /// Schedule this frame's steps and fill the uniform.
@@ -413,13 +469,14 @@ fn run_cover(
     time: Res<Time<Real>>,
     tick: Res<ReadbackTick>,
     terrain: Option<Res<TerrainState>>,
-    terrain_gpu: Option<Res<TerrainGpu>>,
+    terrain_gpu: Option<ResMut<TerrainGpu>>,
     gpu: Option<ResMut<CoverGpu>>,
     mut runtime: ResMut<CoverRuntime>,
     mut stats: ResMut<CoverStats>,
     blockers: Query<(Entity, &PrecipitationBlocker, &GlobalTransform)>,
+    units: Res<ElementsUnits>,
 ) {
-    let (Some(terrain), Some(terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
+    let (Some(terrain), Some(mut terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
         return;
     };
     let grid = terrain.grid;
@@ -454,7 +511,7 @@ fn run_cover(
     let selected = nearest_blockers(
         view.position,
         blockers.iter().filter_map(|(entity, blocker, transform)| {
-            BlockerGpu::new(blocker.half_extents, transform).map(|b| (entity, b))
+            BlockerGpu::new(blocker.half_extents, &units.to_metres(transform)).map(|b| (entity, b))
         }),
     );
     if runtime.blockers != selected {
@@ -523,11 +580,16 @@ fn run_cover(
             weather.relative_humidity,
             sun_factor,
         ),
-        air: Vec4::new(weather.wind_speed_ms, 0.0, 0.0, 0.0),
+        air: Vec4::new(weather.wind_speed_ms, weather.snow_possible, 0.0, 0.0),
         rain: ray(wind, rain_fall),
         snow_ray: ray(wind, SNOW_FALL_SPEED_MS),
         flags: UVec4::new(runtime.blockers.len() as u32, 0, gpu.readback_ds, 0),
+        seed: runtime.seed,
     };
+    // The request travels with its parameters, so the render world never acts on one early.
+    gpu.seed_epoch = runtime.seed_epoch;
+    gpu.seed_current
+        .store(runtime.seed_epoch, Ordering::Relaxed);
     gpu.steps = steps;
     gpu.drift_on = snow.drift && weather.wind_speed_ms * 2.0 > snow.drift_threshold_ms;
     // Never an empty binding: the count says how many entries are real.
@@ -537,10 +599,10 @@ fn run_cover(
         runtime.blockers.clone()
     };
     gpu.shelter_epoch = runtime.shelter_epoch;
-    gpu.downsample = tick.is_due() || !gpu.live.load(Ordering::Relaxed);
+    gpu.downsample = tick.is_due() || !gpu.live.load(Ordering::Relaxed) || gpu.seed_due();
     if steps > 0 {
         // The terrain pack publishes the melt to the render buffer's water depth.
-        terrain_gpu.dirty.store(true, Ordering::Relaxed);
+        terrain_gpu.changes += 1;
     }
 }
 
@@ -554,7 +616,8 @@ fn read_cover(
     let (Some(terrain), Some(gpu)) = (terrain, gpu) else {
         return;
     };
-    if !gpu.live.load(Ordering::Relaxed) || !tick.is_due() {
+    // Not before a pending seed: the maps would still hold the snow it replaces.
+    if !gpu.live.load(Ordering::Relaxed) || !tick.is_due() || gpu.seed_due() {
         return;
     }
     let ds = gpu.readback_ds;
@@ -565,10 +628,16 @@ fn read_cover(
         ..grid
     };
     let expected = (read_grid.size.x * read_grid.size.y) as usize;
+    // A readback in flight across a seed reads the replaced snow: dropped.
+    let epoch = gpu.seed_epoch;
+    let current = gpu.seed_current.clone();
     readbacks.request(
         "cover_maps",
         gpu.readback.clone(),
         move |bytes, snapshot| {
+            if current.load(Ordering::Relaxed) != epoch {
+                return;
+            }
             let Some(cells) = decode::<[f32; 2]>(bytes) else {
                 return;
             };

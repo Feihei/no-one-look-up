@@ -7,7 +7,7 @@
 //! the shader's march on a flat shell. The GPU tests of `gpu.rs` compare the kernels with these
 //! functions.
 
-use bevy::math::{DVec3, Vec3};
+use bevy::math::{DVec3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::gpu::noise_mirror::{cloud_base_at, cloud_coverage_field, cloud_detail_at};
 
@@ -35,11 +35,16 @@ const WEATHER_TEXELS: usize = 512;
 /// Soft edge and dome width of the coverage threshold, field units (`weather.wesl`).
 const SOFT_EDGE: f64 = 0.18;
 const DOME_WIDTH: f64 = 0.37;
-const BASE_TILE_M: f64 = 8192.0;
-const DETAIL_TILE_M: f64 = 1024.0;
+const BASE_TILE_M: f64 = 4096.0;
+const DETAIL_TILE_M: f64 = 640.0;
 const WIND_SKEW_M: f64 = 500.0;
 const DETAIL_EROSION: f64 = 0.2;
 const MIN_HEIGHT_SCALE: f64 = 0.3;
+/// The cumuliform density of `common.wesl` (`docs/research/cumulus-shape.md`).
+const CUMULUS_BASE_RISE: f64 = 0.06;
+const CUMULUS_TOP_ROUND: f64 = 0.25;
+const CUMULUS_EDGE_HEIGHT: f64 = 0.45;
+const CORE_PROFILE: f64 = 0.75;
 const MAX_MARCH_M: f64 = 32_000.0;
 const FADE_START_M: f64 = 16_000.0;
 const EMPTY_LIMIT: u32 = 10;
@@ -71,66 +76,29 @@ fn hg(cos_t: f64, g: f64) -> f64 {
     (1.0 - g2) / (4.0 * PI * (1.0 + g2 - 2.0 * g * cos_t).powf(1.5))
 }
 
-/// The dual lobe with both anisotropies scaled by `c_pow`: forward lobe (g = 0.8) weighted 0.7,
-/// backward lobe (g = −0.5) weighted 0.3.
-fn dual_lobe(cos_t: f64, c_pow: f64) -> f64 {
-    0.7 * hg(cos_t, 0.8 * c_pow) + 0.3 * hg(cos_t, -0.5 * c_pow)
+/// `phase` of `common.wesl`: the single-scattering dual lobe, forward lobe (g = 0.8) weighted
+/// 0.7, backward lobe (g = −0.5) weighted 0.3.
+pub(crate) fn phase(cos_t: f64) -> f64 {
+    0.7 * hg(cos_t, 0.8) + 0.3 * hg(cos_t, -0.5)
 }
 
-/// Phase function of octave `n` of the multiple-scattering sum with `c = 0.5`.
-pub(crate) fn phase_octave(cos_theta: f64, octave: u32) -> f64 {
-    phase_octave_with(cos_theta, octave, 0.5)
-}
+/// Diffusion's extrapolation length in optical depths, `2 / (3 (1 − g))` with `g = 0.8`
+/// (`march.wesl`; `cloud-lighting.md`).
+pub(crate) const DIFFUSE_EXTRAPOLATION: f64 = 10.0 / 3.0;
+/// Albedo of the diffuse source, fitted to the Monte Carlo slabs.
+pub(crate) const DIFFUSE_ALBEDO: f64 = 0.68;
+/// How far behind a sample (away from the light) the cloud behind it is sampled, m; the sample
+/// stands for twice this.
+const BELOW_M: f64 = 300.0;
 
-/// Phase function of octave `n` with the anisotropy factor `c` per octave.
-fn phase_octave_with(cos_theta: f64, octave: u32, c: f64) -> f64 {
-    dual_lobe(cos_theta, c.powi(octave as i32))
-}
-
-/// The Wrenninge multiple-scattering octave sum: octave `n` scatters `a^n`, is attenuated by
-/// `exp(-b^n τ)` and has the phase of anisotropy `c^n`. Energy conservation needs `a ≤ b`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct MultiScatter {
-    a: f64,
-    b: f64,
-    c: f64,
-}
-
-impl MultiScatter {
-    /// The note's values, `a = b = c = 0.5`.
-    pub(crate) const PLAN: Self = Self {
-        a: 0.5,
-        b: 0.5,
-        c: 0.5,
-    };
-
-    /// `None` unless `0 ≤ a ≤ b ≤ 1` and `0 ≤ c ≤ 1`: with `a > b` a deeper octave would scatter
-    /// more than it is attenuated and the sum could return more light than arrives.
-    pub(crate) fn new(a: f64, b: f64, c: f64) -> Option<Self> {
-        let ok = (0.0..=1.0).contains(&a)
-            && (0.0..=1.0).contains(&b)
-            && (0.0..=1.0).contains(&c)
-            && a <= b;
-        ok.then_some(Self { a, b, c })
-    }
-
-    /// The octave sum without the energy rule, for the test that shows why the rule exists.
-    fn unchecked(a: f64, b: f64, c: f64) -> Self {
-        Self { a, b, c }
-    }
-
-    /// Source of the sum per unit of incoming light: light-path optical depth `tau`, phase
-    /// cosine `cos_theta`, `powder` multiplying octave 0 (1 when off).
-    pub(crate) fn sum(&self, octaves: u32, tau: f64, cos_theta: f64, powder: f64) -> f64 {
-        (0..octaves)
-            .map(|n| {
-                let octave = self.a.powi(n as i32)
-                    * (-self.b.powi(n as i32) * tau).exp()
-                    * phase_octave_with(cos_theta, n, self.c);
-                if n == 0 { octave * powder } else { octave }
-            })
-            .sum()
-    }
+/// `cloud_scatter` of `march.wesl` per unit of the light's illuminance, without the ambient:
+/// single scattering `powder · e^{−τ_l} p(θ)` plus the diffuse fluence of a conservative slab
+/// between extrapolated boundaries, `α √μ_l / π · (τ_b + z) / (τ_l + τ_b + 2z)`.
+pub(crate) fn scatter_source(tau_l: f64, tau_b: f64, mu_l: f64, cos_t: f64, powder: f64) -> f64 {
+    let z = DIFFUSE_EXTRAPOLATION;
+    let diffuse =
+        DIFFUSE_ALBEDO / PI * mu_l.max(0.0).sqrt() * (tau_b + z) / (tau_l + tau_b + 2.0 * z);
+    powder * (-tau_l).exp() * phase(cos_t) + diffuse
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -262,6 +230,67 @@ pub(crate) fn eroded_coverage(r: f64, f: f64, kind: f64) -> f64 {
     r.powf(coverage_exponent(f, kind))
 }
 
+/// `cumuliform`: weight of the cumuliform density, 0 for stratus up to type 0.25, 1 from
+/// cumulus (0.5) up.
+pub(crate) fn cumuliform(kind: f64) -> f64 {
+    (4.0 * kind - 1.0).clamp(0.0, 1.0)
+}
+
+/// `cumulus_envelope`: the rounded top, full up to `CUMULUS_TOP_ROUND` of the blob's height
+/// `s = mix(CUMULUS_EDGE_HEIGHT, 1, √dome)` and 0 from `s` up, C¹.
+pub(crate) fn cumulus_envelope(f: f64, dome: f64) -> f64 {
+    let s = mix(CUMULUS_EDGE_HEIGHT, 1.0, dome.sqrt());
+    1.0 - smoothstep(s * CUMULUS_TOP_ROUND, s, f)
+}
+
+/// `cumulus_base`: the flat base, a factor on the eroded density.
+pub(crate) fn cumulus_base(f: f64) -> f64 {
+    smoothstep(0.0, CUMULUS_BASE_RISE, f)
+}
+
+/// `cumulus_profile`: the dimensional profile, the top times the eroded coverage times the
+/// convective cell (the base texture's G channel), whose gaps close as `cover⁴` → 1.
+pub(crate) fn cumulus_profile(f: f64, dome: f64, r: f64, cell: f64, cover: f64) -> f64 {
+    let closed = cover.clamp(0.0, 1.0).powi(4);
+    let gaps = mix(CORE_PROFILE * smoothstep(0.25, 0.65, cell), 1.0, closed);
+    cumulus_envelope(f, dome) * r * gaps
+}
+
+/// `billow_weight`: wispy at the base, billowy above it.
+fn billow_weight(f: f64) -> f64 {
+    smoothstep(0.05, 0.25, f)
+}
+
+/// `noise_composite` of the base Perlin-Worley `shape`, the base Worley octaves `lf` and the
+/// detail octaves `hf`.
+pub(crate) fn noise_composite(f: f64, shape: f64, lf: f64, hf: f64) -> f64 {
+    let wispy = 0.6 * shape + 0.4 * (1.0 - hf);
+    let billowy = 0.5 * shape + 0.3 * lf + 0.2 * hf;
+    mix(wispy, billowy, billow_weight(f))
+}
+
+/// `noise_bound`: the largest `noise_composite` any detail value gives.
+pub(crate) fn noise_bound(f: f64, shape: f64, lf: f64) -> f64 {
+    mix(
+        0.6 * shape + 0.4,
+        0.5 * shape + 0.3 * lf + 0.2,
+        billow_weight(f),
+    )
+}
+
+/// `value_erosion`: `√saturate((noise − (1 − d)) / d)`, 0 for `d ≤ 0`.
+pub(crate) fn value_erosion(noise: f64, d: f64) -> f64 {
+    if d <= 0.0 {
+        return 0.0;
+    }
+    ((noise - (1.0 - d)) / d).clamp(0.0, 1.0).sqrt()
+}
+
+/// `detail_weight`: how much of the detail noise a fine step of `dt` metres resolves.
+pub(crate) fn detail_weight(dt: f64) -> f64 {
+    1.0 - smoothstep(DETAIL_TILE_M / 8.0, DETAIL_TILE_M / 4.0, dt)
+}
+
 /// Field value of the weather map at a world position, `[0, 1]`: the position is wrapped to the
 /// field's 32 km period in `f64` first, so the `f32` field keeps its precision at any drift.
 fn field_at(xz: [f64; 2], drift: [f64; 2]) -> f64 {
@@ -307,7 +336,7 @@ pub(crate) fn coverage_threshold(cover: f64, drift: [f64; 2]) -> f64 {
     threshold_of(&sorted_field(drift), cover)
 }
 
-/// What `cloud_medium` reads from the weather map at a point.
+/// What `cloud_medium` reads from the weather map and the base noise at a point.
 struct ShapeSample {
     /// Height fraction in the layer.
     f: f64,
@@ -315,8 +344,26 @@ struct ShapeSample {
     lean: [f64; 2],
     /// Coverage `r`, `(0, 1]`.
     coverage: f64,
-    /// Base shape times the height gradient, `S · G`.
-    shape: f64,
+    /// Dome factor (the weather map's A channel).
+    dome: f64,
+    /// Base Perlin-Worley shape `S`.
+    base_shape: f64,
+    /// Base Worley octaves `lf`.
+    lf: f64,
+    /// The base texture's G channel: the convective cell.
+    cell: f64,
+}
+
+impl ShapeSample {
+    /// The stratiform base shape times the height gradient, `S · G`.
+    fn stratiform_shape(&self, kind: f64) -> f64 {
+        self.base_shape * cloud_gradient(self.f, kind, self.dome)
+    }
+
+    /// The cumuliform dimensional profile at eroded coverage `r` under the weather's `cover`.
+    fn profile(&self, r: f64, cover: f64) -> f64 {
+        cumulus_profile(self.f, self.dome, r, self.cell, cover)
+    }
 }
 
 /// The cloud layer and weather of a mirror evaluation.
@@ -403,12 +450,14 @@ impl MirrorParams {
         ))
         .map(f64::from);
         let lf = 0.625 * b[1] + 0.25 * b[2] + 0.125 * b[3];
-        let base_shape = ((b[0] + 1.0 - lf) / (2.0 - lf)).clamp(0.0, 1.0);
         Some(ShapeSample {
             f,
             lean,
             coverage,
-            shape: base_shape * cloud_gradient(f, self.kind, dome),
+            dome,
+            base_shape: ((b[0] + 1.0 - lf) / (2.0 - lf)).clamp(0.0, 1.0),
+            lf,
+            cell: b[1],
         })
     }
 
@@ -419,33 +468,53 @@ impl MirrorParams {
     }
 
     /// Mirror of `cloud_medium`: extinction σ_t, m⁻¹, and the precipitation darkening g at
-    /// altitude `h` over `xz`; the detail noise erodes the edges when `detail`.
-    pub(crate) fn medium(&self, h: f64, xz: [f64; 2], detail: bool) -> (f64, f64) {
+    /// altitude `h` over `xz`; `detail` (0–1) is how much of the detail noise is resolved.
+    pub(crate) fn medium(&self, h: f64, xz: [f64; 2], detail: f64) -> (f64, f64) {
         let Some(s) = self.shape_at(h, xz) else {
             return (0.0, 0.0);
         };
         let r = eroded_coverage(s.coverage, s.f, self.kind);
-        let mut rho = ((s.shape - (1.0 - r)) / r.max(1e-4)).clamp(0.0, 1.0) * r;
-        if detail && rho > 0.0 {
+        // Without the detail tap the detail octaves take their mean.
+        let mut raw_hf = 0.5;
+        if detail > 0.0 {
             let d = cloud_detail_at(Self::noise_coordinate(
                 (s.lean[0] - self.drift[0]) / DETAIL_TILE_M,
                 h / DETAIL_TILE_M,
                 (s.lean[1] - self.drift[1]) / DETAIL_TILE_M,
             ))
             .map(f64::from);
-            let hf = 0.625 * d[0] + 0.25 * d[1] + 0.125 * d[2];
-            let wispy = mix(hf, 1.0 - hf, (10.0 * s.f).clamp(0.0, 1.0));
-            let lo = DETAIL_EROSION * wispy;
-            rho = ((rho - lo) / (1.0 - lo)).clamp(0.0, 1.0);
+            raw_hf = 0.625 * d[0] + 0.25 * d[1] + 0.125 * d[2];
         }
-        (sigma_peak(self.kind) * rho, self.precipitation * s.coverage)
+        let hf = mix(0.5, raw_hf, detail);
+        let k = cumuliform(self.kind);
+        let mut stratiform = 0.0;
+        if k < 1.0 {
+            stratiform =
+                ((s.stratiform_shape(self.kind) - (1.0 - r)) / r.max(1e-4)).clamp(0.0, 1.0) * r;
+            if detail > 0.0 && stratiform > 0.0 {
+                let wispy = mix(raw_hf, 1.0 - raw_hf, (10.0 * s.f).clamp(0.0, 1.0));
+                let lo = DETAIL_EROSION * wispy;
+                stratiform = ((stratiform - lo) / (1.0 - lo)).clamp(0.0, 1.0);
+            }
+        }
+        let mut cumulus = 0.0;
+        if k > 0.0 {
+            cumulus = value_erosion(
+                noise_composite(s.f, s.base_shape, s.lf, hf),
+                s.profile(r, self.cover),
+            ) * cumulus_base(s.f);
+        }
+        (
+            sigma_peak(self.kind) * mix(stratiform, cumulus, k),
+            self.precipitation * s.coverage,
+        )
     }
 }
 
 /// Extinction and precipitation darkening of the density mirror with the detail noise on, at
 /// altitude `altitude_m` over world `xz`.
 pub(crate) fn density(altitude_m: f64, xz: [f64; 2], p: &MirrorParams) -> (f64, f64) {
-    p.medium(altitude_m, xz, true)
+    p.medium(altitude_m, xz, 1.0)
 }
 
 /// Vertical optical depth `τ_col = ∫ σ_t dh` through the layer over `xz`, midpoint rule with
@@ -453,7 +522,7 @@ pub(crate) fn density(altitude_m: f64, xz: [f64; 2], p: &MirrorParams) -> (f64, 
 pub(crate) fn column_optical_depth(p: &MirrorParams, xz: [f64; 2], steps: u32) -> f64 {
     let dh = (p.top_m - p.base_m) / f64::from(steps);
     (0..steps)
-        .map(|k| p.medium(p.base_m + (f64::from(k) + 0.5) * dh, xz, true).0 * dh)
+        .map(|k| p.medium(p.base_m + (f64::from(k) + 0.5) * dh, xz, 1.0).0 * dh)
         .sum()
 }
 
@@ -470,7 +539,7 @@ pub(crate) trait Medium {
     /// `coarse_shape`: the base-shape term `S′·r′`, 0 outside cloud.
     fn coarse(&self, altitude: f64, xz: [f64; 2]) -> f64;
     /// `cloud_medium`: (σ_t, g).
-    fn sample(&self, altitude: f64, xz: [f64; 2], detail: bool) -> (f64, f64);
+    fn sample(&self, altitude: f64, xz: [f64; 2], detail: f64) -> (f64, f64);
 }
 
 impl Medium for MirrorParams {
@@ -484,11 +553,22 @@ impl Medium for MirrorParams {
 
     fn coarse(&self, altitude: f64, xz: [f64; 2]) -> f64 {
         self.shape_at(altitude, xz).map_or(0.0, |s| {
-            s.shape * eroded_coverage(s.coverage, s.f, self.kind)
+            let r = eroded_coverage(s.coverage, s.f, self.kind);
+            let k = cumuliform(self.kind);
+            let mut stratiform = 0.0;
+            if k < 1.0 {
+                stratiform = s.stratiform_shape(self.kind) * r;
+            }
+            let mut cumulus = 0.0;
+            if k > 0.0 {
+                cumulus = (noise_bound(s.f, s.base_shape, s.lf) - (1.0 - s.profile(r, self.cover)))
+                    .max(0.0);
+            }
+            mix(stratiform, cumulus, k)
         })
     }
 
-    fn sample(&self, altitude: f64, xz: [f64; 2], detail: bool) -> (f64, f64) {
+    fn sample(&self, altitude: f64, xz: [f64; 2], detail: f64) -> (f64, f64) {
         self.medium(altitude, xz, detail)
     }
 }
@@ -523,7 +603,7 @@ impl Medium for Slab {
         if self.contains(altitude) { 1.0 } else { 0.0 }
     }
 
-    fn sample(&self, altitude: f64, _xz: [f64; 2], _detail: bool) -> (f64, f64) {
+    fn sample(&self, altitude: f64, _xz: [f64; 2], _detail: f64) -> (f64, f64) {
         if self.contains(altitude) {
             (self.sigma, 0.0)
         } else {
@@ -548,21 +628,16 @@ pub(crate) struct Scene {
     pub(crate) sun: f64,
     /// Ambient source term `E_d / 2π`, cd/m².
     pub(crate) ambient: f64,
-    /// Whether the powder term darkens octave 0.
+    /// Whether the powder term darkens single scattering.
     pub(crate) powder: bool,
     /// Primary steps Q.
     pub(crate) steps: u32,
     /// Jitter of the first sample inside its step, 0–1.
     pub(crate) jitter: f64,
-    /// Octaves of multiple scattering.
-    pub(crate) octaves: u32,
-    /// The octave weights.
-    pub(crate) scatter: MultiScatter,
 }
 
 impl Scene {
-    /// Full sun, no ambient, powder on, 64 steps, three octaves of the plan's multiple
-    /// scattering; the phase cosine is that of `dir` and `light`.
+    /// Full sun, no ambient, powder on, 64 steps; the phase cosine is that of `dir` and `light`.
     pub(crate) fn new(camera: DVec3, dir: DVec3, light: DVec3) -> Self {
         let (dir, light) = (dir.normalize(), light.normalize());
         Self {
@@ -575,8 +650,6 @@ impl Scene {
             powder: true,
             steps: 64,
             jitter: 0.5,
-            octaves: 3,
-            scatter: MultiScatter::PLAN,
         }
     }
 }
@@ -589,6 +662,31 @@ pub(crate) struct Marched {
     pub(crate) radiance: f64,
     /// Transmittance of the cloud along the ray when the march ended.
     pub(crate) transmittance: f64,
+}
+
+/// Mirror of `view_ray` of `common.wesl`: the origin and unit direction, in metres, of the ray
+/// through screen position `uv` (0–1, top-left origin) of a view whose matrices are in world
+/// units, `units` of them to the metre. A perspective view's starts at the eye `cam` (world);
+/// an orthographic view's runs along the view direction from the pixel's point on the plane
+/// through `focus` (metres) across it.
+pub(crate) fn view_ray(
+    uv: Vec2,
+    world_from_clip: Mat4,
+    cam: Vec3,
+    orthographic: bool,
+    focus: Vec3,
+    units: f32,
+) -> (Vec3, Vec3) {
+    let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let n = world_from_clip * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+    let on_near = n.truncate() / n.w / units;
+    if orthographic {
+        let m = world_from_clip * Vec4::new(ndc.x, ndc.y, 0.5, 1.0);
+        let dir = (m.truncate() / m.w / units - on_near).normalize();
+        return (on_near + dir * (focus - on_near).dot(dir), dir);
+    }
+    let eye = cam / units;
+    (eye, (on_near - eye).normalize())
 }
 
 /// Where a ray from altitude `y` with vertical component `dy` is between two altitudes (the
@@ -624,10 +722,18 @@ fn light_optical_depth(off: DVec3, light: DVec3, camera: DVec3, medium: &impl Me
         let phi = 2.399_963_23 * (j + 1) as f64;
         let perp = phi.cos() * e1 + phi.sin() * e2;
         let o = off + light * dist + perp * (CONE_TAN * dist);
-        let (sigma, g) = medium.sample(camera.y + o.y, [camera.x + o.x, camera.z + o.z], false);
+        let (sigma, g) = medium.sample(camera.y + o.y, [camera.x + o.x, camera.z + o.z], 0.0);
         tau += (1.0 + g) * sigma * len;
     }
     tau
+}
+
+/// `below_optical_depth` of `march.wesl`: one base-shape sample [`BELOW_M`] behind the point
+/// along the light, standing for twice that, times `1 + g`.
+fn below_optical_depth(off: DVec3, light: DVec3, camera: DVec3, medium: &impl Medium) -> f64 {
+    let o = off - light * BELOW_M;
+    let (sigma, g) = medium.sample(camera.y + o.y, [camera.x + o.x, camera.z + o.z], 0.0);
+    (1.0 + g) * sigma * 2.0 * BELOW_M
 }
 
 /// Mirror of the fine march of `march.wesl` (coarse and fine phases, early exit, per-sample
@@ -669,7 +775,7 @@ pub(crate) fn march(scene: &Scene, medium: &impl Medium) -> Marched {
             }
             continue;
         }
-        let (mut sigma, _) = medium.sample(h, xz, true);
+        let (mut sigma, _) = medium.sample(h, xz, detail_weight(dt));
         sigma *= 1.0 - smoothstep(FADE_START_M, MAX_MARCH_M, t);
         if sigma <= 0.0 {
             empty += 1;
@@ -684,96 +790,29 @@ pub(crate) fn march(scene: &Scene, medium: &impl Medium) -> Marched {
         let seg = (t1 - (t - dt * scene.jitter)).clamp(0.0, dt);
         let step_t = (-sigma * seg).exp();
         let tau_l = light_optical_depth(off, scene.light, scene.camera, medium);
+        let tau_b = below_optical_depth(off, scene.light, scene.camera, medium);
         let powder = if scene.powder {
             mix(1.0, 1.0 - (-2.0 * tau_l).exp(), powder_weight)
         } else {
             1.0
         };
-        let mut source = scene.sun
-            * scene
-                .scatter
-                .sum(scene.octaves, tau_l, scene.cos_theta, powder);
+        let mut source =
+            scene.sun * scatter_source(tau_l, tau_b, scene.light.y, scene.cos_theta, powder);
         let f = (h - medium.base_m()) / (medium.top_m() - medium.base_m());
         source += scene.ambient * (AMBIENT_BOTTOM + (1.0 - AMBIENT_BOTTOM) * f);
         radiance += transmittance * source * (1.0 - step_t);
         transmittance *= step_t;
         t += dt;
     }
+    // An exhausted march is opaque (march.wesl; broken-cloud-light.md, Model 4).
+    if transmittance < MIN_TRANSMITTANCE {
+        radiance /= 1.0 - transmittance;
+        transmittance = 0.0;
+    }
     Marched {
         radiance,
         transmittance,
     }
-}
-
-/// Thickness of the slab of the slab tests, m.
-pub(crate) const SLAB_THICKNESS_M: f64 = 900.0;
-
-/// The scene and medium of the analytic slab of Validation 5: a homogeneous slab of thickness
-/// [`SLAB_THICKNESS_M`] and optical depth `sigma_h` seen along its normal, lit by a light whose
-/// direction makes cosine `mu_s` with the normal; the phase function is evaluated at
-/// `cos_theta` whatever the two directions are. Ambient and powder off, atmosphere
-/// transmittance 1, unit illuminance, 64 steps.
-pub(crate) fn slab_case(
-    sigma_h: f64,
-    mu_s: f64,
-    cos_theta: f64,
-    octaves: u32,
-    a: f64,
-    b: f64,
-    c: f64,
-) -> (Scene, Slab) {
-    let slab = Slab {
-        sigma: sigma_h / SLAB_THICKNESS_M,
-        base_m: 1500.0,
-        top_m: 1500.0 + SLAB_THICKNESS_M,
-    };
-    let light = DVec3::new((1.0 - mu_s * mu_s).max(0.0).sqrt(), mu_s, 0.0);
-    let mut scene = Scene::new(DVec3::new(0.0, slab.base_m, 0.0), DVec3::Y, light);
-    scene.cos_theta = cos_theta;
-    scene.sun = 1.0;
-    scene.powder = false;
-    scene.octaves = octaves;
-    scene.scatter = MultiScatter::unchecked(a, b, c);
-    (scene, slab)
-}
-
-/// `L / E` of the homogeneous slab of [`slab_case`] by the shader's integrator at Q = 64.
-pub(crate) fn slab_radiance(
-    sigma_h: f64,
-    mu_s: f64,
-    cos_theta: f64,
-    octaves: u32,
-    a: f64,
-    b: f64,
-    c: f64,
-) -> f64 {
-    let (scene, slab) = slab_case(sigma_h, mu_s, cos_theta, octaves, a, b, c);
-    march(&scene, &slab).radiance
-}
-
-/// The closed form of the slab (Validation 5): octave `n` contributes
-/// `a^n p_n(θ) e^{-q σH} (1 − e^{-σH (1 − q)}) / (1 − q)` with `q = b^n / μ_s`, which for
-/// `μ_s = 1` is `σH e^{-σH}` at octave 0 and the note's expression at the others.
-pub(crate) fn slab_closed_form(
-    sigma_h: f64,
-    mu_s: f64,
-    cos_theta: f64,
-    octaves: u32,
-    a: f64,
-    b: f64,
-    c: f64,
-) -> f64 {
-    (0..octaves)
-        .map(|n| {
-            let q = b.powi(n as i32) / mu_s;
-            let integral = if (1.0 - q).abs() < 1e-9 {
-                sigma_h * (-q * sigma_h).exp()
-            } else {
-                (-q * sigma_h).exp() * (1.0 - (-sigma_h * (1.0 - q)).exp()) / (1.0 - q)
-            };
-            a.powi(n as i32) * phase_octave_with(cos_theta, n, c) * integral
-        })
-        .sum()
 }
 
 #[cfg(test)]
@@ -900,160 +939,270 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // view-anchor.md Validation 3: the rays of both projections
+    // -----------------------------------------------------------------------------------------
+
+    /// `world_from_clip` of a camera at `eye` looking at `at`, through `projection` on a 16:9
+    /// target.
+    fn world_from_clip(projection: bevy::camera::Projection, eye: Vec3, at: Vec3) -> Mat4 {
+        let mut projection = projection;
+        projection.update(1920.0, 1080.0);
+        let world_from_view = bevy::prelude::Transform::from_translation(eye)
+            .looking_at(at, Vec3::Y)
+            .to_matrix();
+        world_from_view * projection.get_clip_from_view().inverse()
+    }
+
+    /// Under an orthographic projection the rays of two pixels start at different points of the
+    /// plane through the focus across the view and share the view direction, and without a focus
+    /// the plane is the camera's own; under a perspective one they start at the eye and differ in
+    /// direction (issue #7).
+    #[test]
+    fn orthographic_rays_are_parallel_and_perspective_rays_share_the_eye() {
+        use bevy::camera::{
+            OrthographicProjection, PerspectiveProjection, Projection, ScalingMode,
+        };
+        let (eye, focus) = (Vec3::new(0.0, 860.4, 1228.7), Vec3::ZERO);
+        let forward = (focus - eye).normalize();
+        let ortho = world_from_clip(
+            Projection::from(OrthographicProjection {
+                scaling_mode: ScalingMode::FixedVertical {
+                    viewport_height: 80.0,
+                },
+                far: 4000.0,
+                ..OrthographicProjection::default_3d()
+            }),
+            eye,
+            focus,
+        );
+        let (a, b) = (Vec2::new(0.1, 0.2), Vec2::new(0.9, 0.7));
+        let (oa, da) = view_ray(a, ortho, eye, true, focus, 1.0);
+        let (ob, db) = view_ray(b, ortho, eye, true, focus, 1.0);
+        assert!(oa.distance(ob) > 10.0, "{oa} {ob}");
+        assert!(
+            da.distance(db) < 1e-5 && da.distance(forward) < 1e-5,
+            "{da} {db} {forward}"
+        );
+        // The origins lie on the plane through the focus across the view direction.
+        assert!((oa - focus).dot(forward).abs() < 1e-2 && (ob - focus).dot(forward).abs() < 1e-2);
+        // Without a focus (it is the camera) they lie on the camera's own plane.
+        let (own, _) = view_ray(a, ortho, eye, true, eye, 1.0);
+        assert!((own - eye).dot(forward).abs() < 1e-2 && own.distance(oa) > 1000.0);
+
+        let persp = world_from_clip(
+            Projection::from(PerspectiveProjection::default()),
+            eye,
+            focus,
+        );
+        let (pa, ea) = view_ray(a, persp, eye, false, focus, 1.0);
+        let (pb, eb) = view_ray(b, persp, eye, false, focus, 1.0);
+        assert_eq!((pa, pb), (eye, eye));
+        assert!(ea.distance(eb) > 0.1 && (ea.length() - 1.0).abs() < 1e-5);
+        // The centre of the screen looks along the view direction in both (a perspective ray is
+        // the difference of the eye and a point 0.1 m from it, in f32 1500 m out: 1e-3), and an
+        // orthographic one starts at the focus.
+        let centre = Vec2::splat(0.5);
+        assert!(
+            view_ray(centre, persp, eye, false, focus, 1.0)
+                .1
+                .distance(forward)
+                < 1e-3
+        );
+        assert!(
+            view_ray(centre, ortho, eye, true, focus, 1.0)
+                .0
+                .distance(focus)
+                < 1e-2
+        );
+    }
+
+    /// The same scene built in feet (the camera, and so every matrix, ×3.2808) gives the same
+    /// rays in metres: the same origin and direction under both projections.
+    #[test]
+    fn a_view_in_feet_gives_the_metre_rays_of_the_same_scene() {
+        use bevy::camera::{
+            OrthographicProjection, PerspectiveProjection, Projection, ScalingMode,
+        };
+        let u = 3.2808_f32;
+        let (eye, focus) = (Vec3::new(0.0, 860.4, 1228.7), Vec3::ZERO);
+        let uv = Vec2::new(0.3, 0.6);
+        for (projection, orthographic) in [
+            (
+                Projection::from(OrthographicProjection {
+                    scaling_mode: ScalingMode::FixedVertical {
+                        viewport_height: 80.0,
+                    },
+                    far: 4000.0,
+                    ..OrthographicProjection::default_3d()
+                }),
+                true,
+            ),
+            (Projection::from(PerspectiveProjection::default()), false),
+        ] {
+            let metres = view_ray(
+                uv,
+                world_from_clip(projection.clone(), eye, focus),
+                eye,
+                orthographic,
+                focus,
+                1.0,
+            );
+            // The world in feet: the camera at `eye · u`, and a projection whose extents are
+            // in feet too.
+            let mut feet_projection = projection;
+            if let Projection::Orthographic(o) = &mut feet_projection {
+                o.scaling_mode = ScalingMode::FixedVertical {
+                    viewport_height: 80.0 * u,
+                };
+                o.far *= u;
+            }
+            let feet = view_ray(
+                uv,
+                world_from_clip(feet_projection, eye * u, focus * u),
+                eye * u,
+                orthographic,
+                focus,
+                u,
+            );
+            assert!(
+                // (A perspective direction is the difference of the eye and a point 0.1 from it,
+                // in f32 thousands out: ~1e-2.)
+                metres.0.distance(feet.0) < 0.5 && metres.1.distance(feet.1) < 2e-2,
+                "{metres:?} {feet:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Validation 4: the phase function
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn every_phase_octave_integrates_to_one() {
+    fn the_phase_function_integrates_to_one() {
         // ∫ p dΩ = 2π ∫ p dμ, midpoint rule fine enough for the forward lobe (width ~0.03).
         let n = 400_000;
-        for octave in 0..3 {
-            let integral: f64 = (0..n)
-                .map(|k| {
-                    let mu = -1.0 + (f64::from(k) + 0.5) * 2.0 / f64::from(n);
-                    phase_octave(mu, octave)
-                })
-                .sum::<f64>()
-                * (2.0 / f64::from(n))
-                * 2.0
-                * PI;
-            assert!(
-                (integral - 1.0).abs() < 1e-3,
-                "octave {octave} integrates to {integral}"
-            );
-        }
+        let integral: f64 = (0..n)
+            .map(|k| phase(-1.0 + (f64::from(k) + 0.5) * 2.0 / f64::from(n)))
+            .sum::<f64>()
+            * (2.0 / f64::from(n))
+            * 2.0
+            * PI;
+        assert!((integral - 1.0).abs() < 1e-3, "{integral}");
     }
 
     #[test]
-    fn the_phase_octaves_have_the_values_of_the_note() {
-        // The note quotes four decimals.
-        let cases = [
-            (0.0_f64.cos(), 0, 2.5120),
-            (90.0_f64.to_radians().cos(), 0, 0.0224),
-            (PI.cos(), 0, 0.1467),
-            (1.0, 1, 0.2281),
-            (1.0, 2, 0.1210),
-            (-1.0, 1, 0.0701),
-            (-1.0, 2, 0.0660),
-        ];
-        for (cos, octave, expected) in cases {
-            let p = phase_octave(cos, octave);
+    fn the_phase_function_has_the_values_of_the_note() {
+        for (cos, expected) in [(1.0, 2.5120), (0.0, 0.0224), (-1.0, 0.1467)] {
+            let p = phase(cos);
             assert!(
                 (p - expected).abs() <= 5.0e-5,
-                "p_{octave}({cos}) = {p}, note {expected}"
+                "p({cos}) = {p}, note {expected}"
             );
         }
     }
 
     // -----------------------------------------------------------------------------------------
-    // Validation 5: the analytic slab
+    // cloud-lighting.md Validation 1 and 3: the slab against Monte Carlo
     // -----------------------------------------------------------------------------------------
 
-    #[test]
-    fn the_closed_form_of_the_slab_is_the_value_of_the_note() {
-        // σH = 1, sun overhead, θ = 0, three octaves: 0.9241 + 0.0544 + 0.0166 = 0.9951.
-        let single = slab_closed_form(1.0, 1.0, 1.0, 1, 0.5, 0.5, 0.5);
-        let total = slab_closed_form(1.0, 1.0, 1.0, 3, 0.5, 0.5, 0.5);
-        assert!((single - 0.9241).abs() < 5e-5, "single scattering {single}");
-        assert!((total - 0.9951).abs() < 5e-5, "three octaves {total}");
-        let oblique = slab_closed_form(1.0, 0.5, 1.0, 1, 0.5, 0.5, 0.5);
-        assert!(
-            (oblique - 0.5841).abs() < 5e-5,
-            "oblique single scattering {oblique}"
-        );
-    }
+    /// `(τ, μ₀, view (0 above, 1 below), view zenith cosine, azimuth from the sun's side in
+    /// degrees, L/E)` of a homogeneous conservative slab, by Monte Carlo transport with the
+    /// march's phase (`docs/research/cloud-lighting-mc.py`).
+    const MONTE_CARLO_SLAB: &[(f64, f64, u32, f64, f64, f64)] = &include!("monte_carlo_slab.in");
 
-    fn assert_slab(steps: u32, tolerance: f64, sigma_h: f64, mu_s: f64, octaves: u32) {
-        let (mut scene, slab) = slab_case(sigma_h, mu_s, 1.0, octaves, 0.5, 0.5, 0.5);
+    /// `L / E` the march sees on a 900 m slab of optical depth `tau` lit from zenith cosine
+    /// `mu0`, viewed from above or below along the row's direction, with `steps` primary steps.
+    fn slab_view(tau: f64, mu0: f64, below: bool, mu_v: f64, azimuth: f64, steps: u32) -> f64 {
+        let thickness = 900.0;
+        let slab = Slab {
+            sigma: tau / thickness,
+            base_m: 1500.0,
+            top_m: 1500.0 + thickness,
+        };
+        let light = DVec3::new((1.0 - mu0 * mu0).sqrt(), mu0, 0.0);
+        let sv = (1.0 - mu_v * mu_v).sqrt();
+        let a = azimuth.to_radians();
+        // The viewer sits along `toward` and looks back at the slab.
+        let (from, toward) = if below {
+            (slab.base_m, DVec3::new(-sv, -mu_v, 0.0))
+        } else {
+            (slab.top_m, DVec3::new(sv * a.cos(), mu_v, sv * a.sin()))
+        };
+        let mut scene = Scene::new(DVec3::new(0.0, from, 0.0) + toward * 100.0, -toward, light);
+        scene.sun = 1.0;
         scene.steps = steps;
-        let mirror = march(&scene, &slab).radiance;
-        let exact = slab_closed_form(sigma_h, mu_s, 1.0, octaves, 0.5, 0.5, 0.5);
-        let error = (mirror / exact - 1.0).abs();
-        assert!(
-            error <= tolerance,
-            "σH {sigma_h}, μ_s {mu_s}, {octaves} octaves, Q {steps}: mirror {mirror}, closed form {exact} ({:.2} %)",
-            100.0 * error
-        );
+        march(&scene, &slab).radiance
     }
 
+    /// The march returns the light a cloud slab reflects and transmits: the mean squared log
+    /// error over the 96 Monte Carlo cases (floor 0.01) is at most 0.08, every thick top within
+    /// half to twice the reference and every base within 0.4 to 2.5 times (`cloud-lighting.md`
+    /// Deviation 2). Measured: 0.067, thick tops 0.57–1.12×, bases 0.45–1.19×. Three Wrenninge
+    /// octaves gave 0.82, thick tops at a sixth and bases at nothing.
     #[test]
-    fn the_integrator_matches_the_closed_form_of_the_slab() {
-        // Q = 64 within 10 %, Q = 32 within 12 % (the rectangle rule of the light path).
-        // Measured: at σH = 1 the mirror is within 0.75 % of the closed form at Q ≥ 48 and 0.93 %
-        // at Q = 32 (oblique single scattering 0.7 % and 1.7 %); only a low sun (μ_s = 0.2,
-        // 12.8 %) or an optical depth of 4 (4.1 %) leaves the band.
-        for (steps, tolerance) in [(64, 0.10), (32, 0.12)] {
-            assert_slab(steps, tolerance, 1.0, 1.0, 3);
-            assert_slab(steps, tolerance, 1.0, 1.0, 1);
-            assert_slab(steps, tolerance, 1.0, 0.5, 1);
+    fn the_slab_matches_monte_carlo() {
+        let mut error = 0.0;
+        for &(tau, mu0, view, mu_v, azimuth, reference) in MONTE_CARLO_SLAB {
+            let below = view == 1;
+            let marched = slab_view(tau, mu0, below, mu_v, azimuth, 64);
+            let weight = if below { 0.5 } else { 1.0 };
+            error += weight * ((marched + 0.01).ln() - (reference + 0.01).ln()).powi(2);
+            let ratio = marched / reference;
+            if below {
+                assert!(
+                    (0.4..=2.5).contains(&ratio),
+                    "base τ {tau} μ₀ {mu0} μ_v {mu_v}: {marched} against {reference}"
+                );
+            } else if tau >= 10.0 {
+                assert!(
+                    (0.5..=2.0).contains(&ratio),
+                    "top τ {tau} μ₀ {mu0} μ_v {mu_v} az {azimuth}: {marched} against {reference}"
+                );
+            }
         }
+        let error = error / MONTE_CARLO_SLAB.len() as f64;
+        println!("mean squared log error {error:.4}");
+        assert!(error <= 0.08, "{error}");
     }
 
+    /// The march at Q = 64 is within 5 % of the same march converged at Q = 1024.
     #[test]
-    fn the_slab_radiance_function_is_the_integrator_at_sixty_four_steps() {
-        let direct = slab_radiance(1.0, 1.0, 1.0, 3, 0.5, 0.5, 0.5);
-        let (scene, slab) = slab_case(1.0, 1.0, 1.0, 3, 0.5, 0.5, 0.5);
-        assert_eq!(scene.steps, 64);
-        assert_eq!(direct, march(&scene, &slab).radiance);
-    }
-
-    #[test]
-    fn multiple_scattering_needs_a_scatter_weight_no_larger_than_the_extinction() {
-        // a ≤ b: the deeper octaves are attenuated at least as fast as they scatter.
-        assert!(MultiScatter::new(0.5, 0.5, 0.5).is_some());
-        assert!(MultiScatter::new(0.3, 0.5, 0.5).is_some());
-        assert!(
-            MultiScatter::new(0.5, 0.3, 0.5).is_none(),
-            "a > b must be rejected"
-        );
-        assert!(MultiScatter::new(-0.1, 0.5, 0.5).is_none());
-        assert!(MultiScatter::new(0.5, 1.5, 0.5).is_none());
-
-        let at = |a: f64, b: f64| slab_closed_form(1.0, 1.0, 1.0, 3, a, b, 0.5);
-        let plan = at(0.5, 0.5);
-        // A weaker scatter weight with the same extinction returns less light.
-        assert!(
-            at(0.3, 0.5) < plan,
-            "a = 0.3, b = 0.5 gives {} against {plan}",
-            at(0.3, 0.5)
-        );
-        // The pair the rule forbids (a = 0.5, b = 0.3: less extinction than scattering) returns
-        // more, so a deeper octave could add energy; the integrator shows the same.
-        assert!(at(0.5, 0.3) > plan);
-        let integrated = |a: f64, b: f64| slab_radiance(1.0, 1.0, 1.0, 3, a, b, 0.5);
-        assert!(integrated(0.3, 0.5) < integrated(0.5, 0.5));
-        assert!(integrated(0.5, 0.3) > integrated(0.5, 0.5));
-        let valid = MultiScatter::new(0.3, 0.5, 0.5).map(|m| m.sum(3, 1.0, 1.0, 1.0));
-        assert!(valid.is_some_and(|s| s < MultiScatter::PLAN.sum(3, 1.0, 1.0, 1.0)));
+    fn the_integrator_converges_on_the_slab() {
+        for (tau, mu0, below) in [(1.0, 0.9, false), (10.0, 0.5, false), (10.0, 0.9, true)] {
+            let coarse = slab_view(tau, mu0, below, 0.7, 90.0, 64);
+            let fine = slab_view(tau, mu0, below, 0.7, 90.0, 1024);
+            assert!(
+                (coarse / fine - 1.0).abs() <= 0.05,
+                "τ {tau}, μ₀ {mu0}, below {below}: {coarse} at Q = 64, {fine} at Q = 1024"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------------
     // Validation 6: energy
     // -----------------------------------------------------------------------------------------
 
-    /// `Σ a^n max_θ p_n(θ)`: the most light one unit of illuminance can return per steradian
-    /// of source term.
-    fn energy_factor() -> f64 {
-        (0..3)
-            .map(|n| {
-                let peak = (0..=2000)
-                    .map(|k| phase_octave(-1.0 + f64::from(k) / 1000.0, n))
-                    .fold(0.0_f64, f64::max);
-                0.5_f64.powi(n as i32) * peak
-            })
-            .sum()
+    /// The most light one unit of illuminance can return per unit of source: the phase
+    /// function's forward peak plus the diffuse term at its largest, `α / π`.
+    fn source_bound() -> f64 {
+        let peak = (0..=2000)
+            .map(|k| phase(-1.0 + f64::from(k) / 1000.0))
+            .fold(0.0_f64, f64::max);
+        peak + DIFFUSE_ALBEDO / PI
     }
 
     #[test]
-    fn the_energy_factor_of_the_multiple_scattering_sum_is_the_note_value() {
-        let factor = energy_factor();
-        assert!((factor - 2.656).abs() < 1e-3, "energy factor {factor}");
-        assert!(
-            factor * SUN_LUX < 3.46e5,
-            "bound {} cd/m²",
-            factor * SUN_LUX
-        );
-        assert!(factor * SUN_LUX > 3.44e5);
+    fn the_source_bound_is_the_phase_peak_and_the_diffuse_albedo() {
+        let bound = source_bound();
+        assert!((bound - 2.7285).abs() < 1e-3, "source bound {bound}");
+        for tau_l in [0.0, 1.0, 10.0] {
+            for tau_b in [0.0, 5.0, 100.0] {
+                for cos in [-1.0, 0.0, 1.0] {
+                    let s = scatter_source(tau_l, tau_b, 1.0, cos, 1.0);
+                    assert!((0.0..=bound + 1e-12).contains(&s), "{s}");
+                }
+            }
+        }
     }
 
     /// Directions of the stress scenes: toward and away from the light, and rings at several
@@ -1079,7 +1228,7 @@ mod tests {
         let light = DVec3::new(0.4, 0.8, 0.3).normalize();
         let mut cumulonimbus = MirrorParams::new(1500.0, 9500.0, 1.0, 1.0, [0.0, 0.0]);
         cumulonimbus.precipitation = 0.5;
-        let bound = energy_factor() * SUN_LUX;
+        let bound = source_bound() * SUN_LUX;
         let ambient = SUN_LUX * 0.15 / (2.0 * PI);
         let mut brightest: f64 = 0.0;
         let mut hits = 0;
@@ -1112,12 +1261,18 @@ mod tests {
         );
         // A cumulonimbus self-shadows far below the bound; a thin slab seen toward the light
         // comes within a third of it.
-        let thin = slab_radiance(1.0, 1.0, 1.0, 3, 0.5, 0.5, 0.5) * SUN_LUX;
+        let slab = Slab {
+            sigma: 1.0 / 900.0,
+            base_m: 1500.0,
+            top_m: 2400.0,
+        };
+        let toward_light = Scene::new(DVec3::new(0.0, 1400.0, 0.0), DVec3::Y, DVec3::Y);
+        let thin = march(&toward_light, &slab).radiance;
         assert!(
             thin <= bound && thin > 0.3 * bound,
             "thin slab {thin} cd/m² against {bound}"
         );
-        assert!(bound < 3.46e5);
+        assert!(bound < 3.56e5);
     }
 
     /// A stratus slab of optical depth 40 (σ = 0.05, the stratus peak, over 800 m), sun off,
@@ -1182,17 +1337,57 @@ mod tests {
         }
     }
 
+    /// Validation 3 of `broken-cloud-light.md`: a column the march gives up on hides what is
+    /// behind it (the sun disc is 10⁵ times the sky), and its radiance is what it integrated,
+    /// renormalised by at most `1/0.99`.
     #[test]
-    fn an_opaque_column_ends_finite_below_the_early_exit() {
+    fn an_opaque_column_hides_what_is_behind_it() {
         for steps in [32, 64, 96] {
             let m = column(0.05, 1000.0, steps);
-            assert!(m.transmittance.is_finite() && m.radiance.is_finite());
+            assert!(m.radiance.is_finite());
+            assert_eq!(m.transmittance, 0.0);
+            assert!(m.radiance > 0.0);
+        }
+        // A thin column the march finishes keeps its transmittance.
+        let thin = column(0.0004, 1000.0, 64);
+        assert!(
+            (thin.transmittance - (-0.4f64).exp()).abs() < 0.02,
+            "T {}",
+            thin.transmittance
+        );
+    }
+
+    /// `cumulus-shape.md` Validation 4: carving the cumulus out of the coverage keeps the share
+    /// of the ground in their shade (vertical columns with `T < 0.5`, the shadow map's own
+    /// sampling without the detail noise) at the weather map's fraction, so `cloud_cover` still
+    /// means what it says. Measured over 2048 columns of the 32 km field: 0.048 at cover 0.05,
+    /// 0.377 at 0.4, 0.818 at 0.8, 0.966 at 0.95.
+    #[test]
+    fn the_cumulus_shadow_covers_what_the_weather_says() {
+        for cover in [0.05, 0.4, 0.8] {
+            let p = MirrorParams::new(1500.0, 3300.0, 0.5, cover, [0.0, 0.0]);
+            let n = 2048;
+            let dh = (p.top_m - p.base_m) / 32.0;
+            let (mut map, mut dark) = (0, 0);
+            for i in 0..n {
+                let x = (0.5 + f64::from(i) * 0.754_877_666_246_692_7).fract() * WEATHER_EXTENT_M;
+                let z = (0.5 + f64::from(i) * 0.569_840_290_998_053_2).fract() * WEATHER_EXTENT_M;
+                map += usize::from(p.weather_at([x, z]).0 >= 0.5);
+                let tau: f64 = (0..32)
+                    .map(|k| {
+                        p.medium(p.base_m + (f64::from(k) + 0.5) * dh, [x, z], 0.0)
+                            .0
+                            * dh
+                    })
+                    .sum();
+                dark += usize::from(tau > std::f64::consts::LN_2);
+            }
+            let (map, dark) = (map as f64 / f64::from(n), dark as f64 / f64::from(n));
+            println!("cover {cover}: map {map:.3}, shade {dark:.3}");
             assert!(
-                (0.0..=0.01).contains(&m.transmittance),
-                "T {}",
-                m.transmittance
+                (dark - map).abs() <= 0.03,
+                "cover {cover}: map {map}, shade {dark}"
             );
-            assert!(m.radiance >= 0.0);
         }
     }
 
@@ -1476,7 +1671,7 @@ mod tests {
             assert_eq!(g, 0.0);
             // Where the march's coarse test sees nothing, the medium has no extinction.
             let coarse = p.coarse(2300.0, xz);
-            assert!(coarse > 0.0 || p.medium(2300.0, xz, false).0 == 0.0);
+            assert!(coarse > 0.0 || p.medium(2300.0, xz, 1.0).0 == 0.0);
             if sigma > 0.0 {
                 dense += 1;
             }
@@ -1484,19 +1679,76 @@ mod tests {
         assert!(dense > 0, "no cloud found at mid height");
     }
 
+    /// The coarse march samples the base noise only; it must never step over a cloud the fine
+    /// march would draw, for any type, height or detail weight.
     #[test]
-    fn detail_noise_only_removes_density() {
-        let p = MirrorParams::new(1500.0, 3300.0, 0.5, 0.95, [0.0, 0.0]);
+    fn the_coarse_test_never_misses_a_cloud() {
+        for kind in [0.0, 0.35, 0.5, 1.0] {
+            let p = MirrorParams::new(1500.0, 3300.0, kind, 0.6, [0.0, 0.0]);
+            for i in 0..600 {
+                let xz = [f64::from(i) * 97.0, f64::from(i) * 53.0];
+                let h = 1510.0 + f64::from(i % 29) * 62.0;
+                for detail in [0.0, 0.5, 1.0] {
+                    let fine = p.medium(h, xz, detail).0;
+                    assert!(
+                        fine == 0.0 || p.coarse(h, xz) > 0.0,
+                        "type {kind}: σ {fine} at {xz:?}, {h} with a zero coarse test"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detail_noise_only_removes_stratus_density() {
+        let p = MirrorParams::new(1500.0, 2300.0, 0.0, 0.95, [0.0, 0.0]);
         for i in 0..300 {
             let xz = [f64::from(i) * 97.0, f64::from(i) * 53.0];
-            let h = 1600.0 + f64::from(i % 17) * 100.0;
-            let with = p.medium(h, xz, true).0;
-            let without = p.medium(h, xz, false).0;
+            let h = 1510.0 + f64::from(i % 17) * 45.0;
+            let with = p.medium(h, xz, 1.0).0;
+            let without = p.medium(h, xz, 0.0).0;
             assert!(
                 with <= without + 1e-12,
                 "detail added density at {xz:?}, {h}"
             );
         }
+    }
+
+    /// `cumulus-shape.md` Validation 5: the envelope is 0 above the blob's height and 1 below
+    /// its rounding, C¹ (no jump in slope: the terraces were slope jumps), the base is a plane,
+    /// and the erosion is a density in [0, 1] that grows with the noise and is 0 below `1 − d`.
+    #[test]
+    fn the_cumulus_envelope_is_smooth_and_the_erosion_bounded() {
+        for dome in [0.0, 0.3, 1.0] {
+            let s = mix(CUMULUS_EDGE_HEIGHT, 1.0, f64::sqrt(dome));
+            assert_eq!(cumulus_envelope(s, dome), 0.0);
+            assert_eq!(cumulus_envelope(0.99 * s * CUMULUS_TOP_ROUND, dome), 1.0);
+            // A kink (the old linear gradient's corners) jumps the slope by a whole 1/width
+            // however fine the step; a C¹ curve by its curvature times the step.
+            let h = 1e-5;
+            let slope = |f: f64| {
+                (cumulus_envelope(f + h, dome) - cumulus_envelope(f - h, dome)) / (2.0 * h)
+            };
+            let mut f = 0.0005;
+            while f < 0.999 {
+                let jump = (slope(f + 0.0005) - slope(f)).abs();
+                assert!(jump < 0.1, "slope jumps by {jump} at f {f}, dome {dome}");
+                f += 0.0005;
+            }
+        }
+        assert_eq!(cumulus_base(0.0), 0.0);
+        assert_eq!(cumulus_base(CUMULUS_BASE_RISE), 1.0);
+        for d in [0.1, 0.5, 0.75] {
+            assert_eq!(value_erosion(1.0 - d - 1e-6, d), 0.0);
+            assert!((value_erosion(1.0, d) - 1.0).abs() < 1e-12);
+            let mut last = 0.0;
+            for i in 0..=100 {
+                let v = value_erosion(f64::from(i) / 100.0, d);
+                assert!((last..=1.0).contains(&v), "not monotone at {i}");
+                last = v;
+            }
+        }
+        assert_eq!(value_erosion(1.0, 0.0), 0.0);
     }
 
     #[test]
@@ -1506,7 +1758,7 @@ mod tests {
         for i in 0..300 {
             let xz = [f64::from(i) * 101.0, f64::from(i) * 67.0];
             let (coverage, _) = p.weather_at(xz);
-            let (_, g) = p.medium(1800.0, xz, false);
+            let (_, g) = p.medium(1800.0, xz, 0.0);
             if coverage <= 0.0 {
                 assert_eq!(g, 0.0);
             } else {

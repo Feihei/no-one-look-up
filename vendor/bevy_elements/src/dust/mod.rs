@@ -212,12 +212,12 @@ fn run_dust(
     time: Res<Time<Virtual>>,
     hydrology: Option<Res<HydrologySettings>>,
     terrain: Option<Res<TerrainState>>,
-    terrain_gpu: Option<Res<TerrainGpu>>,
+    terrain_gpu: Option<ResMut<TerrainGpu>>,
     gpu: Option<ResMut<DustGpu>>,
     mut runtime: ResMut<DustRuntime>,
     mut stats: ResMut<DustStats>,
 ) {
-    let (Some(terrain), Some(terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
+    let (Some(terrain), Some(mut terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
         return;
     };
     gpu.run = false;
@@ -262,5 +262,5 @@ fn run_dust(
     runtime.bed_time_s += f64::from(bed_s);
     stats.bed_time_s = runtime.bed_time_s;
     // The pack, bounds and height readback follow the step, in the same frame.
-    terrain_gpu.dirty.store(true, Ordering::Relaxed);
+    terrain_gpu.changes += 1;
 }

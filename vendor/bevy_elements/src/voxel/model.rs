@@ -306,6 +306,95 @@ pub(crate) fn hold_swap(
     Some(Swap { snow, changed })
 }
 
+/// The columns of a [`VoxelSnow`](super::VoxelSnow) volume over its field-space box `(min, max)`:
+/// one column per voxel, the column width doubled until the grid fits in `max_cells` a side. The
+/// grid is in the volume's field space (`y0` = 0).
+pub(crate) fn snow_columns(min: [f32; 3], max: [f32; 3], cell: f32, max_cells: u32) -> Columns {
+    let extent = Vec2::new(max[0] - min[0], max[2] - min[2]);
+    let mut cell_m = cell;
+    while (extent / cell_m).max_element() > max_cells as f32 {
+        cell_m *= 2.0;
+    }
+    let size = (extent / cell_m).ceil().max(Vec2::ONE).as_uvec2();
+    Columns {
+        grid: TerrainGrid {
+            origin: Vec2::new(min[0], min[2]),
+            cell_m,
+            size,
+            y0: 0.0,
+        },
+        y_lo: min[1],
+        y_hi: max[1],
+        cell,
+    }
+}
+
+/// The share of the snowfall the top of column `index` keeps on its slope:
+/// `1 − smoothstep(α₀, α₁, α)` with `α` the slope (degrees) from the neighbouring tops (central
+/// differences, one-sided at an edge, beside a column with no top or across a cliff: a
+/// neighbour more than a voxel higher or lower is a wall, not a slope, as in [`SnowyField`]'s
+/// cliff rule), `shed_deg = [α₀, α₁]` (`docs/research/snow-cover.md`). A column with no top
+/// keeps nothing.
+///
+/// [`SnowyField`]: super::SnowyField
+pub(crate) fn top_exposure(
+    columns: &Columns,
+    tops: &[f32],
+    index: usize,
+    shed_deg: [f32; 2],
+) -> f32 {
+    let top = tops[index];
+    if !columns.has_top(top) {
+        return 0.0;
+    }
+    let (w, h) = (columns.grid.size.x as usize, columns.grid.size.y as usize);
+    let (i, j) = (index % w, index / w);
+    let neighbour = |ni: usize, nj: usize| {
+        let t = tops[nj * w + ni];
+        (columns.has_top(t) && (t - top).abs() <= columns.cell).then_some(t)
+    };
+    let slope = |lo: Option<(f32, f32)>, hi: Option<(f32, f32)>| match (lo, hi) {
+        (Some((tl, dl)), Some((th, dh))) => (th - tl) / (dh + dl),
+        (Some((tl, dl)), None) => (top - tl) / dl,
+        (None, Some((th, dh))) => (th - top) / dh,
+        (None, None) => 0.0,
+    };
+    let c = columns.grid.cell_m;
+    let dx = slope(
+        (i > 0)
+            .then(|| neighbour(i - 1, j))
+            .flatten()
+            .map(|t| (t, c)),
+        (i + 1 < w)
+            .then(|| neighbour(i + 1, j))
+            .flatten()
+            .map(|t| (t, c)),
+    );
+    let dz = slope(
+        (j > 0)
+            .then(|| neighbour(i, j - 1))
+            .flatten()
+            .map(|t| (t, c)),
+        (j + 1 < h)
+            .then(|| neighbour(i, j + 1))
+            .flatten()
+            .map(|t| (t, c)),
+    );
+    let alpha = Vec2::new(dx, dz).length().atan().to_degrees();
+    1.0 - crate::cover::model::smoothstep(shed_deg[0], shed_deg[1], alpha)
+}
+
+/// The uniform scale of a transform whose vertical stays vertical (any translation, any turn
+/// about the vertical, a uniform scale), or `None` for a tilted or unevenly scaled one: snow
+/// falls down the world's vertical, which must be the field's.
+pub(crate) fn upright_scale(transform: &bevy::prelude::GlobalTransform) -> Option<f32> {
+    let (scale, rotation, _) = transform.to_scale_rotation_translation();
+    let up = rotation * bevy::math::Vec3::Y;
+    let even = (scale.x - scale.y).abs() <= 1e-3 * scale.y.abs()
+        && (scale.z - scale.y).abs() <= 1e-3 * scale.y.abs();
+    (up.y > 0.9999 && even && scale.y > 0.0).then_some(scale.y)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -532,6 +621,67 @@ mod tests {
             columns
                 .columns_in(&layout, ChunkId::new([2, 0, 0]))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn snow_columns_are_one_per_voxel_until_the_cap() {
+        let (min, max) = ([0.0, -8.0, 0.0], [16.0, 16.0, 8.0]);
+        let fine = snow_columns(min, max, 0.5, 1024);
+        assert_eq!(
+            (fine.grid.size, fine.grid.cell_m),
+            (UVec2::new(32, 16), 0.5)
+        );
+        assert_eq!(
+            (fine.grid.origin, fine.y_lo, fine.y_hi),
+            (Vec2::ZERO, -8.0, 16.0)
+        );
+        // Past the cap the columns widen by doubling; the voxel cell stays.
+        let capped = snow_columns(min, max, 0.5, 16);
+        assert_eq!(
+            (capped.grid.size, capped.grid.cell_m, capped.cell),
+            (UVec2::new(16, 8), 1.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn a_top_sheds_by_its_slope() {
+        let columns = snow_columns([0.0; 3], [4.0, 8.0, 4.0], 1.0, 64);
+        let flat = vec![2.0_f32; 16];
+        assert_eq!(top_exposure(&columns, &flat, 5, [35.0, 55.0]), 1.0);
+        // A 45° ramp along x sits halfway through the 35°–55° shed band.
+        let ramp: Vec<f32> = (0..16).map(|i| (i % 4) as f32).collect();
+        let half = top_exposure(&columns, &ramp, 5, [35.0, 55.0]);
+        assert!((half - 0.5).abs() < 1e-5, "{half}");
+        // A column with no top keeps nothing, and its neighbours read one-sided slopes.
+        let mut holed = flat.clone();
+        holed[6] = columns.no_top();
+        assert_eq!(top_exposure(&columns, &holed, 6, [35.0, 55.0]), 0.0);
+        assert_eq!(top_exposure(&columns, &holed, 5, [35.0, 55.0]), 1.0);
+        // A flat walk beside a merlon 2 m higher keeps its snow: the step is a wall, not a slope.
+        let mut merlon = flat.clone();
+        merlon[6] = 4.0;
+        assert_eq!(top_exposure(&columns, &merlon, 5, [35.0, 55.0]), 1.0);
+        assert_eq!(top_exposure(&columns, &merlon, 6, [35.0, 55.0]), 1.0);
+    }
+
+    #[test]
+    fn only_an_upright_evenly_scaled_volume_takes_snow() {
+        use bevy::prelude::{GlobalTransform, Quat, Transform, Vec3};
+        let upright = |t: Transform| upright_scale(&GlobalTransform::from(t));
+        assert_eq!(upright(Transform::IDENTITY), Some(1.0));
+        let turned = Transform::from_xyz(40.0, 2.0, -10.0)
+            .with_rotation(Quat::from_rotation_y(0.7))
+            .with_scale(Vec3::splat(2.0));
+        let s = upright(turned).expect("turned about the vertical");
+        assert!((s - 2.0).abs() < 1e-5, "{s}");
+        assert_eq!(
+            upright(Transform::from_rotation(Quat::from_rotation_x(0.2))),
+            None
+        );
+        assert_eq!(
+            upright(Transform::from_scale(Vec3::new(1.0, 2.0, 1.0))),
+            None
         );
     }
 }

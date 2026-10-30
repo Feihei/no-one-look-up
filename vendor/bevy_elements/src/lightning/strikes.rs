@@ -7,7 +7,8 @@ use bevy::prelude::*;
 use super::bolt::{self, Strokes};
 use crate::climate::{Climate, Weather, hash64};
 use crate::clouds::CloudLayer;
-use crate::plugin::ElementsView;
+use crate::plugin::{ElementsUnits, ElementsView};
+use crate::query::EnvironmentSnapshot;
 
 /// Decouples the strike streams from the hourly weather scheduler, which hashes the same way:
 /// the ASCII bytes of "lightnin".
@@ -17,12 +18,12 @@ pub const STRIKE_RADIUS_M: f32 = 8000.0;
 /// Speed of sound used for the thunder delay, m/s.
 pub const SPEED_OF_SOUND_MS: f32 = 343.0;
 
-/// Script a strike: lightning hits `at` (the attachment point; its `y` is the ground height) on
-/// the next frame.
+/// Script a strike: lightning hits `at` (the attachment point, in world units; its `y` is the
+/// ground height) on the next frame.
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StrikeLightning {
-    /// Where the bolt attaches, world space, m.
+    /// Where the bolt attaches, world units.
     pub at: Vec3,
 }
 
@@ -30,7 +31,7 @@ pub struct StrikeLightning {
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LightningStrike {
-    /// The attachment point, world space, m.
+    /// The attachment point, world units.
     pub position: Vec3,
     /// The bolt's shape seed: the same seed and attachment point give the same bolt.
     pub seed: u64,
@@ -41,7 +42,7 @@ pub struct LightningStrike {
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Thunder {
-    /// Where the strike hit, world space, m.
+    /// Where the strike hit, world units.
     pub position: Vec3,
     /// Distance from the followed camera to the strike when it struck, m.
     pub distance_m: f32,
@@ -113,7 +114,7 @@ impl StrikeProcess {
 pub(crate) struct ActiveBolt {
     pub bolt: bolt::Bolt,
     pub strokes: Strokes,
-    /// The followed camera's position when the bolt struck, m.
+    /// The followed camera's position when the bolt struck, metre frame, m.
     pub view: Vec3,
     /// Seconds since the first stroke at the start of this frame; negative when the strike falls
     /// inside the frame that spawned it.
@@ -161,11 +162,14 @@ pub(crate) struct Clocks<'w> {
 }
 
 /// Advance the strike process, fire scripted strikes and deliver thunder.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_strikes(
     clocks: Clocks,
     weather: Res<Weather>,
+    units: Res<ElementsUnits>,
     climate: Res<Climate>,
     view: Res<ElementsView>,
+    snapshot: Res<EnvironmentSnapshot>,
     mut strikes: ResMut<Strikes>,
     mut io: StrikeIo,
     mut commands: Commands,
@@ -189,28 +193,34 @@ pub(crate) fn run_strikes(
     let mut fired: Vec<(Vec3, u64, f64)> = draws
         .iter()
         .map(|d| {
-            // The ground is y = 0 until terrain exists (M3).
-            let at = Vec3::new(
-                view.position.x + d.offset.x,
-                0.0,
-                view.position.z + d.offset.y,
-            );
+            let xz = Vec2::new(view.position.x + d.offset.x, view.position.z + d.offset.y);
+            let at = Vec3::new(xz.x, snapshot.ground_height(xz), xz.y);
             (at, d.seed, start - d.time)
         })
         .collect();
+    // The process works in the metre frame; a scripted strike's `at` is in world units.
     for strike in io.scripted.read() {
         let n = strikes.scripted;
         strikes.scripted += 1;
-        fired.push((strike.at, hash64(climate.seed ^ DOMAIN, (1 << 63) | n), 0.0));
+        fired.push((
+            units.point_to_metres(strike.at),
+            hash64(climate.seed ^ DOMAIN, (1 << 63) | n),
+            0.0,
+        ));
     }
     let base_m = CloudLayer::from_weather(&weather).base_m;
     for (position, seed, age) in fired {
-        io.strikes.write(LightningStrike { position, seed });
+        // Messages carry world positions; the distance is in metres.
+        let world = units.point_to_world(position);
+        io.strikes.write(LightningStrike {
+            position: world,
+            seed,
+        });
         let distance_m = position.distance(view.position);
         strikes.pending.push(PendingThunder {
             due: now_real + f64::from(distance_m / SPEED_OF_SOUND_MS),
             thunder: Thunder {
-                position,
+                position: world,
                 distance_m,
                 loudness: 1.0 / (1.0 + distance_m / 1000.0),
             },
@@ -218,7 +228,7 @@ pub(crate) fn run_strikes(
         commands.spawn(ActiveBolt {
             bolt: bolt::generate(seed, position, base_m),
             strokes: Strokes::new(seed),
-            view: view.position,
+            view: view.eye,
             age,
             mean: 0.0,
             mean_first: 0.0,
@@ -343,5 +353,64 @@ mod tests {
         let expected = n as f64 / 8.0;
         let chi: f64 = bins.iter().map(|b| (b - expected).powi(2) / expected).sum();
         assert!(chi < 18.48, "chi-square {chi}");
+    }
+
+    #[test]
+    fn drawn_strikes_land_on_the_terrain() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use bevy::time::TimeUpdateStrategy;
+
+        use crate::lightning::LightningPlugin;
+        use crate::plugin::ElementsSystems;
+        use crate::terrain::{TerrainGrid, TerrainSnapshot};
+
+        #[derive(Resource, Default)]
+        struct Seen(Vec<LightningStrike>);
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, LightningPlugin))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_nanos(
+                16_666_667,
+            )))
+            .insert_resource(Climate::temperate().with_seed(42))
+            .insert_resource(Weather {
+                storminess: 6.0,
+                ..default()
+            })
+            // A flat terrain 250 m up over the whole 8 km strike disc.
+            .insert_resource(EnvironmentSnapshot {
+                terrain: Some(TerrainSnapshot {
+                    grid: TerrainGrid {
+                        origin: Vec2::splat(-10_000.0),
+                        cell_m: 625.0,
+                        size: UVec2::splat(32),
+                        y0: 250.0,
+                    },
+                    surface: Arc::from(vec![0.0f32; 1024]),
+                    sediment: Arc::from(vec![0.0f32; 1024]),
+                    version: 1,
+                }),
+                ..default()
+            })
+            .init_resource::<Seen>()
+            .add_systems(
+                Update,
+                (|mut strikes: MessageReader<LightningStrike>, mut seen: ResMut<Seen>| {
+                    seen.0.extend(strikes.read().copied());
+                })
+                .after(ElementsSystems::Simulation),
+            );
+        for _ in 0..36_000 {
+            app.update();
+        }
+        let seen = &app.world().resource::<Seen>().0;
+        assert!(seen.len() >= 40, "{} strikes", seen.len());
+        assert!(
+            seen.iter().all(|s| s.position.y == 250.0),
+            "{:?}",
+            seen.iter().find(|s| s.position.y != 250.0)
+        );
     }
 }

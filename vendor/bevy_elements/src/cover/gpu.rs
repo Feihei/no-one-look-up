@@ -1,11 +1,12 @@
 //! Render-world side of the ground cover: pipelines, bind groups and the per-frame dispatch.
 //!
 //! Three compute passes a frame, each with its own diagnostic span: `elements_shelter` (the
-//! shelter mask, only when the blockers or the fall directions changed), `elements_snow` (per
-//! step: source, drift flux and apply when the wind can move snow, two diffusion passes) and
-//! `elements_wetness` (the wetness update, the render pack, and the readback kernel on a readback
-//! tick). The passes run after hydrology's substeps and before the terrain's pack kernels, which
-//! publish the melt water to the packed render buffer in the same frame.
+//! shelter mask, only when the blockers or the fall directions changed, then the one-off
+//! `cover_seed` from a snowpack when one was asked for), `elements_snow` (per step: source, drift
+//! flux and apply when the wind can move snow, two diffusion passes) and `elements_wetness` (the
+//! wetness update, the render pack, and the readback kernel on a readback tick). The passes run
+//! after hydrology's substeps and before the terrain's pack kernels, which publish the melt water
+//! to the packed render buffer in the same frame.
 
 use std::sync::atomic::Ordering;
 
@@ -51,6 +52,7 @@ struct CoverPipelines {
     wetness: Kernel,
     pack: Kernel,
     shelter: Kernel,
+    seed: Kernel,
     readback: Kernel,
 }
 
@@ -63,6 +65,7 @@ struct Ready<'a> {
     wetness: &'a ComputePipeline,
     pack: &'a ComputePipeline,
     shelter: &'a ComputePipeline,
+    seed: &'a ComputePipeline,
     readback: &'a ComputePipeline,
 }
 
@@ -78,6 +81,7 @@ impl CoverPipelines {
             wetness: ready(cache, &self.wetness)?,
             pack: ready(cache, &self.pack)?,
             shelter: ready(cache, &self.shelter)?,
+            seed: ready(cache, &self.seed)?,
             readback: ready(cache, &self.readback)?,
         })
     }
@@ -179,6 +183,7 @@ fn init_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<P
         wetness: kernel(&snow, "wetness_update", maps_layout()),
         pack: kernel(&snow, "cover_pack", maps_layout()),
         shelter: kernel(&shelter, "shelter_mask", shelter_layout()),
+        seed: kernel(&snow, "cover_seed", maps_layout()),
         readback: kernel(&readback, "cover_readback", readback_layout()),
     });
 }
@@ -230,7 +235,7 @@ fn prepare(
         Ordering::Relaxed,
     );
     let stale = gpu.shelter_built.load(Ordering::Relaxed) < gpu.shelter_epoch;
-    if !compiled || (gpu.steps == 0 && !stale && !gpu.downsample) {
+    if !compiled || (gpu.steps == 0 && !stale && !gpu.downsample && !gpu.seed_due()) {
         commands.remove_resource::<CoverBindGroups>();
         return;
     }
@@ -298,7 +303,9 @@ fn dispatch(
     };
     let steps = u64::from(gpu.steps);
     let stale = gpu.shelter_built.load(Ordering::Relaxed) < gpu.shelter_epoch;
-    if steps == 0 && !stale && !gpu.downsample {
+    let seed_epoch = gpu.seed_epoch;
+    let seed_due = gpu.seed_due();
+    if steps == 0 && !stale && !gpu.downsample && !seed_due {
         return;
     }
     if !terrain.generated.load(Ordering::Relaxed) {
@@ -318,7 +325,7 @@ fn dispatch(
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    if let (true, Some(group)) = (stale, bind_groups.shelter.as_ref()) {
+    if stale || seed_due {
         let mut pass = ctx
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor {
@@ -326,10 +333,21 @@ fn dispatch(
                 ..default()
             });
         let span = diagnostics.pass_span(&mut pass, "elements_shelter");
-        pass.set_pipeline(pipes.shelter);
-        pass.set_bind_group(0, group, &[]);
-        pass.dispatch_workgroups(cx, cy, 1);
+        if let (true, Some(group)) = (stale, bind_groups.shelter.as_ref()) {
+            pass.set_pipeline(pipes.shelter);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(cx, cy, 1);
+        }
+        // The snowpack the maps start from, on the exposure the shelter mask now holds.
+        if seed_due {
+            pass.set_pipeline(pipes.seed);
+            pass.set_bind_group(0, &bind_groups.maps, &[]);
+            pass.dispatch_workgroups(cx, cy, 1);
+        }
         span.end(&mut pass);
+        if seed_due {
+            gpu.seeded.store(seed_epoch, Ordering::Relaxed);
+        }
     }
     if steps > 0 {
         let mut pass = ctx

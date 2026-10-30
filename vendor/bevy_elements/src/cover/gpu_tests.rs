@@ -880,3 +880,62 @@ fn gpu_surface_weathering_follows_the_map() {
     assert_eq!(depth, Some(0.0));
     sim.finish();
 }
+
+/// A snowpack read back from a save seeds the maps: the pack's depth and SWE on open flat ground,
+/// nothing under a roof, and the pack's wetness where the rain reaches (issue #14,
+/// `docs/research/snow-season.md`).
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_a_restored_snowpack_seeds_the_maps() {
+    let _lock = serial();
+    let roof = (Vec3::new(0.0, 5.0, 0.0), Vec3::new(5.0, 0.5, 5.0));
+    // No precipitation and no melt: only the seed puts snow on the map, and the clock is held.
+    let mut config = Config::new(tank(64, 1.0), Pin::new(0.0, -5.0));
+    config.blockers = vec![roof];
+    let mut sim = Sim::new(config);
+    let grid = sim.terrain.grid;
+    assert!(
+        sim.snow().iter().all(|c| c[1] == 0.0),
+        "a fresh map is bare"
+    );
+
+    // 20 mm of SWE at 200 kg/m³: 10 cm.
+    sim.app
+        .world_mut()
+        .insert_resource(SurfaceWeathering::with_snowpack(0.1, 200.0, 0.6));
+    run_until(&mut sim.app, "the seeded map's readback", |app| {
+        app.world_mut()
+            .run_system_once(|env: Environment| env.snow_depth(Vec2::new(20.0, 20.0)))
+            .ok()
+            .flatten()
+            .is_some_and(|d| d > 0.05)
+    });
+    let snow = sim.snow();
+    let wetness = sim.wetness();
+    let cells = grid.size.x as usize;
+    let (mut open, mut under) = (0, 0);
+    for (i, (c, w)) in snow.iter().zip(&wetness).enumerate() {
+        let p =
+            grid.origin + (Vec2::new((i % cells) as f32, (i / cells) as f32) + 0.5) * grid.cell_m;
+        if p.x.abs() <= 5.0 && p.y.abs() <= 5.0 {
+            assert_eq!(c[1], 0.0, "snow under the roof at {p}");
+            assert_eq!(*w, 0.0, "wet under the roof at {p}");
+            under += 1;
+        } else if p.x.abs() > 6.0 || p.y.abs() > 6.0 {
+            close(c[0], 0.1, 1e-4, "seeded depth");
+            close(c[1], 0.02, 1e-4, "seeded SWE");
+            close(*w, 0.6, 1e-4, "seeded wetness");
+            open += 1;
+        }
+    }
+    println!("RESULT seed: {open} open cells at 0.1 m, {under} cells under the roof bare");
+    assert!(open > 3000 && under == 100, "{open} open, {under} under");
+    // The pack is stepped once and is no longer a restore.
+    assert!(
+        !sim.app
+            .world()
+            .resource::<SurfaceWeathering>()
+            .is_restored()
+    );
+    sim.finish();
+}

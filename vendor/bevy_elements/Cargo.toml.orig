@@ -1,6 +1,6 @@
 [package]
 name = "bevy_elements"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Living environments for Bevy: sun, moon and stars, climate-driven weather, GPU wind, volumetric clouds, rain, snow and fog, lightning, terrain with hydraulic and thermal erosion, flooding, snow cover, wetness and dust — simulated in compute shaders."
@@ -12,7 +12,7 @@ readme = "README.md"
 # `bevy` first: it is the term a Bevy user searches, and crates.io weights keyword position.
 keywords = ["bevy", "weather", "terrain", "erosion", "atmosphere"]
 categories = ["game-development", "graphics", "rendering"]
-exclude = ["docs/*.gif", "docs/*.png", "docs/research/*", "tools/*"]
+exclude = ["assets/*", "docs/*.gif", "docs/*.png", "docs/research/*", "tools/*"]
 
 # docs.rs builds with every feature so the optional integrations are visible to someone choosing
 # the crate, not only to someone who has already checked out the source.
@@ -50,7 +50,10 @@ serde = { version = "1", features = ["derive"], optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 # Optional sibling: trees and their wind, season and wetness belong to `bevy_flora`; this crate
 # only writes its public resources (feature `flora`). Same Bevy minor (0.20).
-bevy_flora = { version = "0.30", optional = true, default-features = false }
+bevy_flora = { version = "0.46", optional = true, default-features = false }
+# bevy_isomesh 0.0.10 is built on Bevy 0.19 and lacks `replace_field` and `IsomeshSystems`, and
+# bevy_isomesh 0.0.11 needs isomesh 0.0.11 exactly, so both stay at 0.0.11
+# (`docs/research/voxel-volumes.md`, Deviation 1).
 bevy_isomesh = { version = "0.0.11", optional = true }
 isomesh = { version = "0.0.11", optional = true }
 
@@ -58,7 +61,8 @@ isomesh = { version = "0.0.11", optional = true }
 # full umbrella here, where it cannot reach a consumer's dependency graph. `tests/leaf.rs` reads
 # `[dependencies]` only, deliberately.
 [dev-dependencies]
-bevy = { version = "0.20.0" }
+# `jpeg`: the examples' ground texture maps (`assets/ground/`); the crate itself loads no images.
+bevy = { version = "0.20.0", features = ["jpeg"] }
 serde_json = "1"
 
 # Compute shaders are not in WebGL2, so wasm means WebGPU. `web` makes `bevy::platform::time::Instant`
@@ -72,6 +76,10 @@ required-features = ["flora"]
 
 [[example]]
 name = "voxel_snow"
+required-features = ["isomesh"]
+
+[[example]]
+name = "voxel_walls"
 required-features = ["isomesh"]
 
 [[test]]

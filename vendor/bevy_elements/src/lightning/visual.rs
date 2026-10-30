@@ -14,13 +14,10 @@ use super::strikes::ActiveBolt;
 use super::{FLASH_HEIGHT_M, FLASH_LUMENS, FLASH_RANGE_M};
 use crate::climate::Weather;
 use crate::fog::extinction_for_visibility;
-use crate::plugin::{ElementsSystems, ElementsView};
+use crate::plugin::{ElementsSystems, ElementsUnits, ElementsView};
 
 /// Scene luminance of the channel core at a first stroke's peak, cd/m² (plan 2.3).
 const BOLT_LUMINANCE: f32 = 50_000.0;
-/// Largest display value written per layer: `Rgba16Float` tops out at 65 504 and about sixteen
-/// layers (crossed ribbons, branches, restrikes) can overlap.
-const DISPLAY_MAX: f32 = 4096.0;
 /// Blue-white, linear RGB.
 const TINT: Vec3 = Vec3::new(0.85, 0.92, 1.0);
 /// Half the 6.5 cm mean channel diameter, m.
@@ -38,7 +35,7 @@ const GLOW_AMPLITUDE: f32 = 0.0004;
 /// Texels across the ramp.
 const RAMP_TEXELS: u32 = 256;
 /// Pixel angle of a 1080p, 60° view, rad: the width used when the followed camera's is unknown.
-const DEFAULT_PIXEL_ANGLE: f32 = 1.069e-3;
+const DEFAULT_PIXEL: PixelSize = PixelSize::Angle(1.069e-3);
 
 /// A bolt's render objects.
 #[derive(Component)]
@@ -68,10 +65,29 @@ pub(crate) fn pixel_angle(fov_y: f32, height_px: f32) -> f32 {
     2.0 * (fov_y * 0.5).tan() / height_px
 }
 
+/// The world size of one pixel of the followed camera at a distance from it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PixelSize {
+    /// A perspective camera's: the angle one pixel subtends vertically, rad.
+    Angle(f32),
+    /// An orthographic camera's: one pixel's height in world units, at every distance.
+    Fixed(f32),
+}
+
+impl PixelSize {
+    /// One pixel's height at `distance_m` from the camera, m.
+    pub(crate) fn at(self, distance_m: f32) -> f32 {
+        match self {
+            Self::Angle(angle) => angle * distance_m,
+            Self::Fixed(size) => size,
+        }
+    }
+}
+
 /// Half-width of the channel core at `distance_m`: the physical channel, or two pixels if that
 /// is wider on screen.
-pub(crate) fn core_half_width(distance_m: f32, pixel_angle: f32) -> f32 {
-    PHYSICAL_HALF_WIDTH_M.max(0.5 * CORE_PIXELS * distance_m * pixel_angle)
+pub(crate) fn core_half_width(distance_m: f32, pixel: PixelSize) -> f32 {
+    PHYSICAL_HALF_WIDTH_M.max(0.5 * CORE_PIXELS * pixel.at(distance_m))
 }
 
 /// Half-width of the ribbon quad around a core of half-width `core`.
@@ -82,9 +98,7 @@ pub(crate) fn quad_half_width(core: f32) -> f32 {
 /// The display value of scene luminance `luminance` (cd/m²) under camera exposure `exposure`
 /// (`2^−EV₁₀₀ / 1.2`): Bevy writes an unlit colour as it is, so the exposure is applied here,
 /// and the result is clamped so it stays finite in `Rgba16Float`.
-pub(crate) fn display_value(luminance: f32, exposure: f32) -> f32 {
-    (luminance * exposure).min(DISPLAY_MAX)
-}
+pub(crate) use crate::celestial::light::display_value;
 
 /// Material colour for a layer at envelope `mean` under `exposure`.
 pub(crate) fn layer_color(mean: f32, exposure: f32) -> LinearRgba {
@@ -159,7 +173,7 @@ pub(crate) fn ribbon_mesh(
     channels: &[&Channel],
     origin: Vec3,
     view: Vec3,
-    pixel_angle: f32,
+    pixel: PixelSize,
     extinction: f32,
 ) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
@@ -188,7 +202,7 @@ pub(crate) fn ribbon_mesh(
                 .unwrap_or_else(|| tangent.any_orthonormal_vector());
             let s2 = tangent.cross(s1);
             let distance = p.distance(view);
-            let core = core_half_width(distance, pixel_angle) * channel.width;
+            let core = core_half_width(distance, pixel) * channel.width;
             let q = quad_half_width(core);
             let t = (-extinction * distance).exp();
             let local = p - origin;
@@ -264,28 +278,39 @@ fn warm_up(
 #[derive(SystemParam)]
 struct ViewPixels<'w, 's> {
     view: Res<'w, ElementsView>,
+    units: Res<'w, ElementsUnits>,
     cameras: Query<'w, 's, (&'static Camera, &'static Projection)>,
 }
 
 impl ViewPixels<'_, '_> {
-    /// The angle one pixel of the followed camera subtends, rad; a 1080p, 60° view's if there is
-    /// no followed perspective camera with a target yet.
-    fn angle(&self) -> f32 {
+    /// The size in metres of one pixel of the followed camera: the angle a perspective camera's
+    /// pixel subtends, or an orthographic camera's pixel height; a 1080p, 60° view's if there is
+    /// no followed camera with a target yet.
+    fn size(&self) -> PixelSize {
         self.view
             .entity
             .and_then(|e| self.cameras.get(e).ok())
             .and_then(|(camera, projection)| {
-                let Projection::Perspective(p) = projection else {
-                    return None;
-                };
-                let size = camera.physical_target_size()?;
-                Some(pixel_angle(p.fov, size.y as f32))
+                let height_px = camera.physical_target_size()?.y as f32;
+                match projection {
+                    Projection::Perspective(p) => {
+                        Some(PixelSize::Angle(pixel_angle(p.fov, height_px)))
+                    }
+                    Projection::Orthographic(o) => Some(PixelSize::Fixed(
+                        self.units.metres(o.area.height()) / height_px,
+                    )),
+                    Projection::Custom(_) => None,
+                }
             })
-            .unwrap_or(DEFAULT_PIXEL_ANGLE)
+            .filter(|p| match *p {
+                PixelSize::Angle(a) | PixelSize::Fixed(a) => a.is_finite() && a > 0.0,
+            })
+            .unwrap_or(DEFAULT_PIXEL)
     }
 }
 
 /// Build the ribbons and the light for every bolt that just struck.
+#[allow(clippy::too_many_arguments)]
 fn attach(
     mut commands: Commands,
     new: Query<(Entity, &ActiveBolt), Added<ActiveBolt>>,
@@ -294,11 +319,12 @@ fn attach(
     mut materials: ResMut<Assets<StandardMaterial>>,
     ramp: Res<Ramp>,
     weather: Res<Weather>,
+    units: Res<ElementsUnits>,
 ) {
     if new.is_empty() {
         return;
     }
-    let pixel = pixels.angle();
+    let pixel = pixels.size();
     let ramp = ramp.0.clone();
     let extinction = extinction_for_visibility(weather.visibility_m);
     for (entity, active) in &new {
@@ -326,9 +352,14 @@ fn attach(
         });
         let mut light = Entity::PLACEHOLDER;
         let branch_material = branches.as_ref().map(|(_, m)| m.clone());
+        // The bolt is built in metres about its attachment point: its entity stands at that
+        // point in the world and is scaled by the units, so the ribbons and the light's height
+        // follow. A light's range and intensity are not transformed: they are written in world
+        // units (range × u, intensity × u², `E = I / d²`).
+        let u = units.per_metre();
         commands.entity(entity).insert((
             Name::new("Lightning bolt"),
-            Transform::from_translation(ground),
+            Transform::from_translation(units.point_to_world(ground)).with_scale(Vec3::splat(u)),
             Visibility::default(),
         ));
         commands.entity(entity).with_children(|parent| {
@@ -341,7 +372,7 @@ fn attach(
                     PointLight {
                         color: Color::linear_rgb(TINT.x, TINT.y, TINT.z),
                         intensity: 0.0,
-                        range: FLASH_RANGE_M,
+                        range: FLASH_RANGE_M * u,
                         shadow_maps_enabled: false,
                         ..default()
                     },
@@ -361,6 +392,7 @@ fn attach(
 fn animate(
     bolts: Query<(&ActiveBolt, &BoltVisual)>,
     view: Res<ElementsView>,
+    units: Res<ElementsUnits>,
     exposures: Query<&Exposure>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut lights: Query<&mut PointLight>,
@@ -381,7 +413,8 @@ fn animate(
             material.base_color = layer_color(active.mean_first, exposure).into();
         }
         if let Ok(mut light) = lights.get_mut(visual.light) {
-            light.intensity = FLASH_LUMENS * active.mean;
+            let u = units.per_metre();
+            light.intensity = FLASH_LUMENS * active.mean * u * u;
         }
     }
 }
@@ -389,6 +422,7 @@ fn animate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::celestial::light::DISPLAY_MAX;
     use crate::lightning::bolt::generate;
 
     fn exposure(ev100: f32) -> f32 {
@@ -431,6 +465,7 @@ mod tests {
     fn the_ribbon_keeps_two_pixels_of_core() {
         let delta = pixel_angle(60f32.to_radians(), 1080.0);
         assert!((delta - 1.069e-3).abs() < 1e-6, "{delta}");
+        let delta = PixelSize::Angle(delta);
         let core = |d| 2.0 * core_half_width(d, delta);
         assert!((core(1000.0) - 2.14).abs() < 0.01, "{}", core(1000.0));
         assert!(
@@ -446,6 +481,21 @@ mod tests {
         assert!((core(5000.0) - 10.7).abs() < 0.05, "{}", core(5000.0));
     }
 
+    /// Under an orthographic camera a pixel is the same size at every distance, so the core is
+    /// two pixels wide wherever the bolt strikes (issue #7).
+    #[test]
+    fn an_orthographic_ribbon_keeps_two_pixels_at_every_distance() {
+        // A 1080-pixel view 200 m high: 0.185 m a pixel, 0.370 m of core.
+        let pixel = PixelSize::Fixed(200.0 / 1080.0);
+        for d in [10.0, 1500.0, 8000.0] {
+            let core = 2.0 * core_half_width(d, pixel);
+            assert!(
+                core.is_finite() && (core - 0.3704).abs() < 1e-3,
+                "{d} m: {core}"
+            );
+        }
+    }
+
     #[test]
     fn a_ribbon_pair_is_four_triangles_per_segment() {
         let bolt = generate(11, Vec3::ZERO, 1500.0);
@@ -453,7 +503,7 @@ mod tests {
             &[&bolt.channels[0]],
             Vec3::ZERO,
             Vec3::new(1000.0, 5.0, 0.0),
-            1e-3,
+            PixelSize::Angle(1e-3),
             0.0,
         );
         let triangles = mesh.indices().map_or(0, Indices::len) / 3;
@@ -470,7 +520,13 @@ mod tests {
         let bolt = generate(11, Vec3::ZERO, 1500.0);
         let view = Vec3::new(1500.0, 0.0, 0.0);
         let colours = |extinction| {
-            let mesh = ribbon_mesh(&[&bolt.channels[0]], Vec3::ZERO, view, 1e-3, extinction);
+            let mesh = ribbon_mesh(
+                &[&bolt.channels[0]],
+                Vec3::ZERO,
+                view,
+                PixelSize::Angle(1e-3),
+                extinction,
+            );
             match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
                 Some(bevy::mesh::VertexAttributeValues::Float32x4(c)) => c.clone(),
                 other => panic!("no vertex colours: {other:?}"),

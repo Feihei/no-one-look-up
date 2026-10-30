@@ -46,7 +46,7 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 
 use super::stars::ZENITH_OPTICAL_DEPTH;
-use super::{CelestialFrame, SunState};
+use super::{CelestialFrame, CelestialSettings, SunState};
 use crate::plugin::{ElementsSystems, ElementsView};
 
 /// The albedo map, raw `u8`, row-major, 512×256, row 0 = north, column 0 = longitude −180°.
@@ -251,10 +251,14 @@ fn quad_mesh() -> Mesh {
 
 fn spawn_moon(
     mut commands: Commands,
+    settings: Res<CelestialSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<MoonMaterial>>,
 ) {
+    if !settings.sky {
+        return;
+    }
     let material = MoonMaterial {
         params: MoonParams::default(),
         albedo: images.add(albedo_image()),

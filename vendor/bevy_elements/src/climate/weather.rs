@@ -135,6 +135,16 @@ pub struct Weather {
     pub storminess: f32,
     /// Airborne dust, 0–1.
     pub dust: f32,
+    /// How far precipitation may fall as snow, 0–1: 0 outside the climate's
+    /// [`SnowSeason`](crate::SnowSeason) (raised by a forced Snow or Blizzard), 1 otherwise.
+    /// [`snow_fraction`](Self::snow_fraction) is scaled by it.
+    #[cfg_attr(feature = "serde", serde(default = "one"))]
+    pub snow_possible: f32,
+}
+
+#[cfg(feature = "serde")]
+fn one() -> f32 {
+    1.0
 }
 
 impl Default for Weather {
@@ -151,14 +161,16 @@ impl Default for Weather {
             visibility_m: t.visibility,
             storminess: t.storm,
             dust: t.dust,
+            snow_possible: 1.0,
         }
     }
 }
 
 impl Weather {
-    /// Fraction of precipitation falling as snow: 1 at ≤ −1 °C, 0 at ≥ 2 °C, linear between.
+    /// Fraction of precipitation falling as snow: 1 at ≤ −1 °C, 0 at ≥ 2 °C, linear between,
+    /// times [`snow_possible`](Self::snow_possible).
     pub fn snow_fraction(&self) -> f32 {
-        ((2.0 - self.temperature_c) / 3.0).clamp(0.0, 1.0)
+        ((2.0 - self.temperature_c) / 3.0).clamp(0.0, 1.0) * self.snow_possible
     }
 }
 
@@ -357,9 +369,12 @@ pub(crate) fn schedule(climate: &Climate, southern: bool, prev: WeatherPreset, i
     let doy = f32::from(date.day_of_year()) + hour / 24.0;
     let temperature = climate.base_temperature_c(doy, hour, southern);
     let summer = Season::of_month(date.month, southern) == Season::Summer;
+    // Out of the snow season (its whole day, the ramps included) the snow presets are gated as
+    // above 1 °C.
+    let snowless = climate.snow_season.is_some_and(|s| !s.contains(date));
 
     let gated = |p: WeatherPreset| match p {
-        WeatherPreset::Snow | WeatherPreset::Blizzard => temperature > 1.0,
+        WeatherPreset::Snow | WeatherPreset::Blizzard => temperature > 1.0 || snowless,
         WeatherPreset::Rain | WeatherPreset::Drizzle | WeatherPreset::Thunderstorm => {
             temperature < -1.0
         }
@@ -533,6 +548,9 @@ pub(crate) fn run_weather(
         visibility_m: blend.visibility,
         storminess: blend.storm,
         dust: blend.dust,
+        snow_possible: climate
+            .snow_possible(clock.date, clock.hour)
+            .max(blend.snow_cap),
     };
 }
 
@@ -540,6 +558,40 @@ impl WeatherDirector {
     /// The preset of the transition in progress, before this frame's request is applied.
     fn current_target_preset(&self) -> WeatherPreset {
         self.transition.map_or(self.scheduled, |t| t.preset)
+    }
+
+    /// The scheduler's coming weather: the preset it will have chosen for each of the `hours`
+    /// game hours after `clock`'s hour, element 0 for the next hour. It runs the seeded chain
+    /// forward from where this director is, exactly as the hourly steps will (a director that has
+    /// not stepped yet starts its chain Clear at `clock`'s hour), so with the same `climate` and
+    /// `location` the weather turns out as forecast. A forced preset does not enter it: the chain
+    /// keeps stepping underneath a force, and [`release`](Self::release) blends back to it. Pure:
+    /// the director is not changed.
+    pub fn forecast(
+        &self,
+        climate: &Climate,
+        location: &GeoLocation,
+        clock: &WorldClock,
+        hours: u32,
+    ) -> Vec<WeatherPreset> {
+        let index = clock.hours_since_2000().floor() as i64;
+        let southern = location.is_southern();
+        let (mut preset, from) = match self.last_hour {
+            None => (WeatherPreset::Clear, index),
+            Some(last) if index < last || index - last > MAX_STEPS_PER_FRAME => {
+                (self.scheduled, index)
+            }
+            Some(last) => (self.scheduled, last),
+        };
+        for hour in from + 1..=index {
+            preset = schedule(climate, southern, preset, hour).preset;
+        }
+        (index + 1..=index + i64::from(hours))
+            .map(|hour| {
+                preset = schedule(climate, southern, preset, hour).preset;
+                preset
+            })
+            .collect()
     }
 }
 
@@ -692,5 +744,75 @@ mod tests {
             8760,
         );
         assert!(desert.contains(&WeatherPreset::DustStorm));
+    }
+
+    /// Issue #27 (precipitation-look.md Validation 5): the forecast is the weather the director
+    /// then schedules, hour by hour, whether a preset is forced meanwhile or not, from a director
+    /// that has not stepped yet and from one mid-chain.
+    #[test]
+    fn the_forecast_is_the_weather_that_comes() {
+        use crate::ClimatePlugin;
+        use std::collections::BTreeMap;
+        let app = |force: bool| {
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, ClimatePlugin))
+                .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                    Duration::from_millis(100),
+                ))
+                .insert_resource(Climate::temperate().with_seed(42))
+                .insert_resource(
+                    WorldClock::new(CivilDate::new(2026, 3, 1))
+                        .at_hour(6.5)
+                        .with_time_scale(3600.0),
+                );
+            if force {
+                app.world_mut()
+                    .resource_mut::<WeatherDirector>()
+                    .force(WeatherPreset::Thunderstorm, Duration::ZERO);
+            }
+            app
+        };
+        let forecast = |app: &App, hours| {
+            let w = app.world();
+            w.resource::<WeatherDirector>().forecast(
+                w.resource::<Climate>(),
+                w.resource::<GeoLocation>(),
+                w.resource::<WorldClock>(),
+                hours,
+            )
+        };
+        // Scheduled preset per hour index, 0.1 game hours an update.
+        let run = |app: &mut App, hours: usize| {
+            let mut seen = BTreeMap::new();
+            for _ in 0..hours * 10 + 5 {
+                app.update();
+                let w = app.world();
+                let index = w.resource::<WorldClock>().hours_since_2000().floor() as i64;
+                seen.insert(index, w.resource::<WeatherDirector>().scheduled);
+            }
+            seen
+        };
+        let start = |app: &App| app.world().resource::<WorldClock>().hours_since_2000().floor() as i64;
+
+        // A director that has not stepped: the chain starts Clear at the clock's hour.
+        let mut fresh = app(false);
+        let first = forecast(&fresh, 72);
+        let from = start(&fresh);
+        let seen = run(&mut fresh, 72);
+        let came: Vec<_> = (1..=72).map(|h| seen[&(from + h)]).collect();
+        assert_eq!(first, came);
+        assert!(came.windows(2).any(|w| w[0] != w[1]), "72 h without a change");
+
+        // Mid-chain, with Thunderstorm forced underneath: the same chain.
+        let mut forced = app(true);
+        run(&mut forced, 30);
+        let director = forced.world().resource::<WeatherDirector>().clone();
+        let next = forecast(&forced, 48);
+        assert_eq!(*forced.world().resource::<WeatherDirector>(), director);
+        assert!(director.is_forced());
+        let from = start(&forced);
+        let seen = run(&mut forced, 48);
+        let came: Vec<_> = (1..=48).map(|h| seen[&(from + h)]).collect();
+        assert_eq!(next, came);
     }
 }

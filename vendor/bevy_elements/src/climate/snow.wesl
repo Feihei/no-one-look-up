@@ -8,7 +8,8 @@
 // Mirrors `Weather::snow_fraction` (`climate/weather.rs`).
 
 /// Fraction of precipitation that falls as snow at air temperature `t_c` (°C): 1 at −1 °C and
-/// below, 0 at 2 °C and above, linear between.
-fn snow_fraction_at(t_c: f32) -> f32 {
-    return clamp((2.0 - t_c) / 3.0, 0.0, 1.0);
+/// below, 0 at 2 °C and above, linear between, times `possible` (`Weather::snow_possible`: 0
+/// outside the climate's snow season).
+fn snow_fraction_at(t_c: f32, possible: f32) -> f32 {
+    return clamp((2.0 - t_c) / 3.0, 0.0, 1.0) * possible;
 }

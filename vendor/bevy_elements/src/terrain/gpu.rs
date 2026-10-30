@@ -2,8 +2,8 @@
 //! kernels.
 //!
 //! The kernels run in one compute pass, on the first frame with a ready pipeline (generator,
-//! then everything below) and afterwards on any frame in which something set
-//! `TerrainGpu::dirty` (hydrology and erosion do, once per frame they ran). Each run bumps
+//! then everything below) and afterwards on any frame in which something bumped
+//! `TerrainGpu::changes` (hydrology and erosion do, once per frame they ran). Each run bumps
 //! `TerrainState::version`, which the main world's readback compares against.
 
 use std::sync::atomic::Ordering;
@@ -201,7 +201,7 @@ fn prepare(
         return;
     };
     let generated = gpu.generated.load(Ordering::Relaxed);
-    if generated && !gpu.dirty.load(Ordering::Relaxed) {
+    if generated && gpu.changes <= gpu.packed.load(Ordering::Relaxed) {
         commands.remove_resource::<TerrainBindGroups>();
         return;
     }
@@ -318,7 +318,7 @@ fn dispatch(
         return;
     };
     let generated = gpu.generated.load(Ordering::Relaxed);
-    if generated && !gpu.dirty.load(Ordering::Relaxed) {
+    if generated && gpu.changes <= gpu.packed.load(Ordering::Relaxed) {
         return;
     }
     let generator = match &gpu.source {
@@ -368,7 +368,7 @@ fn dispatch(
     pass.dispatch_workgroups(groups(rb.x, 8), groups(rb.y, 8), 1);
     span.end(&mut pass);
     drop(pass);
-    gpu.dirty.store(false, Ordering::Relaxed);
+    gpu.packed.store(gpu.changes, Ordering::Relaxed);
     gpu.generated.store(true, Ordering::Relaxed);
     gpu.state.version.fetch_add(1, Ordering::Relaxed);
 }

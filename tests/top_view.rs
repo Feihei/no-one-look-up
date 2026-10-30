@@ -118,6 +118,7 @@ fn main() {
         }),
         ElementsCamera {
             auto_exposure: false,
+            ..ElementsCamera::default()
         },
         Exposure { ev100: 13.0 },
         Tonemapping::AcesFitted,

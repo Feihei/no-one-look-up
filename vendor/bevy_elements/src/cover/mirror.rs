@@ -24,7 +24,8 @@ pub(crate) fn diffuse_lambda(dt_s: f32) -> f32 {
 /// Highest a blocker still shelters the ground, m (`shelter.wesl`).
 pub(crate) const SHELTER_HEIGHT_M: f32 = 500.0;
 
-/// Fraction of precipitation that falls as snow at `t_c` (`snow.wesl` in `climate`).
+/// Fraction of precipitation that falls as snow at `t_c` (`snow.wesl` in `climate`), in the snow
+/// season (`possible` 1).
 pub(crate) fn snow_fraction_at(t_c: f32) -> f32 {
     Weather {
         temperature_c: t_c,

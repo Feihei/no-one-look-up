@@ -16,7 +16,9 @@ use bevy::render::storage::ShaderBuffer;
 use crate::climate::{Climate, Weather};
 use crate::gpu::grid::{storage_buffer, storage_volume};
 use crate::gpu::readback::{Readbacks, decode};
-use crate::plugin::{ElementsQuality, ElementsSystems, ElementsView, ensure_gpu_core};
+use crate::plugin::{
+    ElementsQuality, ElementsSystems, ElementsUnits, ElementsView, ensure_gpu_core,
+};
 use crate::query::EnvironmentSnapshot;
 use crate::terrain::{NO_TERRAIN, TerrainParamsGpu, TerrainState};
 
@@ -57,15 +59,30 @@ pub fn log_wind_speed(u10: f32, height_m: f32) -> f32 {
 }
 
 /// The uniform the `bevy_elements::wind` WGSL import takes. Bind it with
-/// `#[uniform(N)] wind: WindFieldParams` and fill it from [`WindState::field_params`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, ShaderType, Reflect)]
+/// `#[uniform(N)] wind: WindFieldParams` and fill it from [`WindState::field_params`]. The field
+/// itself is in the metre frame (world ÷ `units`); `elements_wind` takes a world position and
+/// divides it by `units`.
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, Reflect)]
 pub struct WindFieldParams {
-    /// xyz: world position of the field's minimum corner, m. w: unused.
+    /// xyz: metre-frame position of the field's minimum corner, m. w: unused.
     pub origin: Vec4,
     /// xyz: field size, m. w: 1 when the field holds simulated data, else 0.
     pub extent: Vec4,
     /// xyz: prevailing wind at 10 m, m/s, used outside the field. w: unused.
     pub prevailing: Vec4,
+    /// x: world units per metre ([`crate::ElementsUnits::units_per_metre`]). yzw: unused.
+    pub units: Vec4,
+}
+
+impl Default for WindFieldParams {
+    fn default() -> Self {
+        Self {
+            origin: Vec4::ZERO,
+            extent: Vec4::ZERO,
+            prevailing: Vec4::ZERO,
+            units: Vec4::new(1.0, 0.0, 0.0, 0.0),
+        }
+    }
 }
 
 /// The wind, for shaders, sibling crates and gameplay.
@@ -77,15 +94,19 @@ pub struct WindState {
     pub speed_10m: f32,
     /// Peak 3-s gust over the mean: `1 + 0.5·gustiness`.
     pub gust_factor: f32,
-    /// Wind at the followed camera, m/s.
-    pub at_camera: Vec3,
+    /// Wind at the view's focus ([`ElementsFocus`](crate::ElementsFocus), else the followed
+    /// camera), m/s.
+    pub at_focus: Vec3,
     /// The simulated field: a 3D `rgba16float` texture, xyz = velocity m/s, w = turbulence
     /// intensity, toroidally addressed (see `bevy_elements::wind`).
     pub field: Handle<Image>,
-    /// World position of the field's minimum corner, m.
+    /// Metre-frame position of the field's minimum corner, m (world ÷ `units_per_metre`).
     pub field_origin: Vec3,
     /// Field size, m.
     pub field_extent: Vec3,
+    /// World units per metre, as the crate last read [`ElementsUnits`]: what
+    /// [`WindState::field_params`] hands the shader to convert a world position.
+    pub units_per_metre: f32,
     /// Whether the field has been simulated at least once.
     pub field_live: bool,
 }
@@ -96,11 +117,12 @@ impl Default for WindState {
             prevailing: Vec2::X,
             speed_10m: 0.0,
             gust_factor: 1.0,
-            at_camera: Vec3::ZERO,
+            at_focus: Vec3::ZERO,
             field: Handle::default(),
             field_origin: Vec3::ZERO,
             field_extent: Vec3::ZERO,
             field_live: false,
+            units_per_metre: 1.0,
         }
     }
 }
@@ -114,6 +136,7 @@ impl WindState {
                 .field_extent
                 .extend(if self.field_live { 1.0 } else { 0.0 }),
             prevailing: self.prevailing_velocity().extend(0.0),
+            units: Vec4::new(self.units_per_metre, 0.0, 0.0, 0.0),
         }
     }
 
@@ -127,7 +150,8 @@ impl WindState {
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WindGust {
-    /// World XZ where the band's centre line starts, m.
+    /// World XZ where the band's centre line starts (world units; the crate computes it in
+    /// metres and scales it by `units_per_metre` when it announces the gust).
     pub origin: Vec2,
     /// Unit XZ direction the band travels and pushes.
     pub direction: Vec2,
@@ -241,6 +265,7 @@ impl Plugin for WindPlugin {
         ensure_gpu_core(app);
         embedded_asset!(app, "sim.wesl");
         app.init_resource::<WindRuntime>()
+            .init_resource::<Climate>()
             .add_message::<WindGust>()
             .add_systems(
                 Update,
@@ -336,6 +361,7 @@ fn step_wind(
     time: Res<Time<Virtual>>,
     view: Res<ElementsView>,
     weather: Res<Weather>,
+    units: Res<ElementsUnits>,
     climate: Res<Climate>,
     snapshot: Res<EnvironmentSnapshot>,
     terrain: Option<Res<TerrainState>>,
@@ -351,13 +377,14 @@ fn step_wind(
     state.prevailing = direction;
     state.speed_10m = u10;
     state.gust_factor = 1.0 + GUST_STRENGTH * gustiness;
+    state.units_per_metre = units.per_metre();
 
     let Some(grid) = grid.as_deref_mut() else {
         return;
     };
     let Some(camera) = view.entity.map(|_| view.position) else {
         grid.active = false;
-        state.at_camera = state.prevailing_velocity();
+        state.at_focus = state.prevailing_velocity();
         return;
     };
 
@@ -365,7 +392,10 @@ fn step_wind(
         runtime.rng = climate.seed ^ 0x57_1D_6A_57;
     }
     if let Some(gust) = advance_gusts(&mut runtime, camera, direction, u10, gustiness, dt) {
-        gusts.write(gust);
+        gusts.write(WindGust {
+            origin: gust.origin * units.per_metre(),
+            ..gust
+        });
     }
 
     // Window: whole-cell steps, centred horizontally. Vertically it starts 8 m below the ground
@@ -426,7 +456,7 @@ fn step_wind(
     state.field_origin = origin.as_vec3() * WIND_CELL_M;
     state.field_extent = grid.size.as_vec3() * WIND_CELL_M;
     state.field_live = grid.live.load(Ordering::Relaxed);
-    state.at_camera = snapshot
+    state.at_focus = snapshot
         .wind
         .as_ref()
         .and_then(|w| w.sample(camera))
@@ -448,13 +478,15 @@ fn read_wind(grid: Option<Res<WindGpu>>, mut readbacks: Readbacks) {
         let Some(cells) = decode::<[f32; 4]>(bytes) else {
             return;
         };
-        if cells.len() != (size.x * size.y * size.z) as usize {
+        // The readback pool can hand back a larger buffer than asked for: decode only the grid.
+        let n = (size.x * size.y * size.z) as usize;
+        if cells.len() < n {
             return;
         }
         snapshot.wind = Some(WindSnapshot {
             origin_cell,
             size,
-            data: cells.into_iter().map(Vec4::from_array).collect(),
+            data: cells[..n].iter().copied().map(Vec4::from_array).collect(),
         });
     });
 }

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use bevy::math::Vec2;
+use bevy::math::{IVec2, Vec2};
 use bevy_isomesh::VolumeField;
 use isomesh::Sdf;
 
@@ -13,7 +13,8 @@ use crate::terrain::TerrainGrid;
 /// column's top.
 ///
 /// For a world point `p`, with `c` the voxel cell size, `t(x, z)` the column top and `s(x, z)`
-/// the snow depth (both bilinear in their grids, edge clamped, the tap rule of the terrain):
+/// the snow depth (both bilinear in their grids, edge clamped, the tap rule of the terrain,
+/// except across a cliff, below):
 ///
 /// ```text
 /// sample(p) = min( base(p),  max( p.y − (t + s),  (t − c) − p.y ) )
@@ -24,6 +25,11 @@ use crate::terrain::TerrainGrid;
 /// on and the union has no gap at the join. `min` is the union, so the base is never carved, and
 /// at every point at least `c` below the top the slab term is `≥ 0`: **the sign there, and so the
 /// mesh, is the base's, exactly.** A tunnel under a roof thicker than `c` never gets snow.
+///
+/// **Across a cliff** (the four column tops around `p` differ by more than `c`: a merlon's foot,
+/// a wall's side over air) `t` and `s` are the nearest column's: a top blended across the step
+/// would float the slab off the lower columns and hang its underside in the air, a dark sheet
+/// down the face (`docs/research/voxel-volumes.md`, Deviation 3).
 ///
 /// The value is a signed distance only inside the slab's own faces; like the reference fields of
 /// `isomesh` it is a valid solid but not an exact distance, and `gradient` is the default central
@@ -102,6 +108,25 @@ impl SnowyField {
     pub fn top_grid(&self) -> &TerrainGrid {
         &self.top_grid
     }
+
+    /// The column top and snow depth at `xz`: bilinear, or the nearest column's across a cliff.
+    fn top_and_snow(&self, xz: Vec2) -> (f32, f32) {
+        let g = &self.top_grid;
+        let base = ((xz - g.origin) / g.cell_m - 0.5).floor().as_ivec2();
+        let at = |dx: i32, dz: i32| self.top[g.index(base + IVec2::new(dx, dz))];
+        let taps = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+        let lo = taps.iter().copied().fold(f32::MAX, f32::min);
+        let hi = taps.iter().copied().fold(f32::MIN, f32::max);
+        if hi - lo <= self.cell_size {
+            return (
+                g.sample(&self.top, xz),
+                self.snow_grid.sample(&self.snow, xz),
+            );
+        }
+        let nearest =
+            |grid: &TerrainGrid| grid.index(((xz - grid.origin) / grid.cell_m).floor().as_ivec2());
+        (self.top[nearest(g)], self.snow[nearest(&self.snow_grid)])
+    }
 }
 
 impl fmt::Debug for SnowyField {
@@ -120,8 +145,7 @@ impl Sdf for SnowyField {
     #[inline]
     fn sample(&self, p: [f32; 3]) -> f32 {
         let xz = Vec2::new(p[0], p[2]);
-        let top = self.top_grid.sample(&self.top, xz);
-        let snow = self.snow_grid.sample(&self.snow, xz);
+        let (top, snow) = self.top_and_snow(xz);
         let slab = (p[1] - (top + snow)).max((top - self.cell_size) - p[1]);
         self.base.sample(p).min(slab)
     }
@@ -265,5 +289,43 @@ mod tests {
             g[0].abs() < 1e-2 && (g[1] - 1.0).abs() < 1e-2 && g[2].abs() < 1e-2,
             "{g:?}"
         );
+    }
+
+    /// A 1 m step at `x = 0` (tops 5 m west, 6 m east) under 0.3 m of snow, 0.25 m voxels.
+    #[derive(Clone, Copy)]
+    struct Step;
+
+    impl Sdf for Step {
+        type Scalar = f32;
+        fn sample(&self, p: [f32; 3]) -> f32 {
+            p[1] - if p[0] < 0.0 { 5.0 } else { 6.0 }
+        }
+    }
+
+    #[test]
+    fn the_slab_sits_on_both_sides_of_a_cliff() {
+        let grid = centred_grid(8, 0.25);
+        let tops: Arc<[f32]> = (0..64)
+            .map(|i| if (i % 8) < 4 { 5.0 } else { 6.0 })
+            .collect();
+        let field = SnowyField::new(Arc::new(Step), 0.25, tops, grid, vec![0.3; 64].into(), grid);
+        // Just west of the step, 0.1 m above the low top: a blended top (5.46 m) put the slab's
+        // underside at 5.21 m and left air here under a floating sheet. The nearest column's top
+        // keeps the slab on the walk.
+        assert!(
+            field.sample([-0.01, 5.1, 0.0]) < 0.0,
+            "snow on the low side at the foot"
+        );
+        assert!(
+            field.sample([-0.01, 5.4, 0.0]) > 0.0,
+            "air above the low side's snow"
+        );
+        assert!(
+            field.sample([0.01, 6.2, 0.0]) < 0.0,
+            "snow on the high side"
+        );
+        // Away from the step the blend is unchanged.
+        assert!(field.sample([-0.6, 5.25, 0.0]) < 0.0);
+        assert!(field.sample([-0.6, 5.35, 0.0]) > 0.0);
     }
 }

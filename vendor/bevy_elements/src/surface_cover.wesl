@@ -12,12 +12,12 @@
 
 import bevy_elements::noise::{hash33, perlin3};
 
-/// The shared globals buffer, five `vec4<f32>` (80 B). Mirrors the Rust `ElementsGlobals`.
+/// The shared globals buffer, eight `vec4<f32>` (128 B). Mirrors the Rust `ElementsGlobals`.
 struct ElementsGlobals {
     /// x wetness 0–1, y snow cover 0–1 (both of exposed flat ground), z rain intensity
-    /// `min(1, R_liquid / 20)`, w the camera's mean cloud transmittance.
+    /// `min(1, R_liquid / 20)`, w the mean cloud transmittance the lights carry.
     weather: vec4<f32>,
-    /// xy cloud shadow map origin (world XZ, m), z extent (m), w 1 when a map is bound.
+    /// xy cloud shadow map origin (metre-frame XZ, m), z extent (m), w 1 when a map is bound.
     shadow: vec4<f32>,
     /// Phase of each of the four ripple layers, 0–1.
     ripple: vec4<f32>,
@@ -25,16 +25,45 @@ struct ElementsGlobals {
     wind: vec4<f32>,
     /// xyz unit direction toward the light the shadow map was made for.
     light: vec4<f32>,
+    /// x world units per metre (`ElementsUnits`); the rest 0. A shader that takes a world position
+    /// from Bevy divides it by this before the metre-based functions below (`rain_streak`,
+    /// `ripple_offset`, `cloud_shadow_uv`).
+    units: vec4<f32>,
+    /// The trail field's window, as `bevy_elements::trails::surface` takes it: x texel edge (m),
+    /// y texels a side, z 1 when trails run, w the parallax march's bound on |h| (m).
+    trail: vec4<f32>,
+    /// x the beam's share of the light on a horizontal surface (a trail's self-shadow removes
+    /// it), yz the trail window's centre (metre-frame XZ), w the snow depth of exposed ground (m).
+    trail_light: vec4<f32>,
 }
 
 /// Linear albedo of snow; bit-equal to `bevy_flora`'s `SNOW_ALBEDO` (`common.wesl:388`).
 const SNOW_ALBEDO: vec3<f32> = vec3<f32>(0.80, 0.83, 0.88);
 /// Roughness of snow; `bevy_flora` `common.wesl:424` (the plan's 0.6 is Deviation 4 of snow-cover.md).
 const SNOW_ROUGHNESS: f32 = 0.9;
-/// Fraction of albedo a fully wet, fully porous surface loses (plan 4.1).
-const WET_ALBEDO_LOSS: f32 = 0.5;
-/// Roughness a wet surface approaches (plan 4.1).
+/// The water film's diffuse reflectances, external and internal, for water's n = 1.33: a wet
+/// porous surface's albedo is `(1 − r_e)(1 − r_i) ρ / (1 − r_i ρ)` per channel, the film physics
+/// of `wetness.md` Model adopted 2 (Jensen et al. 1999 §2.1). A dark channel loses more than a
+/// bright one, so wet colour is more saturated (`wet-ground.md`, Model adopted 1).
+const WET_FILM_R_E: f32 = 0.0659;
+const WET_FILM_R_I: f32 = 0.4720;
+/// The albedo a porous surface drenched to `DRENCHED_MAX` keeps: Lagarde's empirical 0.2–0.3.
+const DRENCHED_ALBEDO: f32 = 0.3;
+/// Roughness of a water film: a smooth or metal surface holds one as soon as it is wet, a porous
+/// one only when it is drenched past saturation (wet-ground.md, Model adopted 2).
 const WET_ROUGHNESS: f32 = 0.1;
+/// How far a soaked, fully porous surface's gloss moves towards water's: Lagarde 3b's
+/// `lerp(1, factor, 0.5 · WetLevel)` with his `factor` 0.2, i.e. 0.5 × (1 − 0.2), so the roughness
+/// becomes `r · (1 − 0.4 · w · φ)` (wet-ground.md, Model adopted 1).
+const WET_GLOSS_BOOST: f32 = 0.4;
+/// How much a wet leaf's saturation rises at full wetness; `bevy_flora`'s `WET_LEAF_SATURATE`
+/// (`common.wesl:538`), so a meadow matches the wet trees on it.
+const WET_LEAF_SATURATE: f32 = 0.25;
+/// The excess green `2g − r − b` (chromatic coordinates) over which a surface turns from bare
+/// ground to canopy: Woebbecke et al. 1995's index, the ramp from the terrain's own layer colours
+/// (grass 0.834, sand 0.046, rock 0.000, soil −0.101; `wet-ground.md`, Model adopted 3).
+const CANOPY_EXG_LOW: f32 = 0.10;
+const CANOPY_EXG_HIGH: f32 = 0.80;
 /// Roughness of standing water (Lagarde 2013, gloss 1).
 const PUDDLE_ROUGHNESS: f32 = 0.02;
 /// Bevy `reflectance` for water: `F0 = 0.16 · r²` (pbr_functions.wesl:279) equals 0.02, so
@@ -79,7 +108,7 @@ fn mesh_snow_cover(snow: f32, normal_y: f32) -> f32 {
 
 /// Wetness a rain streak adds on top of a vertical face's film: `0.4 · min(1, f / 0.2) · s ·
 /// (1 − n_y²)` with `s` a noise stretched down the wall that flows with `phase`. `world` is the
-/// fragment's position, `normal` its geometric world normal, `intensity` the rain intensity `f`.
+/// fragment's position in metres, `normal` its geometric world normal, `intensity` the rain intensity `f`.
 /// The noise lattice repeats every 4096 units, so a `phase` wrapped at 8192 s is seamless.
 fn rain_streak(world: vec3<f32>, normal: vec3<f32>, intensity: f32, phase: f32) -> f32 {
     let vertical = 1.0 - normal.y * normal.y;
@@ -143,8 +172,10 @@ struct WeatheredSurface {
     normal: vec3<f32>,
 }
 
-/// Wet, puddled and snowed-on material inputs, in the order of the note: darken and gloss by the
-/// wetness `max(wetness, puddle)`; standing water is a mirror with water's `F0`, a level normal
+/// Wet, puddled and snowed-on material inputs, in the order of the note: darken by the wetness
+/// `max(wetness, puddle)` and the porosity; gloss a porous surface by Lagarde's limited boost and
+/// lay a water film on a smooth one, or on a porous one drenched past saturation
+/// (`docs/research/wet-ground.md`); standing water is a mirror with water's `F0`, a level normal
 /// plus `ripple` (the horizontal offset of `ripple_offset`); snow covers it all.
 ///
 /// With wetness, puddle and snow all 0 the inputs come back bit-for-bit.
@@ -162,8 +193,15 @@ fn weather_surface(
     var s = WeatheredSurface(base_color, roughness, metallic, reflectance, normal);
     let wet = min(max(wetness, puddle), DRENCHED_MAX);
     if wet > 0.0 {
-        s.base_color = base_color * (1.0 - WET_ALBEDO_LOSS * wet * porosity(roughness, metallic));
-        s.roughness = mix(roughness, min(roughness, WET_ROUGHNESS), saturate(wet));
+        let phi = porosity(roughness, metallic);
+        let soaked = min(wet, 1.0);
+        let drenched = saturate((wet - 1.0) / (DRENCHED_MAX - 1.0));
+        let filmed = (1.0 - WET_FILM_R_E) * (1.0 - WET_FILM_R_I) * base_color
+            / (vec3<f32>(1.0) - WET_FILM_R_I * base_color);
+        s.base_color = mix(mix(base_color, filmed, soaked * phi), base_color * DRENCHED_ALBEDO, drenched * phi);
+        let porous = roughness * (1.0 - WET_GLOSS_BOOST * soaked * phi);
+        let film = (1.0 - phi) * soaked + phi * drenched;
+        s.roughness = mix(porous, min(porous, WET_ROUGHNESS), film);
     }
     if puddle > 0.0 {
         s.roughness = mix(s.roughness, PUDDLE_ROUGHNESS, puddle);
@@ -178,8 +216,48 @@ fn weather_surface(
     return s;
 }
 
-/// Where the cloud shadow map is sampled for world position `p`: `xy` the texture coordinate,
-/// `z` 1 when the point lies inside a bound map (else its transmittance is 1).
+/// A wet canopy's colour, `wetness` 0–1 times the canopy's share of the surface: `bevy_flora`'s wet
+/// leaf (`common.wesl` `wet_on`), the saturation raised by a quarter at full wetness with the
+/// luminance kept. A blade's wax beads the rain, so a canopy takes no film and no gloss; the
+/// caller passes `weather_surface` only the wetness of the ground between the blades
+/// (`docs/research/wet-ground.md`, Model adopted 3). Exactly the input at `wetness` 0.
+fn wet_canopy(colour: vec3<f32>, wetness: f32) -> vec3<f32> {
+    if wetness <= 0.0 {
+        return colour;
+    }
+    return saturated(colour, 1.0 + WET_LEAF_SATURATE * wetness);
+}
+
+/// A colour's saturation scaled by `s` around its own linear Rec. 709 luminance: 0 is its grey,
+/// 1 the colour itself, above 1 more saturated; the luminance kept, no channel below zero.
+fn saturated(colour: vec3<f32>, s: f32) -> vec3<f32> {
+    let grey = vec3<f32>(dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722)));
+    return max(grey + (colour - grey) * s, vec3<f32>(0.0));
+}
+
+/// A game's grade of an albedo, `look` = (tint, saturation) (`TerrainLook`,
+/// `docs/research/terrain-look.md`): the saturation first, then the tint, so a cooling tint
+/// survives a desaturation. The default (1, 1, 1, 1) returns the albedo itself to the bit, and a
+/// tint alone is exactly a multiply.
+fn graded(albedo: vec3<f32>, look: vec4<f32>) -> vec3<f32> {
+    return saturated(albedo, max(look.w, 0.0)) * look.xyz;
+}
+
+/// The share of a surface that is green canopy, 0–1, read from its albedo: Woebbecke et al.'s
+/// excess green `2g − r − b` on chromatic coordinates (each channel over their sum), which tells
+/// living plants from soil, residue and stone (`docs/research/wet-ground.md`, Model adopted 3).
+/// Black is not canopy.
+fn canopy_share(colour: vec3<f32>) -> f32 {
+    let sum = colour.r + colour.g + colour.b;
+    if sum <= 1e-6 {
+        return 0.0;
+    }
+    let c = colour / sum;
+    return smoothstep(CANOPY_EXG_LOW, CANOPY_EXG_HIGH, 2.0 * c.g - c.r - c.b);
+}
+
+/// Where the cloud shadow map is sampled for position `p` in metres (world ÷ `g.units.x`): `xy`
+/// the texture coordinate, `z` 1 when the point lies inside a bound map (else its transmittance is 1).
 fn cloud_shadow_uv(g: ElementsGlobals, p: vec3<f32>) -> vec3<f32> {
     let l = g.light.xyz;
     if g.shadow.w > 0.5 && l.y > 0.1 {
@@ -191,10 +269,26 @@ fn cloud_shadow_uv(g: ElementsGlobals, p: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-/// Scale of the lit colour from the map's transmittance `t` at the point against the camera's
-/// mean transmittance: `(0.25 + 0.75 t) / (0.25 + 0.75 t_cam)` (clouds.md, "Cloud shadow map").
-fn cloud_shadow_ratio(t: f32, camera_transmittance: f32) -> f32 {
+/// Scale of the lit colour from the map's transmittance `t` at the point against the mean
+/// transmittance the lights carry: `(0.25 + 0.75 t) / (0.25 + 0.75 t_mean)`
+/// (broken-cloud-light.md, Model 2).
+fn cloud_shadow_ratio(t: f32, mean_transmittance: f32) -> f32 {
     let here = 0.25 + 0.75 * t;
-    let camera = max(0.25 + 0.75 * camera_transmittance, 0.01);
-    return clamp(here / camera, 0.0, 4.0);
+    let lights = max(0.25 + 0.75 * mean_transmittance, 0.01);
+    return clamp(here / lights, 0.0, 4.0);
+}
+
+/// The relief cue under a deck (`docs/research/snow-cover.md` Deviation 15, as revised by
+/// `sky-light.md` Deviation 9): the lit colour's scale for a surface whose normal has vertical
+/// component `n_y`, `deck` 0 in clear air (exactly no change) to 1 under a deck. The environment
+/// map carries the overcast dome, which shades a surface by its cosine, `1 − 0.30 (1 − n_y)`
+/// (measured on the sky probe's irradiance map: a side 0.70 and an underside 0.40 of a top); the
+/// iteration-7 curve `1 − 0.35 (1 − n_y)^0.3` was fitted so gentle relief reads (−6.7 % at 5°),
+/// standing for the sky occlusion real relief has. Their quotient, never above 1, is what the
+/// dome lacks: about −6.5 % on any tilted surface, and no second darkening of a wall.
+fn overcast_relief(n_y: f32, deck: f32) -> f32 {
+    let tilt = max(1.0 - n_y, 0.0);
+    let shape = 1.0 - 0.35 * pow(tilt, 0.3);
+    let dome = 1.0 - 0.30 * tilt;
+    return mix(1.0, min(shape / dome, 1.0), deck);
 }

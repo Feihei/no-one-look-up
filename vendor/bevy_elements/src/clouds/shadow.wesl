@@ -4,8 +4,8 @@
 //
 //   cloud_shadow          R transmittance, G optical depth (≤ 60), B precipitation darkening;
 //                         every fourth texel's transmittance (texel 4k + 2 on each axis) also
-//                         goes to `coarse`, the 256² grid the gameplay query reads back
-//   cloud_shadow_camera   mean transmittance of the 9×9 texels around the camera → buffer
+//                         goes to `coarse`, the 256² grid the gameplay query and the lights'
+//                         mean transmittance read back
 
 import bevy_pbr::render::utils::interleaved_gradient_noise;
 import bevy_elements::clouds::common::{CloudParams, cloud_medium};
@@ -15,8 +15,7 @@ import bevy_elements::clouds::common::{CloudParams, cloud_medium};
 @group(0) @binding(2) var base_tex: texture_3d<f32>;
 @group(0) @binding(3) var smp: sampler;
 @group(0) @binding(4) var shadow_out: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(5) var<storage, read_write> camera_t: array<f32, 4>;
-@group(0) @binding(6) var<storage, read_write> coarse: array<f32>;
+@group(0) @binding(5) var<storage, read_write> coarse: array<f32>;
 
 const TEXELS: u32 = 1024u;
 /// Texels per coarse cell edge.
@@ -47,7 +46,7 @@ fn shadow_at(texel: vec2<f32>) -> vec3<f32> {
     var s_sum = 0.0;
     for (var i = 0u; i < STEPS; i += 1u) {
         let h = h_b + (f32(i) + jitter) * dh;
-        let m = cloud_medium(h, q + l.xz * (h / l.y), false, params, base_tex, base_tex, weather_tex, smp);
+        let m = cloud_medium(h, q + l.xz * (h / l.y), 0.0, params, base_tex, base_tex, weather_tex, smp);
         tau += (1.0 + m.g) * m.sigma * ds;
         g_sum += m.g * m.sigma;
         s_sum += m.sigma;
@@ -65,22 +64,5 @@ fn cloud_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     if all(id.xy % COARSE_STRIDE == vec2<u32>(COARSE_STRIDE / 2u)) {
         let cell = id.xy / COARSE_STRIDE;
         coarse[cell.y * (TEXELS / COARSE_STRIDE) + cell.x] = s.x;
-    }
-}
-
-var<workgroup> column: array<f32, 81>;
-
-@compute @workgroup_size(9, 9, 1)
-fn cloud_shadow_camera(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    let centre = floor((params.camera.xz - params.shadow.xy) / (params.shadow.z / f32(TEXELS)));
-    let texel = centre + vec2<f32>(lid.xy) - 4.0;
-    column[lane] = shadow_at(texel + 0.5).x;
-    workgroupBarrier();
-    if lane == 0u {
-        var sum = 0.0;
-        for (var i = 0u; i < 81u; i += 1u) {
-            sum += column[i];
-        }
-        camera_t[0] = sum / 81.0;
     }
 }

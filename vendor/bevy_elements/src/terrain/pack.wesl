@@ -2,7 +2,7 @@
 // leaf bounds. See docs/research/terrain.md ("Layer buffers and the render pack", GPU mapping).
 //
 //   terrain_pack      bedrock + sediment + water → terrain_cells (surface, sediment, water, slope)
-//   terrain_readback  terrain_cells.x → one f32 per cell (2× box-averaged above 1024²)
+//   terrain_readback  terrain_cells.xy → (surface, sediment) per cell (2× box-averaged above 1024²)
 //   terrain_minmax    terrain_cells → per 32×32-cell leaf (surface min, surface max, water-surface max, water depth max)
 //   flow_pack         velocity + suspended + water → flow_cells (u, v, turbidity)
 
@@ -19,7 +19,7 @@ struct TerrainParams {
 @group(0) @binding(2) var<storage, read> sediment: array<f32>;
 @group(0) @binding(3) var<storage, read> water: array<f32>;
 @group(0) @binding(4) var<storage, read_write> cells: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read_write> height_rb: array<f32>;
+@group(0) @binding(5) var<storage, read_write> height_rb: array<vec2<f32>>;
 @group(0) @binding(6) var<storage, read_write> leaf_bounds: array<vec4<f32>>;
 
 fn surface_at(c: vec2<i32>) -> f32 {
@@ -52,11 +52,11 @@ fn terrain_readback(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= out_size.x || id.y >= out_size.y {
         return;
     }
-    var sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var j = 0u; j < ds; j += 1u) {
         for (var i = 0u; i < ds; i += 1u) {
             let c = vec2<u32>(id.x * ds + i, id.y * ds + j);
-            sum += cells[c.y * params.grid.size.x + c.x].x;
+            sum += cells[c.y * params.grid.size.x + c.x].xy;
         }
     }
     height_rb[id.y * out_size.x + id.x] = sum / f32(ds * ds);
@@ -77,8 +77,8 @@ fn cell_bounds(c: vec2<i32>) -> vec4<f32> {
 }
 
 // One workgroup per 32×32-cell leaf; each of the 256 threads reduces a 2×2 block plus a one-cell
-// halo (4×4 cells): a vertex on the leaf's edge is a bilinear blend with the neighbouring leaf's
-// first cell, so the leaf's bounds must cover it.
+// halo (4×4 cells): a leaf's vertices sit on its own cells' centres and its last row and column
+// on the neighbouring leaf's first cells, so the leaf's bounds must cover them.
 @compute @workgroup_size(16, 16, 1)
 fn terrain_minmax(
     @builtin(workgroup_id) leaf: vec3<u32>,

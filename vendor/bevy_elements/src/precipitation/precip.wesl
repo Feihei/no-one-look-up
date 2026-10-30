@@ -13,7 +13,7 @@
 
 import bevy_elements::grid::grid_taps;
 import bevy_elements::terrain::common::{TerrainParams, terrain_live};
-import bevy_elements::wind::{WindFieldParams, elements_wind};
+import bevy_elements::wind::{WindFieldParams, elements_wind_metres};
 import bevy_elements::precipitation::common::{particle_rand, drop_diameter_mm, drop_fall_speed, dust_height};
 
 struct Particle {
@@ -47,7 +47,8 @@ struct Params {
     motion: vec4<f32>,
     // x: rain count. y: snow count. z: capacity. w: blocker count.
     counts: vec4<u32>,
-    // x: Marshall–Palmer Λ, mm⁻¹.
+    // x: Marshall–Palmer Λ, mm⁻¹. y: the standing water an impact on a live terrain needs to
+    // ring, m (`docs/research/wet-ground.md`, Model adopted 5).
     rain: vec4<f32>,
     // x: flutter speed, m/s. y: snow fall speed, m/s. zw: flutter frequency range, Hz.
     snow: vec4<f32>,
@@ -118,6 +119,23 @@ fn ground_at(xz: vec2<f32>) -> f32 {
     let d = terrain_cells[t.i11];
     let h = mix(mix(a.x + a.z, b.x + b.z, t.w.x), mix(c.x + c.z, d.x + d.z, t.w.x), t.w.y);
     return params.terrain.misc.x + h;
+}
+
+/// Whether a rain impact on the ground at world XZ rings: a ring is a wave on a free water
+/// surface, so on a live terrain only where the water standing on it is at least `rain.y` deep;
+/// a drop on grass is caught by a leaf and one on soil soaks in (`docs/research/wet-ground.md`,
+/// Model adopted 5). The plane of a scene without a terrain is a surface the kernel does not
+/// know, and rings as before.
+fn ground_rings(xz: vec2<f32>) -> bool {
+    if !terrain_live(params.terrain) {
+        return true;
+    }
+    let t = grid_taps(params.terrain.grid, xz);
+    let a = terrain_cells[t.i00].z;
+    let b = terrain_cells[t.i10].z;
+    let c = terrain_cells[t.i01].z;
+    let d = terrain_cells[t.i11].z;
+    return mix(mix(a, b, t.w.x), mix(c, d, t.w.x), t.w.y) >= params.rain.y;
 }
 
 /// A position uniform in the part of the box above the ground.
@@ -201,7 +219,7 @@ fn elements_precip_sim(
                 }
                 life = 0.0;
             }
-            let wind = elements_wind(wind_field, wind_sampler, params.wind, pos);
+            let wind = elements_wind_metres(wind_field, wind_sampler, params.wind, pos);
             if kind == KIND_RAIN {
                 let d = drop_diameter_mm(particle_rand(index, epoch, 0u), params.rain.x);
                 vel = wind + vec3<f32>(0.0, -drop_fall_speed(d), 0.0);
@@ -244,15 +262,19 @@ fn elements_precip_sim(
     }
 
     // Ground: the terrain surface (plus standing water) under each end of the step. A particle
-    // already below it respawns without a splash.
+    // already below it respawns without a splash. The blockers' entry is kept apart: a splash
+    // on a blocker's top face always rings, one on the ground only where it is water.
+    let t_block = t_hit;
+    var t_ground = MISS;
     let g0 = ground_at(p0.xz);
     let g1 = ground_at(p1.xz);
     if p0.y <= g0 {
-        t_hit = 0.0;
+        t_ground = 0.0;
     } else if p1.y <= g1 {
         let above = p0.y - g0;
-        t_hit = min(t_hit, above / (above - (p1.y - g1)));
+        t_ground = above / (above - (p1.y - g1));
     }
+    t_hit = min(t_block, t_ground);
     // A sprite carried out of the top of the box respawns in it (wrapping would drop it under the
     // ground for a frame).
     if kind == KIND_DUST && p1.y > cam.y + half_edge {
@@ -268,7 +290,7 @@ fn elements_precip_sim(
         } else {
             // A segment that enters from outside (t > 0) is an impact; one that starts inside a
             // blocker or below the ground is a respawn that landed badly and makes no splash.
-            if kind == KIND_RAIN && t_hit > 0.0 {
+            if kind == KIND_RAIN && t_hit > 0.0 && (t_block < t_ground || ground_rings(mix(p0, p1, t_hit).xz)) {
                 let hit = mix(p0, p1, t_hit);
                 let dxz = hit.xz - cam.xz;
                 if dot(dxz, dxz) <= params.motion.z * params.motion.z {

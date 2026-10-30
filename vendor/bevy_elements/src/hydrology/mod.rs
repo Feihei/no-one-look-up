@@ -37,7 +37,9 @@ use bevy::render::storage::ShaderBuffer;
 use crate::climate::{Climate, LAPSE_RATE_C_PER_M, Weather};
 use crate::gpu::grid::zeroed_buffer;
 use crate::gpu::readback::{ReadbackTick, Readbacks, decode};
-use crate::plugin::{ElementsQuality, ElementsSystems, ElementsView, ensure_gpu_core};
+use crate::plugin::{
+    ElementsQuality, ElementsSystems, ElementsUnits, ElementsView, ensure_gpu_core,
+};
 use crate::precipitation::{BlockerGpu, PrecipitationBlocker, nearest_blockers};
 use crate::query::EnvironmentSnapshot;
 use crate::terrain::{TerrainGpu, TerrainGrid, TerrainState};
@@ -180,7 +182,8 @@ pub struct WaterSink {
 /// Start an erosion bake: hydrology runs at the quality's full substep rate with `rain_mm_h` of
 /// uniform liquid rain (the weather's rain is ignored) until `duration_s` of simulated time has
 /// passed, then [`TerrainBaked`] is written. A bake requested during a bake starts when the
-/// first one ends.
+/// first one ends; a bake interrupted by the terrain being rebuilt or removed restarts in full
+/// on the next terrain.
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ErodeTerrain {
@@ -274,7 +277,7 @@ pub(crate) struct HydroParams {
     /// x: rain quantum, m. y: evaporation quantum, m. z: terrain y0 − reference elevation, m.
     /// w: air temperature at the reference elevation, °C.
     weather: Vec4,
-    /// x: lapse, °C/m. y: speed clamp, m/s. z: 1 in a bake. w: unused.
+    /// x: lapse, °C/m. y: speed clamp, m/s. z: 1 in a bake. w: `Weather::snow_possible`.
     misc: Vec4,
     /// x: closed boundary. y: erosion on. z: sources uploaded. w: blockers uploaded.
     flags: UVec4,
@@ -401,6 +404,18 @@ struct HydrologyRuntime {
     wet_area_m2: f64,
 }
 
+impl HydrologyRuntime {
+    /// The bake requests to keep across a rebuild: the running bake first (it restarts in full on
+    /// the new layers), then the queue.
+    fn take_requests(&mut self) -> VecDeque<ErodeTerrain> {
+        let mut queue = std::mem::take(&mut self.queue);
+        if let Some(bake) = self.bake.take() {
+            queue.push_front(bake.request);
+        }
+        queue
+    }
+}
+
 /// Hydrology, erosion and the water readback.
 ///
 /// Needs a [`Terrain`](crate::Terrain); idles without one. Inserts, if absent,
@@ -462,7 +477,7 @@ fn ensure_hydrology(
         if gpu.is_some() {
             commands.remove_resource::<HydrologyGpu>();
             // A bake asked for before the terrain exists (or while it is rebuilt) waits for it.
-            let queue = std::mem::take(&mut runtime.queue);
+            let queue = runtime.take_requests();
             *runtime = HydrologyRuntime {
                 queue,
                 ..HydrologyRuntime::default()
@@ -496,7 +511,7 @@ fn ensure_hydrology(
     *runtime = HydrologyRuntime {
         built_for: Some(terrain.water.id()),
         source_epoch: 1,
-        queue: std::mem::take(&mut runtime.queue),
+        queue: runtime.take_requests(),
         ..HydrologyRuntime::default()
     };
     *stats = HydrologyStats::default();
@@ -530,12 +545,14 @@ struct Inputs<'w> {
     climate: Res<'w, Climate>,
     view: Res<'w, ElementsView>,
     time: Res<'w, Time<Real>>,
+    units: Res<'w, ElementsUnits>,
     erosion_locked: Option<Res<'w, ErosionLocked>>,
 }
 
-/// The raw descriptions of the sources and sinks, in a deterministic order, and whether the cap
-/// cut any off.
+/// The raw descriptions of the sources and sinks (positions in the metre frame, from their world
+/// translations through `units`), in a deterministic order, and whether the cap cut any off.
 fn collect_sources(
+    units: &ElementsUnits,
     sources: &Query<(Entity, &WaterSource, &GlobalTransform)>,
     sinks: &Query<(Entity, &WaterSink, &GlobalTransform)>,
 ) -> (Vec<(Vec2, f32, f32)>, bool) {
@@ -548,16 +565,22 @@ fn collect_sources(
         all.truncate(MAX_WATER_SOURCES);
         (all.into_iter().map(|(_, p, r, q)| (p, r, q)).collect(), cut)
     }
-    let (mut entries, cut_sources) = take(
-        sources
-            .iter()
-            .map(|(e, s, t)| (e, t.translation().xz(), s.radius_m, s.rate_m3_s)),
-    );
-    let (sink_entries, cut_sinks) = take(
-        sinks
-            .iter()
-            .map(|(e, s, t)| (e, t.translation().xz(), s.radius_m, -s.rate_m3_s)),
-    );
+    let (mut entries, cut_sources) = take(sources.iter().map(|(e, s, t)| {
+        (
+            e,
+            units.point_to_metres(t.translation()).xz(),
+            s.radius_m,
+            s.rate_m3_s,
+        )
+    }));
+    let (sink_entries, cut_sinks) = take(sinks.iter().map(|(e, s, t)| {
+        (
+            e,
+            units.point_to_metres(t.translation()).xz(),
+            s.radius_m,
+            -s.rate_m3_s,
+        )
+    }));
     entries.extend(sink_entries);
     (entries, cut_sources || cut_sinks)
 }
@@ -567,7 +590,7 @@ fn collect_sources(
 fn run_hydrology(
     inputs: Inputs,
     terrain: Option<Res<TerrainState>>,
-    terrain_gpu: Option<Res<TerrainGpu>>,
+    terrain_gpu: Option<ResMut<TerrainGpu>>,
     gpu: Option<ResMut<HydrologyGpu>>,
     mut runtime: ResMut<HydrologyRuntime>,
     mut stats: ResMut<HydrologyStats>,
@@ -579,7 +602,7 @@ fn run_hydrology(
     mut baked: MessageWriter<TerrainBaked>,
 ) {
     runtime.queue.extend(requests.read().copied());
-    let (Some(terrain), Some(terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
+    let (Some(terrain), Some(mut terrain_gpu), Some(mut gpu)) = (terrain, terrain_gpu, gpu) else {
         return;
     };
     let Inputs {
@@ -591,6 +614,7 @@ fn run_hydrology(
         view,
         time,
         erosion_locked,
+        units,
     } = inputs;
     let erosion_on = erosion_enabled(&erosion, erosion_locked.is_some());
     let grid = terrain.grid;
@@ -635,7 +659,7 @@ fn run_hydrology(
     stats.baking = runtime.bake.is_some();
 
     // Footprints of the sources and sinks, and the blockers; the map is rebuilt when they change.
-    let (entries, cut) = collect_sources(&sources, &sinks);
+    let (entries, cut) = collect_sources(&units, &sources, &sinks);
     if cut && !runtime.warned_cap {
         warn!(
             "more than {MAX_WATER_SOURCES} WaterSources or WaterSinks exist; the extra ones (highest Entity) are ignored"
@@ -660,7 +684,7 @@ fn run_hydrology(
     let selected = nearest_blockers(
         view.position,
         blockers.iter().filter_map(|(entity, blocker, transform)| {
-            BlockerGpu::new(blocker.half_extents, transform).map(|b| (entity, b))
+            BlockerGpu::new(blocker.half_extents, &units.to_metres(transform)).map(|b| (entity, b))
         }),
     );
     if runtime.blockers != selected {
@@ -752,7 +776,7 @@ fn run_hydrology(
             LAPSE_RATE_C_PER_M,
             speed_cap_ms(cell, step_s),
             f32::from(u8::from(runtime.bake.is_some())),
-            0.0,
+            weather.snow_possible,
         ),
         flags: UVec4::new(
             u32::from(settings.boundary == HydrologyBoundary::Closed),
@@ -794,7 +818,7 @@ fn run_hydrology(
     runtime.scheduled += u64::from(n);
     if n > 0 {
         // The pack, bounds and height readback run once this frame, after the substeps.
-        terrain_gpu.dirty.store(true, Ordering::Relaxed);
+        terrain_gpu.changes += 1;
     }
 }
 
@@ -891,4 +915,79 @@ fn update_stats(
     runtime.wet_area_m2 = f64::from(water.wet_cells) * cell * cell;
     stats.volume_m3 = water.volume_m3;
     stats.lost_m3 = volume0 + (water.input_m3 - input0) - water.volume_m3;
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::system::RunSystemOnce;
+
+    use super::*;
+
+    #[test]
+    fn an_interrupted_bake_restarts_before_the_queue() {
+        let a = ErodeTerrain {
+            duration_s: 60.0,
+            rain_mm_h: 10.0,
+        };
+        let b = ErodeTerrain {
+            duration_s: 30.0,
+            rain_mm_h: 5.0,
+        };
+        let mut runtime = HydrologyRuntime {
+            bake: Some(Bake {
+                request: a,
+                remaining: 5,
+                done_at: 9,
+            }),
+            queue: VecDeque::from([b]),
+            ..default()
+        };
+        assert_eq!(runtime.take_requests(), VecDeque::from([a, b]));
+        assert!(runtime.bake.is_none());
+        assert!(runtime.queue.is_empty());
+    }
+
+    /// A source and a sink placed in feet land at the metre-frame cell the same scene in metres
+    /// has them in; their radius and rate stay in m and m³/s.
+    #[test]
+    fn a_source_in_feet_is_read_at_its_position_in_metres() {
+        let mut world = World::new();
+        world.insert_resource(ElementsUnits {
+            units_per_metre: 3.2808,
+        });
+        let at = |x: f32, z: f32| GlobalTransform::from_xyz(x * 3.2808, 7.0, z * 3.2808);
+        world.spawn((
+            WaterSource {
+                rate_m3_s: 0.5,
+                radius_m: 2.0,
+            },
+            at(10.0, 20.0),
+        ));
+        world.spawn((
+            WaterSink {
+                rate_m3_s: 0.25,
+                radius_m: 1.0,
+            },
+            at(-4.0, 6.0),
+        ));
+        let (entries, cut) = world
+            .run_system_once(
+                |units: Res<ElementsUnits>,
+                 sources: Query<(Entity, &WaterSource, &GlobalTransform)>,
+                 sinks: Query<(Entity, &WaterSink, &GlobalTransform)>| {
+                    collect_sources(&units, &sources, &sinks)
+                },
+            )
+            .expect("the system runs");
+        assert!(!cut);
+        assert_eq!(entries.len(), 2);
+        let (source, sink) = (entries[0], entries[1]);
+        assert!(
+            source.0.distance(Vec2::new(10.0, 20.0)) < 1e-3,
+            "{source:?}"
+        );
+        assert_eq!((source.1, source.2), (2.0, 0.5));
+        assert!(sink.0.distance(Vec2::new(-4.0, 6.0)) < 1e-3, "{sink:?}");
+        assert_eq!((sink.1, sink.2), (1.0, -0.25));
+    }
 }

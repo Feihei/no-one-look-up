@@ -23,11 +23,9 @@ const TEXELS: u32 = 512u;
 const SOFT_EDGE: f32 = 0.18;
 /// Width over which the dome factor (the map's A channel) rises from 0 at the cloud edge to 1,
 /// field units.
-///
-/// [PATCH heads-up] 0.37 -> 0.30. The upstream value spreads the dome across
-/// most of a blob's radius, so every cloud is a smooth dome from edge to core.
-/// Narrowing it keeps the full height only in the blob's core and leaves a
-/// flatter shoulder outside, which is what breaks the "half an egg" profile.
+// [PATCH heads-up] 0.37 -> 0.30. The upstream value spreads the dome across
+// more of the blob, so the full-height core is wide and the dome reads as a
+// flat disc with a bump; 0.30 keeps full height only in a blob's core.
 const DOME_WIDTH: f32 = 0.30;
 /// Largest |fbm| of the 3-octave periodic Perlin field on its z slice, measured by
 /// `the_noise_normalisation_constants_match_the_noise`; maps the noise onto [0, 1].

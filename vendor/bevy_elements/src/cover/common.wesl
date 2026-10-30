@@ -24,7 +24,8 @@ struct CoverParams {
     wind: vec4<f32>,
     // x: wetness per mm of rain. y: dry rate (1/h). z: relative humidity. w: sun factor.
     wet: vec4<f32>,
-    // x: wind speed for evaporation (m/s). yzw: unused.
+    // x: wind speed for evaporation (m/s). y: Weather::snow_possible (0 outside the snow season).
+    // zw: unused.
     air: vec4<f32>,
     // xy: horizontal velocity of falling rain (the wind, m/s) negated, w: its fall speed (m/s):
     // the ray from the ground toward where the rain came from is (x, w, y) in (x, y, z).
@@ -32,6 +33,8 @@ struct CoverParams {
     snow_ray: vec4<f32>,
     // x: blockers uploaded. y: unused. z: readback downsample factor. w: unused.
     flags: vec4<u32>,
+    // The snowpack `cover_seed` writes: x: depth (m). y: SWE (m). z: wetness. w: unused.
+    seed: vec4<f32>,
 }
 
 /// Air temperature (°C) at a ground surface height (m above the terrain's y0).

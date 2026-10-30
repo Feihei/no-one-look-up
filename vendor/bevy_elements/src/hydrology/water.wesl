@@ -10,7 +10,7 @@
 
 import bevy_elements::grid::{GridParams, grid_taps};
 import bevy_elements::noise::perlin3;
-import bevy_elements::terrain::common::TerrainParams;
+import bevy_elements::terrain::common::{TerrainParams, last_sample, morph_centre};
 import bevy_pbr::render::{
     mesh_functions,
     mesh_view_bindings::{view, globals},
@@ -28,7 +28,10 @@ struct WaterParams {
     lod: array<vec4<f32>, 16>,
     // x: coarsest level.
     top: vec4<f32>,
-    // xy: cloud shadow map origin (world XZ), z: its extent, w: camera transmittance.
+    // What the vertices morph about: xyz a metre-frame point, w 1 to use it (an orthographic
+    // followed camera's centre), 0 for the view's own `lod_view_world_position`.
+    lod_centre: vec4<f32>,
+    // xy: cloud shadow map origin (metre-frame XZ), z: its extent, w: the lights' mean transmittance.
     shadow: vec4<f32>,
     // xyz: unit direction toward the light the map was made for. w: 1 when a map is bound.
     light: vec4<f32>,
@@ -44,6 +47,11 @@ struct WaterParams {
     // x: foam speed threshold (m/s). y: foam thickness threshold (m). z: foam albedo.
     // w: foam perceptual roughness.
     foam: vec4<f32>,
+    // x: the finest wave cascade's texel (m). y: texels a side. z: 1 when a field is bound.
+    waves: vec4<f32>,
+    // World units to the metre (`ElementsUnits`): the shader divides the positions Bevy gives it
+    // by this and multiplies the ones it hands back.
+    units: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<uniform> water: WaterParams;
@@ -53,6 +61,12 @@ struct WaterParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(104) var normal_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(105) var cloud_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106) var cloud_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(107) var wave_map: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(108) var wave_sampler: sampler;
+
+const WAVE_CASCADES: i32 = 3;
+// The lowest elevation (sine) a reflection may take: the horizon.
+const HORIZON_Y: f32 = 0.03;
 
 // 1 mm: the water vertex sits this far above the surface so it never z-fights the ground where
 // the fragment discard (3 mm) has not yet removed it.
@@ -66,7 +80,10 @@ const FOAM_THICKNESS_RAMP: f32 = 0.03;
 // Offset of the second flow layer, in tiles (Vlachos 2010: layers are offset against repetition).
 const LAYER_OFFSET: vec2<f32> = vec2<f32>(0.37, 0.59);
 const PHASE_NOISE_M: f32 = 37.0;
-const STILL_RIPPLE: f32 = 0.25;
+/// The slope a body with no flow keeps: a sheltered pond is a mirror with a skin on it, not a
+/// wind sea (`docs/research/water-surface.md`, Model 3). A floor of zero would make still water
+/// read as glass, with no surface at all.
+const STILL_RIPPLE: f32 = 0.06;
 const MAX_THICKNESS: f32 = 1000.0;
 
 struct WaterVertex {
@@ -97,23 +114,26 @@ fn morph_k(distance: f32, lod: u32) -> f32 {
 }
 
 // The terrain's CDLOD vertex with the morph measured against the terrain surface (so the water
-// morphs with the ground under it), lifted by the water depth.
+// morphs with the ground under it), lifted by the water depth. In the metre frame: the instance
+// matrix's translation (world units) is divided by `units`.
 fn water_vertex_position(local: vec3<f32>, instance_index: u32) -> vec4<f32> {
     let m = mesh_functions::get_world_from_local(instance_index);
     let lod = mesh_functions::get_tag(instance_index);
+    let origin = vec3<f32>(m[3].x, m[3].y, m[3].z) / water.units;
     let gi = round(local.xz * 32.0);
     let step = water.terrain.grid.cell * f32(1u << lod);
-    var wxz = vec2<f32>(m[3].x, m[3].z) + gi * step;
-    let d = distance(view.lod_view_world_position, vec3<f32>(wxz.x, m[3].y + terrain_height(wxz), wxz.y));
+    var wxz = origin.xz + gi * step;
+    let centre = morph_centre(view.lod_view_world_position, water.lod_centre, water.units);
+    let d = distance(centre, vec3<f32>(wxz.x, origin.y + terrain_height(wxz), wxz.y));
     let odd = gi - 2.0 * floor(gi * 0.5);
-    wxz = wxz - odd * step * morph_k(d, lod);
-    return vec4<f32>(wxz.x, m[3].y + terrain_height(wxz) + water_depth_at(wxz) + LIFT, wxz.y, 1.0);
+    wxz = min(wxz - odd * step * morph_k(d, lod), last_sample(water.terrain.grid));
+    return vec4<f32>(wxz.x, origin.y + terrain_height(wxz) + water_depth_at(wxz) + LIFT, wxz.y, 1.0);
 }
 
 @vertex
 fn vertex(v: WaterVertex) -> VertexOutput {
     var out: VertexOutput;
-    let world = water_vertex_position(v.position, v.instance_index);
+    let world = vec4<f32>(water_vertex_position(v.position, v.instance_index).xyz * water.units, 1.0);
     out.world_position = world;
     out.position = position_world_to_clip(world.xyz);
     out.world_normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -162,7 +182,7 @@ fn edge_alpha(depth: f32) -> f32 {
     return smoothstep(DISCARD_DEPTH, FADE_DEPTH, depth);
 }
 
-// Cloud shadow scale ρ = (0.25 + 0.75 T_px) / (0.25 + 0.75 T_cam) at a world position, as the
+// Cloud shadow scale ρ = (0.25 + 0.75 T_px) / (0.25 + 0.75 T̄) at a world position, as the
 // terrain's fragment computes it.
 fn cloud_shadow_ratio(p: vec3<f32>) -> f32 {
     let l = water.light.xyz;
@@ -174,8 +194,8 @@ fn cloud_shadow_ratio(p: vec3<f32>) -> f32 {
         }
     }
     let here = 0.25 + 0.75 * t;
-    let camera = max(0.25 + 0.75 * water.shadow.w, 0.01);
-    return clamp(here / camera, 0.0, 4.0);
+    let lights = max(0.25 + 0.75 * water.shadow.w, 0.01);
+    return clamp(here / lights, 0.0, 4.0);
 }
 
 struct Flow {
@@ -249,12 +269,42 @@ fn silt_body(turbidity: f32) -> vec3<f32> {
     return mix(water.deep.xyz, water.silt.xyz, tau);
 }
 
+// The wave field at world XZ (`waves.wesl`): the cascades' gradient summed and their breaking
+// foam (the largest), each faded out over the last 10 % of its window (inside the sponge) and
+// where one of its texels is smaller than about a pixel (the field has no mips; Crest fades its
+// cascades the same way).
+fn wave_field(xz: vec2<f32>, footprint: f32) -> vec3<f32> {
+    if water.waves.z < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let n = water.waves.y;
+    var out = vec3<f32>(0.0);
+    for (var c = 0; c < WAVE_CASCADES; c += 1) {
+        let t = water.waves.x * pow(4.0, f32(c));
+        let extent = t * n;
+        // The window spans N texels from `floor(camera / t) − N/2`.
+        let middle = floor(view.world_position.xz / water.units / t) * t;
+        let reach = abs(xz - middle) / (0.5 * extent);
+        let inside = 1.0 - smoothstep(0.85, 0.93, max(reach.x, reach.y));
+        let detail = 1.0 - smoothstep(0.6, 1.2, footprint / t);
+        let weight = inside * detail;
+        if weight > 0.0 {
+            let s = textureSampleLevel(wave_map, wave_sampler, xz / extent, c, 0.0);
+            out = vec3<f32>(out.xy + weight * s.yz, max(out.z, weight * s.w));
+        }
+    }
+    return out;
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
-    let p = in.world_position.xyz;
+    let world_p = in.world_position.xyz;
+    let p = world_p / water.units;
     // Derivatives of the tile coordinate, taken before the discard (uniform control flow).
     let gx = dpdx(p.xz / water.flow.y);
     let gy = dpdy(p.xz / water.flow.y);
+    // The world size of this pixel on the water, for the wave cascades' level of detail.
+    let footprint = max(length(dpdx(p.xz)), length(dpdy(p.xz)));
     let column = column_at(p.xz);
     if column.depth < DISCARD_DEPTH {
         discard;
@@ -262,23 +312,47 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let a_edge = edge_alpha(column.depth);
 
     let flow = flow_normal(p.xz, column.velocity, gx, gy);
-    let n = flow.normal;
-    let v_dir = normalize(view.world_position - p);
+    // The flow-mapped ripples' slope plus the wave field's: both small-slope height fields.
+    let ripple = flow.normal.xz / flow.normal.y;
+    let waves = wave_field(p.xz, footprint);
+    let flat_n = normalize(vec3<f32>(ripple.x - waves.x, 1.0, ripple.y - waves.y));
+    let v_dir = normalize(view.world_position / water.units - p);
+    // A face steep enough to reflect below the horizon sees, in a real scene, the water and the
+    // far shore; the environment map holds only Bevy's ground disc there (tan, with a hard edge
+    // at the horizon). Hold its reflection at the horizon: the normal becomes the half vector of
+    // the view and the reflection lifted to it.
+    let reflected = reflect(-v_dir, flat_n);
+    let n = select(
+        flat_n,
+        normalize(v_dir + normalize(vec3<f32>(reflected.x, HORIZON_Y, reflected.z))),
+        reflected.y < HORIZON_Y,
+    );
     let cos_v = max(dot(v_dir, n), 0.02);
     let f = fresnel(cos_v);
 
     // Thickness from the depth prepass: the opaque scene under the water along the view ray.
-    let view_pos = position_world_to_view(p);
+    let view_pos = position_world_to_view(world_p);
     let ray = normalize(view_pos);
     let z_scene = depth_ndc_to_view_z(max(prepass_depth(in.position, 0u), 1e-9));
-    let t_ray = clamp((view_pos.z - z_scene) / max(-ray.z, 1e-3), 0.0, MAX_THICKNESS);
+    let t_ray = clamp((view_pos.z - z_scene) / max(-ray.z, 1e-3) / water.units, 0.0, MAX_THICKNESS);
     let t_eff = refracted_thickness(t_ray, cos_v, water.absorption.w);
 
-    // Foam: fast flow, and the contact with anything the water meets (shoreline, rocks, posts).
+    // Foam: fast flow, the contact with anything the water meets (shoreline, rocks, posts), and
+    // the waves that break.
     let blotch = smoothstep(0.45, 0.75, flow.patch_noise);
     let f_speed = foam_from_speed(length(column.velocity)) * blotch;
     let f_contact = foam_from_thickness(t_ray) * mix(1.0, blotch, smoothstep(0.02, 0.03, t_ray));
-    let foam = max(f_speed, f_contact);
+    // Breaking foam dissolves into noise as it fades (lace, not a blur): its coverage is the share
+    // of a fine fbm (the normal map's alpha at a fifth of the tile, with the coarse patchiness)
+    // above a threshold that falls with the foam, never to zero (fresh foam is still bubbles and
+    // gaps), with soft edges.
+    let foam_cover = saturate(waves.z);
+    let lace = 0.5 * textureSampleGrad(normal_map, normal_sampler, p.xz / (0.2 * water.flow.y), gx * 5.0, gy * 5.0).a
+        + 0.5 * textureSampleGrad(normal_map, normal_sampler, p.xz / (0.05 * water.flow.y), gx * 20.0, gy * 20.0).a;
+    let threshold = 1.0 - 0.65 * foam_cover;
+    let f_breaking = sqrt(foam_cover)
+        * smoothstep(threshold - 0.12, threshold + 0.15, 0.3 * flow.patch_noise + 0.7 * lace);
+    let foam = max(max(f_speed, f_contact), f_breaking);
 
 @if(BLEND_MULTIPLY) {
     let x = (1.0 - f) * beer_lambert(water.absorption.xyz, t_eff) * (1.0 - foam);

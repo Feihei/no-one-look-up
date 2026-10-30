@@ -20,7 +20,7 @@ pub use strikes::{LightningStrike, SPEED_OF_SOUND_MS, STRIKE_RADIUS_M, StrikeLig
 
 use crate::climate::Climate;
 use crate::flash::LightningFlash;
-use crate::plugin::{ElementsSystems, ensure_core};
+use crate::plugin::{ElementsSystems, ElementsUnits, ensure_core};
 use strikes::{ActiveBolt, Strikes};
 
 /// Luminous power of a first return stroke averaged over one 1/60 s frame, lm
@@ -78,15 +78,19 @@ fn advance_bolts(
 }
 
 /// Publish the brightest flash this frame as [`LightningFlash`]: its channel top at the cloud
-/// base, `Φ·e / 4π` candela; intensity 0 when nothing is flashing.
-pub(crate) fn write_flash(bolts: Query<&ActiveBolt>, mut flash: ResMut<LightningFlash>) {
+/// base (a world position), `Φ·e / 4π` candela; intensity 0 when nothing is flashing.
+pub(crate) fn write_flash(
+    bolts: Query<&ActiveBolt>,
+    units: Res<ElementsUnits>,
+    mut flash: ResMut<LightningFlash>,
+) {
     let brightest = bolts
         .iter()
         .filter(|b| b.mean > 0.0)
         .max_by(|a, b| a.mean.total_cmp(&b.mean));
     let next = match brightest {
         Some(bolt) => LightningFlash {
-            position: bolt.bolt.top(),
+            position: units.point_to_world(bolt.bolt.top()),
             intensity_cd: FLASH_LUMENS * bolt.mean / (4.0 * std::f32::consts::PI),
         },
         None => LightningFlash {

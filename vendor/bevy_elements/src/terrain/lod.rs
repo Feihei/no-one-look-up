@@ -97,6 +97,18 @@ impl LodConfig {
             .as_uvec2()
             .max(UVec2::ONE)
     }
+
+    /// Offset of every level's vertex lattice from the grid's corner on each axis, m: half a
+    /// cell, so the vertices sit on the height samples, the cell centres
+    /// (`docs/research/orthographic-lod.md` Model 3).
+    pub fn sample_offset(&self) -> f32 {
+        0.5 * self.leaf_m / LEAF_CELLS as f32
+    }
+
+    /// The last sample on each axis, terrain-local m: a vertex past it is clamped onto it.
+    pub fn last_sample(&self) -> Vec2 {
+        self.extent - self.sample_offset()
+    }
 }
 
 /// One selected patch: a node of the quadtree.
@@ -164,6 +176,17 @@ impl BoundsTree {
         let (dims, bounds) = &self.levels[level as usize];
         bounds[(iz.min(dims.y - 1) * dims.x + ix.min(dims.x - 1)) as usize]
     }
+
+    /// The lowest and highest surface of the whole terrain, m (unpadded).
+    pub fn extremes(&self) -> (f32, f32) {
+        self.levels.last().map_or((0.0, 0.0), |(_, roots)| {
+            roots
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &(a, b)| {
+                    (lo.min(a), hi.max(b))
+                })
+        })
+    }
 }
 
 /// Distance from `p` to the box `[lo, hi]`.
@@ -171,12 +194,12 @@ fn box_distance(lo: Vec3, hi: Vec3, p: Vec3) -> f32 {
     (lo - p).max(p - hi).max(Vec3::ZERO).length()
 }
 
-/// The 3D box of a node, with the height padding, in terrain-local space: the node's tile
-/// clipped to the grid.
+/// The 3D box of a node, with the height padding, in terrain-local space: the node's tile on
+/// the vertex lattice (half a cell in from the grid's corner), clipped to the last sample.
 pub(crate) fn node_box(config: &LodConfig, tree: &BoundsTree, node: Patch) -> (Vec3, Vec3) {
     let s = config.node_m(node.level);
-    let lo = Vec2::new(node.ix as f32, node.iz as f32) * s;
-    let hi = (lo + s).min(config.extent);
+    let lo = Vec2::new(node.ix as f32, node.iz as f32) * s + config.sample_offset();
+    let hi = (lo + s).min(config.last_sample());
     let (y0, y1) = tree.get(node.level, node.ix, node.iz);
     (
         Vec3::new(lo.x, y0 - AABB_PAD_M, lo.y),
@@ -248,27 +271,31 @@ pub(crate) fn morph_k(config: &LodConfig, level: u32, distance: f32) -> f32 {
 
 #[cfg(test)]
 /// The vertex stage of `render.wesl` for grid vertex `gi` (0–32 on each axis) of a patch,
-/// as a function of `height`, the terrain height at a local XZ: the morphed local position.
+/// as a function of `height`, the terrain height at a local XZ, morphed about `centre`: the
+/// morphed local position.
 pub(crate) fn vertex_position(
     config: &LodConfig,
     patch: Patch,
     gi: UVec2,
-    camera: Vec3,
+    centre: Vec3,
     height: impl Fn(Vec2) -> f32,
 ) -> Vec3 {
     let step = config.node_m(patch.level) / LEAF_CELLS as f32;
-    let origin = Vec2::new(patch.ix as f32, patch.iz as f32) * config.node_m(patch.level);
+    let origin = Vec2::new(patch.ix as f32, patch.iz as f32) * config.node_m(patch.level)
+        + config.sample_offset();
     let unmorphed = origin + gi.as_vec2() * step;
-    let d = Vec3::new(unmorphed.x, height(unmorphed), unmorphed.y).distance(camera);
+    let d = Vec3::new(unmorphed.x, height(unmorphed), unmorphed.y).distance(centre);
     let k = morph_k(config, patch.level, d);
     let odd = Vec2::new((gi.x % 2) as f32, (gi.y % 2) as f32);
-    let morphed = unmorphed - odd * step * k;
+    let morphed = (unmorphed - odd * step * k).min(config.last_sample());
     Vec3::new(morphed.x, height(morphed), morphed.y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::TerrainGrid;
+    use bevy::math::{IVec2, Vec3Swizzles};
 
     /// Deterministic pseudo-random numbers in `[0, 1)`.
     struct Rng(u64);
@@ -332,12 +359,14 @@ mod tests {
         }
     }
 
-    /// Validation 3 (d) and (e): the patch counts of a flat terrain.
+    /// Validation 3 (d) and (e): the patch counts of a flat terrain, for a camera over a corner
+    /// of the vertex lattice's central nodes (half a cell off the grid's centre).
     #[test]
     fn a_flat_terrain_selects_the_measured_patch_counts() {
         let at = |cell: f32, y: f32| {
             let c = LodConfig::new(Vec2::splat(2048.0), cell);
-            let p = select_patches(&c, &flat(&c), Vec3::new(1024.0, y, 1024.0));
+            let centre = 1024.0 + c.sample_offset();
+            let p = select_patches(&c, &flat(&c), Vec3::new(centre, y, centre));
             (counts(&p, c.levels), p.len())
         };
         assert_eq!(at(2.0, 30.0), (vec![16, 60, 48, 0, 0, 0], 124));
@@ -396,23 +425,31 @@ mod tests {
         assert_eq!(worst_gap, 1, "adjacent patches two levels apart");
     }
 
-    /// The leaf bounds of a generated terrain: what the readback would give.
-    fn generated_tree(
+    /// A generated terrain over 2048 m: its quadtree, the leaf bounds the readback would give
+    /// (each leaf's cells and a one-cell halo, as `terrain_minmax` reduces them) and the grid's
+    /// surface.
+    fn generated(
         preset: &super::super::ProceduralTerrain,
         cell: f32,
-    ) -> (LodConfig, BoundsTree) {
+    ) -> (LodConfig, BoundsTree, TerrainGrid, Vec<f32>) {
         use crate::terrain::model::mirror::generate_surface;
         let size = UVec2::splat((2048.0 / cell) as u32);
         let surface = generate_surface(preset, size, cell);
+        let grid = TerrainGrid {
+            origin: Vec2::ZERO,
+            cell_m: cell,
+            size,
+            y0: 0.0,
+        };
         let leaves = size / LEAF_CELLS;
         let mut bounds = Vec::new();
-        for lz in 0..leaves.y {
-            for lx in 0..leaves.x {
+        for lz in 0..leaves.y as i32 {
+            for lx in 0..leaves.x as i32 {
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for z in 0..LEAF_CELLS {
-                    for x in 0..LEAF_CELLS {
-                        let h = surface
-                            [((lz * LEAF_CELLS + z) * size.x + lx * LEAF_CELLS + x) as usize];
+                let edge = LEAF_CELLS as i32;
+                for z in -1..=edge {
+                    for x in -1..=edge {
+                        let h = surface[grid.index(IVec2::new(lx * edge + x, lz * edge + z))];
                         lo = lo.min(h);
                         hi = hi.max(h);
                     }
@@ -422,7 +459,7 @@ mod tests {
         }
         let config = LodConfig::new(Vec2::splat(2048.0), cell);
         let tree = BoundsTree::from_leaves(&config, leaves, bounds.into_iter());
-        (config.derive(Some(&tree)), tree)
+        (config.derive(Some(&tree)), tree, grid, surface)
     }
 
     /// Validation 3 (f): the pool capacity is never exceeded, on flat ground and on the
@@ -445,7 +482,8 @@ mod tests {
                 ProceduralTerrain::hills(42),
                 ProceduralTerrain::mountains(42),
             ] {
-                cases.push(generated_tree(&preset, cell));
+                let (config, tree, _, _) = generated(&preset, cell);
+                cases.push((config, tree));
             }
             let flat = BoundsTree::uniform(&LodConfig::new(Vec2::splat(2048.0), cell), 0.0, 0.0);
             cases.push((LodConfig::new(Vec2::splat(2048.0), cell), flat));
@@ -506,6 +544,52 @@ mod tests {
         30.0 * (p.x * 0.01).sin() * (p.y * 0.013).cos() + 0.02 * p.x
     }
 
+    /// The selection about `cam` has no crack: the vertices of two adjacent patches on their
+    /// shared vertical edge are bit-identical (the horizontal edge is the same with the axes
+    /// swapped).
+    fn assert_no_cracks(
+        config: &LodConfig,
+        tree: &BoundsTree,
+        cam: Vec3,
+        height: &impl Fn(Vec2) -> f32,
+    ) {
+        let patches = select_patches(config, tree, cam);
+        for (i, a) in patches.iter().enumerate() {
+            for b in &patches[i + 1..] {
+                let (sa, sb) = (config.node_m(a.level), config.node_m(b.level));
+                let (pa, pb) = (
+                    Vec2::new(a.ix as f32, a.iz as f32) * sa,
+                    Vec2::new(b.ix as f32, b.iz as f32) * sb,
+                );
+                if pa.x + sa != pb.x {
+                    continue;
+                }
+                // The coarser patch's vertices on the shared edge are the finer one's even
+                // vertices; compare them where both have one.
+                let z0 = pa.y.max(pb.y);
+                let z1 = (pa.y + sa).min(pb.y + sb);
+                if z1 <= z0 {
+                    continue;
+                }
+                let (stepa, stepb) = (sa / 32.0, sb / 32.0);
+                let mut z = z0;
+                while z <= z1 {
+                    // Vertex index of this z in each patch; both exist when z is a multiple of
+                    // the coarser step.
+                    let coarse_step = stepa.max(stepb);
+                    if (z - z0) % coarse_step == 0.0 {
+                        let ga = UVec2::new(32, ((z - pa.y) / stepa) as u32);
+                        let gb = UVec2::new(0, ((z - pb.y) / stepb) as u32);
+                        let va = vertex_position(config, *a, ga, cam, height);
+                        let vb = vertex_position(config, *b, gb, cam, height);
+                        assert_eq!(va, vb, "{a:?} {b:?} at z {z}, camera {cam}");
+                    }
+                    z += stepa.min(stepb);
+                }
+            }
+        }
+    }
+
     /// Validation 4: shared-edge vertices of adjacent patches are bit-identical, and a patch
     /// whose morph is 1 everywhere has its odd vertices on the level-k+1 grid.
     #[test]
@@ -519,43 +603,7 @@ mod tests {
                 5.0 + rng.next() * 150.0,
                 rng.next() * 2048.0,
             );
-            let patches = select_patches(&config, &tree, cam);
-            for (i, a) in patches.iter().enumerate() {
-                for b in &patches[i + 1..] {
-                    // Only patches that share a vertical edge (the test of the horizontal one is
-                    // the same with the axes swapped).
-                    let (sa, sb) = (config.node_m(a.level), config.node_m(b.level));
-                    let (pa, pb) = (
-                        Vec2::new(a.ix as f32, a.iz as f32) * sa,
-                        Vec2::new(b.ix as f32, b.iz as f32) * sb,
-                    );
-                    if pa.x + sa != pb.x {
-                        continue;
-                    }
-                    // The coarser patch's vertices on the shared edge are the finer one's even
-                    // vertices; compare them where both have one.
-                    let z0 = pa.y.max(pb.y);
-                    let z1 = (pa.y + sa).min(pb.y + sb);
-                    if z1 <= z0 {
-                        continue;
-                    }
-                    let (stepa, stepb) = (sa / 32.0, sb / 32.0);
-                    let mut z = z0;
-                    while z <= z1 {
-                        // Vertex index of this z in each patch; both exist when z is a multiple
-                        // of the coarser step.
-                        let coarse_step = stepa.max(stepb);
-                        if (z - z0) % coarse_step == 0.0 {
-                            let ga = UVec2::new(32, ((z - pa.y) / stepa) as u32);
-                            let gb = UVec2::new(0, ((z - pb.y) / stepb) as u32);
-                            let va = vertex_position(&config, *a, ga, cam, hill);
-                            let vb = vertex_position(&config, *b, gb, cam, hill);
-                            assert_eq!(va, vb, "{a:?} {b:?} at z {z}, camera {cam}");
-                        }
-                        z += stepa.min(stepb);
-                    }
-                }
-            }
+            assert_no_cracks(&config, &tree, cam, &hill);
         }
         // A fully morphed patch sits on the next level's grid (error < 1e-4 m).
         let patch = Patch {
@@ -568,7 +616,7 @@ mod tests {
             for gx in 0..=32 {
                 let v = vertex_position(&config, patch, UVec2::new(gx, gz), far, hill);
                 let coarse = config.node_m(1) / 32.0;
-                let origin = Vec2::new(3.0, 4.0) * config.node_m(0);
+                let origin = Vec2::new(3.0, 4.0) * config.node_m(0) + config.sample_offset();
                 let on_grid =
                     |p: f32, o: f32| (((p - o) / coarse).round() * coarse - (p - o)).abs();
                 assert!(
@@ -579,7 +627,8 @@ mod tests {
         }
     }
 
-    /// The unmorphed position of grid vertex `gi` of a patch.
+    /// The unmorphed position of grid vertex `gi` of a patch, on the vertex lattice and clamped
+    /// to the last sample.
     fn grid_position(
         config: &LodConfig,
         patch: Patch,
@@ -587,15 +636,84 @@ mod tests {
         height: impl Fn(Vec2) -> f32,
     ) -> Vec3 {
         let step = config.node_m(patch.level) / LEAF_CELLS as f32;
-        let p = Vec2::new(patch.ix as f32, patch.iz as f32) * config.node_m(patch.level)
-            + gi.as_vec2() * step;
+        let p = (Vec2::new(patch.ix as f32, patch.iz as f32) * config.node_m(patch.level)
+            + config.sample_offset()
+            + gi.as_vec2() * step)
+            .min(config.last_sample());
         Vec3::new(p.x, height(p), p.y)
     }
 
-    /// No pop: when a camera move swaps a patch for its four children, the patch is unmorphed
-    /// everywhere (it looks like its own grid) and the children's odd vertices are fully morphed
-    /// (they look like the patch's grid), up to the morph the camera's own step buys, so the
-    /// surface does not jump at the swap.
+    /// No pop for a centre moving from `a` to `b`: a patch either selection drops for its four
+    /// children is unmorphed everywhere (it looks like its own grid) and the children's odd
+    /// vertices are fully morphed (they look like the patch's grid), up to the morph the move
+    /// itself buys, so the surface does not jump at the swap. Returns the swaps exercised.
+    fn swaps_barely_move(
+        config: &LodConfig,
+        tree: &BoundsTree,
+        a: Vec3,
+        b: Vec3,
+        height: &impl Fn(Vec2) -> f32,
+    ) -> usize {
+        let mut swaps = 0;
+        let shift = a.distance(b);
+        let (sel_a, sel_b) = (
+            select_patches(config, tree, a),
+            select_patches(config, tree, b),
+        );
+        for (before, after, cam_before, cam_after) in
+            [(&sel_a, &sel_b, a, b), (&sel_b, &sel_a, b, a)]
+        {
+            for parent in before.iter().filter(|p| p.level > 0 && !after.contains(p)) {
+                let children: Vec<&Patch> = after
+                    .iter()
+                    .filter(|c| {
+                        c.level + 1 == parent.level
+                            && c.ix / 2 == parent.ix
+                            && c.iz / 2 == parent.iz
+                    })
+                    .collect();
+                if children.len() != 4 {
+                    continue;
+                }
+                swaps += 1;
+                // The centre moved `shift` m since the swap boundary and the morph is
+                // continuous, so the jump is at most the morph that distance buys.
+                let slack = |level: u32| {
+                    let step = config.node_m(level) / LEAF_CELLS as f32;
+                    2.0 * step * shift / (config.range_m(level) - config.morph_start_m(level))
+                        + 1e-3
+                };
+                for gz in 0..=32 {
+                    for gx in 0..=32 {
+                        let gi = UVec2::new(gx, gz);
+                        let moved = vertex_position(config, *parent, gi, cam_before, height);
+                        let want = grid_position(config, *parent, gi, height);
+                        assert!(
+                            (moved - want).length() <= slack(parent.level),
+                            "{parent:?} is morphed at {gi}: {moved} vs {want}"
+                        );
+                    }
+                }
+                for child in children {
+                    for gz in 0..=32 {
+                        for gx in 0..=32 {
+                            let gi = UVec2::new(gx, gz);
+                            let moved = vertex_position(config, *child, gi, cam_after, height);
+                            let snapped = UVec2::new(gx & !1, gz & !1);
+                            let want = grid_position(config, *child, snapped, height);
+                            assert!(
+                                (moved - want).length() <= slack(child.level),
+                                "{child:?} vertex {gi}: {moved} vs {want} (shift {shift})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        swaps
+    }
+
+    /// No pop: a camera move that swaps a patch for its four children barely moves the surface.
     #[test]
     fn a_patch_swapped_for_its_children_barely_moves() {
         let tree = BoundsTree::uniform(&high(), -50.0, 80.0);
@@ -609,55 +727,113 @@ mod tests {
                 rng.next() * 2048.0,
             );
             let b = a + Vec3::new(rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5) * 6.0;
-            let shift = a.distance(b);
-            let (sel_a, sel_b) = (
-                select_patches(&config, &tree, a),
-                select_patches(&config, &tree, b),
+            swaps += swaps_barely_move(&config, &tree, a, b, &hill);
+        }
+        assert!(swaps > 20, "only {swaps} swaps were exercised");
+    }
+
+    /// The view direction of an isometric orthographic camera like Sanctuary's (issue #36):
+    /// pitched 35.26° down, heading 45°.
+    fn isometric_forward() -> Vec3 {
+        let (pitch, heading) = (35.26f32.to_radians(), 45f32.to_radians());
+        Vec3::new(
+            heading.sin() * pitch.cos(),
+            -pitch.sin(),
+            -heading.cos() * pitch.cos(),
+        )
+    }
+
+    /// Issue #36, acceptance 1 (`orthographic-lod.md` Validation 1). About an orthographic
+    /// camera's focus on the ground, every patch within 30 m of it is level 0, its vertices there
+    /// are unmorphed and sit on the height samples, and between them the patch mesh's triangles
+    /// are within a quarter of their quad's twist of the bilinear; about the eye 457 m back (the
+    /// old centre) some of that ground is drawn coarser.
+    #[test]
+    fn an_orthographic_focus_is_drawn_at_level_0_on_the_samples() {
+        use crate::terrain::ProceduralTerrain;
+        let (config, tree, grid, surface) = generated(&ProceduralTerrain::hills(42), 4.0);
+        let height = |p: Vec2| grid.sample(&surface, p);
+        let cell = grid.cell_m;
+        // A vertex on a sample, at the sample's own height.
+        let on_samples = |v: Vec3| {
+            let index = (v.xz() - 0.5 * cell) / cell;
+            (index - index.round()).abs().max_element() < 1e-3
+                && (v.y - surface[grid.index(index.round().as_ivec2())]).abs() < 1e-3
+        };
+        let mut rng = Rng(36);
+        let mut quads = 0;
+        for _ in 0..12 {
+            let xz = Vec2::new(200.0 + rng.next() * 1648.0, 200.0 + rng.next() * 1648.0);
+            let focus = Vec3::new(xz.x, height(xz), xz.y);
+            let eye = focus - isometric_forward() * 457.0;
+            let near = |p: &Patch| {
+                let (lo, hi) = node_box(&config, &tree, *p);
+                box_distance(lo, hi, focus) <= 30.0
+            };
+            // The vertices within 30 m of the focus that do not draw the map at its own
+            // resolution, for patches selected and morphed about `centre`: on a coarser level,
+            // morphed toward one, or off the samples.
+            let not_the_map = |centre: Vec3| {
+                select_patches(&config, &tree, centre)
+                    .iter()
+                    .filter(|p| near(p))
+                    .flat_map(|p| {
+                        (0..=32u32).flat_map(move |gz| (0..=32u32).map(move |gx| (*p, gx, gz)))
+                    })
+                    .filter(|&(p, gx, gz)| {
+                        let gi = UVec2::new(gx, gz);
+                        let v = vertex_position(&config, p, gi, centre, height);
+                        let unmorphed = grid_position(&config, p, gi, height);
+                        v.distance(focus) <= 30.0
+                            && (p.level > 0 || v.distance(unmorphed) > 1e-4 || !on_samples(v))
+                    })
+                    .count()
+            };
+            assert!(
+                not_the_map(eye) > 0,
+                "about the eye the ground at {focus} is the map"
             );
-            for (before, after, cam_before, cam_after) in
-                [(&sel_a, &sel_b, a, b), (&sel_b, &sel_a, b, a)]
-            {
-                for parent in before.iter().filter(|p| p.level > 0 && !after.contains(p)) {
-                    let children: Vec<&Patch> = after
-                        .iter()
-                        .filter(|c| {
-                            c.level + 1 == parent.level
-                                && c.ix / 2 == parent.ix
-                                && c.iz / 2 == parent.iz
-                        })
-                        .collect();
-                    if children.len() != 4 {
-                        continue;
-                    }
-                    swaps += 1;
-                    // The camera moved `shift` m since the swap boundary and the morph is
-                    // continuous, so the jump is at most the morph that distance buys.
-                    let slack = |level: u32| {
-                        let step = config.node_m(level) / LEAF_CELLS as f32;
-                        2.0 * step * shift / (config.range_m(level) - config.morph_start_m(level))
-                            + 1e-3
-                    };
-                    for gz in 0..=32 {
-                        for gx in 0..=32 {
-                            let gi = UVec2::new(gx, gz);
-                            let moved = vertex_position(&config, *parent, gi, cam_before, hill);
-                            let want = grid_position(&config, *parent, gi, hill);
-                            assert!(
-                                (moved - want).length() <= slack(parent.level),
-                                "{parent:?} is morphed at {gi}: {moved} vs {want}"
-                            );
+            assert_eq!(not_the_map(focus), 0, "about the focus {focus}");
+            let patches: Vec<Patch> = select_patches(&config, &tree, focus)
+                .into_iter()
+                .filter(near)
+                .collect();
+            assert!(!patches.is_empty());
+            for patch in &patches {
+                assert_eq!(patch.level, 0, "{patch:?} near the focus {focus}");
+                for gz in 0..32 {
+                    for gx in 0..32 {
+                        let v = |dx: u32, dz: u32| {
+                            vertex_position(
+                                &config,
+                                *patch,
+                                UVec2::new(gx + dx, gz + dz),
+                                focus,
+                                height,
+                            )
+                        };
+                        let (v00, v10, v01, v11) = (v(0, 0), v(1, 0), v(0, 1), v(1, 1));
+                        if v00.distance(focus) > 30.0 || v10.x == v00.x || v01.z == v00.z {
+                            continue;
                         }
-                    }
-                    for child in children {
-                        for gz in 0..=32 {
-                            for gx in 0..=32 {
-                                let gi = UVec2::new(gx, gz);
-                                let moved = vertex_position(&config, *child, gi, cam_after, hill);
-                                let snapped = UVec2::new(gx & !1, gz & !1);
-                                let want = grid_position(&config, *child, snapped, hill);
+                        quads += 1;
+                        // Between the vertices, the triangles (split along (1, 0)–(0, 1)).
+                        let twist = (v00.y + v11.y - v10.y - v01.y).abs() * 0.25;
+                        for j in 0..=4 {
+                            for i in 0..=4 {
+                                let (u, w) = (i as f32 / 4.0, j as f32 / 4.0);
+                                let drawn = if u + w <= 1.0 {
+                                    v00.y + u * (v10.y - v00.y) + w * (v01.y - v00.y)
+                                } else {
+                                    v11.y
+                                        + (1.0 - u) * (v01.y - v11.y)
+                                        + (1.0 - w) * (v10.y - v11.y)
+                                };
+                                let p = v00.xz() + Vec2::new(u, w) * cell;
                                 assert!(
-                                    (moved - want).length() <= slack(child.level),
-                                    "{child:?} vertex {gi}: {moved} vs {want} (shift {shift})"
+                                    (drawn - height(p)).abs() <= twist + 1e-4,
+                                    "at {p}: drawn {drawn}, bilinear {}, twist/4 {twist}",
+                                    height(p)
                                 );
                             }
                         }
@@ -665,6 +841,42 @@ mod tests {
                 }
             }
         }
-        assert!(swaps > 20, "only {swaps} swaps were exercised");
+        assert!(quads > 1000, "only {quads} quads within 30 m");
+    }
+
+    /// Issue #36, acceptance 3 (`orthographic-lod.md` Validation 3): walking an orthographic
+    /// camera's focus 100 m over the hills in 1 m steps, the patches it swaps barely move, and
+    /// no edge between patches cracks.
+    #[test]
+    fn walking_the_focus_neither_pops_nor_cracks() {
+        use crate::terrain::ProceduralTerrain;
+        let (config, tree, grid, surface) = generated(&ProceduralTerrain::hills(42), 4.0);
+        let height = |p: Vec2| grid.sample(&surface, p);
+        let direction = isometric_forward().xz().normalize();
+        let mut swaps = 0;
+        // Twelve walks across the terrain.
+        let starts = (0..12).map(|i| {
+            let (row, col) = ((i / 4) as f32, (i % 4) as f32);
+            Vec2::new(250.0 + col * 450.0, 450.0 + row * 550.0)
+        });
+        for start in starts {
+            let at = |s: f32| {
+                let xz = start + direction * s;
+                Vec3::new(xz.x, height(xz), xz.y)
+            };
+            for step in 0..100 {
+                swaps += swaps_barely_move(
+                    &config,
+                    &tree,
+                    at(step as f32),
+                    at(step as f32 + 1.0),
+                    &height,
+                );
+                if step % 25 == 0 {
+                    assert_no_cracks(&config, &tree, at(step as f32), &height);
+                }
+            }
+        }
+        assert!(swaps > 10, "only {swaps} swaps were exercised");
     }
 }

@@ -76,7 +76,7 @@ fn snow_source(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var s = snow[k];
     // Accumulate at the cell's own rain/snow split.
-    let swe_in = 1e-3 * params.sim.y * snow_fraction_at(t_loc) * exposure * dt_h;
+    let swe_in = 1e-3 * params.sim.y * snow_fraction_at(t_loc, params.air.y) * exposure * dt_h;
     s.x += swe_in * 1000.0 / params.snow.x;
     s.y += swe_in;
     if s.y > 0.0 {
@@ -290,7 +290,7 @@ fn wetness_update(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let k = id.y * size.x + id.x;
     let t_loc = local_temperature(params, cells[k].x);
-    let snow_part = snow_fraction_at(t_loc);
+    let snow_part = snow_fraction_at(t_loc, params.air.y);
     let covered = smoothstep(0.0, FULL_COVER_M, snow[k].x);
     let rain_mm_h = params.sim.y * (1.0 - snow_part) * shelter[k].x * (1.0 - covered);
     // E / E0 with E the hydrology evaporation (hydrology::evaporation_mm_h) and E0 = 0.1 mm/h.
@@ -308,4 +308,20 @@ fn cover_pack(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let k = id.y * size.x + id.x;
     cover_cells[k] = vec4<f32>(snow[k].x, wetness[k], snow[k].y, 0.0);
+}
+
+// The maps from a snowpack: each cell's snow set to the seed's depth and SWE times its snow
+// exposure (slope shed and blocker shelter), its wetness to the seed's times its rain exposure.
+// Dispatched once per seed request, after the shelter pass (docs/research/snow-season.md).
+@compute @workgroup_size(8, 8, 1)
+fn cover_seed(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = params.grid.size;
+    if id.x >= size.x || id.y >= size.y {
+        return;
+    }
+    let k = id.y * size.x + id.x;
+    let alpha = atan(slope_tangent(cells[k].w));
+    let exposure = (1.0 - smoothstep(params.shed.x, params.shed.y, alpha)) * shelter[k].y;
+    snow[k] = vec4<f32>(params.seed.x * exposure, params.seed.y * exposure, 0.0, 0.0);
+    wetness[k] = params.seed.z * shelter[k].x;
 }

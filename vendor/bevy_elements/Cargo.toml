@@ -13,10 +13,11 @@
 edition = "2024"
 rust-version = "1.97.1"
 name = "bevy_elements"
-version = "0.5.3"
+version = "0.6.0"
 authors = ["C. Thomas Brittain <cthomasbrittain@yahoo.com>"]
 build = false
 exclude = [
+    "assets/*",
     "docs/*.gif",
     "docs/*.png",
     "docs/research/*",
@@ -99,6 +100,10 @@ name = "ground_cover"
 path = "examples/ground_cover.rs"
 
 [[example]]
+name = "isometric"
+path = "examples/isometric.rs"
+
+[[example]]
 name = "lake"
 path = "examples/lake.rs"
 
@@ -123,9 +128,22 @@ name = "terrain_tour"
 path = "examples/terrain_tour.rs"
 
 [[example]]
+name = "trails"
+path = "examples/trails.rs"
+
+[[example]]
 name = "voxel_snow"
 path = "examples/voxel_snow.rs"
 required-features = ["isomesh"]
+
+[[example]]
+name = "voxel_walls"
+path = "examples/voxel_walls.rs"
+required-features = ["isomesh"]
+
+[[example]]
+name = "waves"
+path = "examples/waves.rs"
 
 [[example]]
 name = "weather_tour"
@@ -136,8 +154,24 @@ name = "weathered_town"
 path = "examples/weathered_town.rs"
 
 [[test]]
+name = "climate_history"
+path = "tests/climate_history.rs"
+
+[[test]]
+name = "game_lights"
+path = "tests/game_lights.rs"
+
+[[test]]
+name = "gpu_cloud_ambient"
+path = "tests/gpu_cloud_ambient.rs"
+
+[[test]]
 name = "gpu_clouds"
 path = "tests/gpu_clouds.rs"
+
+[[test]]
+name = "gpu_dressing"
+path = "tests/gpu_dressing.rs"
 
 [[test]]
 name = "gpu_hydrology"
@@ -148,6 +182,10 @@ name = "gpu_imports"
 path = "tests/gpu_imports.rs"
 
 [[test]]
+name = "gpu_plugins"
+path = "tests/gpu_plugins.rs"
+
+[[test]]
 name = "gpu_precipitation"
 path = "tests/gpu_precipitation.rs"
 
@@ -156,8 +194,32 @@ name = "gpu_readback"
 path = "tests/gpu_readback.rs"
 
 [[test]]
+name = "gpu_sky_probe"
+path = "tests/gpu_sky_probe.rs"
+
+[[test]]
+name = "gpu_trail_ground"
+path = "tests/gpu_trail_ground.rs"
+
+[[test]]
+name = "gpu_trails"
+path = "tests/gpu_trails.rs"
+
+[[test]]
+name = "gpu_twilight"
+path = "tests/gpu_twilight.rs"
+
+[[test]]
+name = "gpu_units"
+path = "tests/gpu_units.rs"
+
+[[test]]
 name = "gpu_water"
 path = "tests/gpu_water.rs"
+
+[[test]]
+name = "gpu_waves"
+path = "tests/gpu_waves.rs"
 
 [[test]]
 name = "gpu_weathered"
@@ -179,6 +241,10 @@ path = "tests/lightning.rs"
 name = "save"
 path = "tests/save.rs"
 required-features = ["serde"]
+
+[[test]]
+name = "snow_season"
+path = "tests/snow_season.rs"
 
 [[test]]
 name = "walk"
@@ -203,7 +269,7 @@ features = [
 default-features = false
 
 [dependencies.bevy_flora]
-version = "0.30"
+version = "0.46"
 optional = true
 default-features = false
 
@@ -226,6 +292,7 @@ optional = true
 
 [dev-dependencies.bevy]
 version = "0.20.0"
+features = ["jpeg"]
 
 [dev-dependencies.serde_json]
 version = "1"

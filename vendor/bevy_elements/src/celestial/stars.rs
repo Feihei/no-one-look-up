@@ -49,7 +49,7 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
-use super::{CelestialFrame, SunState};
+use super::{CelestialFrame, CelestialSettings, SunState};
 use crate::gpu::readback::decode;
 use crate::plugin::{ElementsSystems, ElementsView};
 
@@ -304,9 +304,13 @@ pub(super) fn plugin(app: &mut App) {
 
 fn spawn_stars(
     mut commands: Commands,
+    settings: Res<CelestialSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StarsMaterial>>,
 ) {
+    if !settings.sky {
+        return;
+    }
     let Some(catalog) = decode::<[f32; 4]>(CATALOG) else {
         error!("stars.bin is not a whole number of 16-byte records; the star field is not drawn");
         return;

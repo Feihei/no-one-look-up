@@ -62,6 +62,9 @@ fn golden_hour_sky_renders() {
         MeshPlugin,
         CameraPlugin,
         CorePipelinePlugin,
+        // R4.5's menu UI reads `ButtonInput<KeyCode>` (`menu_input`); without
+        // the input plugin the system fails validation on every frame.
+        bevy::input::InputPlugin,
     ));
     app.add_plugins((
         bevy::post_process::PostProcessPlugin,
@@ -105,6 +108,7 @@ fn golden_hour_sky_renders() {
         }),
         ElementsCamera {
             auto_exposure: false,
+            ..ElementsCamera::default()
         },
         Exposure { ev100: 13.0 },
         Tonemapping::AcesFitted,

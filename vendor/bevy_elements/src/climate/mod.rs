@@ -1,6 +1,7 @@
 //! Climate, seasons and weather: a seeded scheduler that picks hourly weather from a
 //! [`Climate`], a director that lets the game force it, and the ground's response.
 
+mod history;
 mod model;
 mod season;
 mod weather;
@@ -8,7 +9,8 @@ pub(crate) mod weathering;
 
 use bevy::prelude::*;
 
-pub use model::{Climate, LAPSE_RATE_C_PER_M};
+pub use history::{ClimateHistory, ClimateSummary, DayConditions, FREEZING_C, WET_DAY_MM};
+pub use model::{Climate, LAPSE_RATE_C_PER_M, SnowSeason};
 pub use season::{Season, SeasonState};
 pub use weather::{Weather, WeatherChanged, WeatherDirector, WeatherPreset};
 pub(crate) use weather::{hash64, mix64};
@@ -26,10 +28,11 @@ pub struct SeasonChanged {
     pub season: Season,
 }
 
-/// Climate, seasons, weather and surface weathering.
+/// Climate, seasons, weather, surface weathering and the record of recent days.
 ///
-/// Inserts (if absent) [`Climate`], [`WeatherDirector`], [`SeasonState`] and
-/// [`SurfaceWeathering`], and writes [`Weather`] every frame in [`ElementsSystems::Weather`].
+/// Inserts (if absent) [`Climate`], [`WeatherDirector`], [`SeasonState`],
+/// [`SurfaceWeathering`] and [`ClimateHistory`], and writes [`Weather`] every frame in
+/// [`ElementsSystems::Weather`].
 pub struct ClimatePlugin;
 
 impl Plugin for ClimatePlugin {
@@ -39,6 +42,7 @@ impl Plugin for ClimatePlugin {
             .init_resource::<WeatherDirector>()
             .init_resource::<SeasonState>()
             .init_resource::<SurfaceWeathering>()
+            .init_resource::<ClimateHistory>()
             .add_message::<WeatherChanged>()
             .add_message::<SeasonChanged>()
             .add_systems(
@@ -47,6 +51,7 @@ impl Plugin for ClimatePlugin {
                     update_season,
                     weather::run_weather,
                     weathering::update_weathering,
+                    history::record_history,
                 )
                     .chain()
                     .in_set(ElementsSystems::Weather),

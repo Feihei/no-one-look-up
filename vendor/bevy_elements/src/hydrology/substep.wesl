@@ -24,6 +24,7 @@ struct HydroParams {
     // (m). w: air temperature at the reference elevation (°C).
     weather: vec4<f32>,
     // x: temperature lapse (°C/m, negative). y: speed clamp (m/s). z: 1 = bake (all rain is liquid).
+    // w: Weather::snow_possible (0 outside the snow season).
     misc: vec4<f32>,
     // x: 1 = closed boundary. y: 1 = erosion on. z: sources uploaded. w: blockers uploaded.
     flags: vec4<u32>,
@@ -71,7 +72,7 @@ fn depth_after_sources(k: u32, surface: f32) -> f32 {
         var liquid = 1.0;
         if params.misc.z < 0.5 {
             let t = params.weather.w + params.misc.x * (surface + params.weather.z);
-            liquid = 1.0 - snow_fraction_at(t);
+            liquid = 1.0 - snow_fraction_at(t, params.misc.w);
         }
         rain = params.weather.x * sm.y * liquid;
     }
