@@ -20,7 +20,8 @@
 use heads_up_bevy::world::tree_shape::{TREE_PROFILES, TreeSkeleton, grow_tree};
 
 const WIDTH: usize = 2400;
-const HEIGHT: usize = 1560;
+/// Three species sheets plus the close-up sheet stack to `HEIGHT`.
+const HEIGHT: usize = 2100;
 /// Seed variants per species (one column each).
 const VARIANTS: u64 = 4;
 /// Minimum centre-to-centre column pitch (m); the real pitch is
@@ -425,6 +426,70 @@ fn main() {
                 sheet.origin_x - 30.0,
                 ground_y + 12.0,
                 &format!("V{variant}"),
+                [0.72, 0.74, 0.78],
+            );
+        }
+    }
+
+    // ---- Close-up sheet: one cluster per species at real scale ----
+    //
+    // The species sheets shrink whole trees to fit, which is exactly what hides
+    // the card granularity: at 30 px/m a 0.3 m card is 9 px. This sheet frames
+    // ONE foliage cluster of each species at full scale, so the leaf units and
+    // the sky gaps between them are what the eye judges — the fragmentation
+    // direction is checked here, not on the shrunk rows.
+    {
+        let close_top = 3 * (SHEET_HEIGHT + SHEET_GAP);
+        canvas.fill_rect(0, close_top, WIDTH, SHEET_HEIGHT, [0.13, 0.15, 0.21]);
+        canvas.text(
+            SHEET_MARGIN_X,
+            (close_top + 10) as f32,
+            "CLOSE-UP - ONE CLUSTER PER SPECIES, REAL SCALE",
+            [0.92, 0.90, 0.85],
+        );
+        let usable_h = (SHEET_HEIGHT - SHEET_CAPTION_H - SHEET_BASELINE) as f32;
+        let column_w = (WIDTH as f32 - 2.0 * SHEET_MARGIN_X) / 3.0;
+        let panel_cy = (close_top + SHEET_CAPTION_H) as f32 + usable_h * 0.5;
+
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let tree = grow_tree(GALLERY_SEED, species, 0);
+            // The biggest cluster: the one whose card granularity dominates
+            // the crown's read.
+            let Some(foliage) = tree
+                .foliage
+                .iter()
+                .max_by(|a, b| a.radius.total_cmp(&b.radius))
+            else {
+                continue;
+            };
+            // The cards sit on a shell out to ~1 cluster radius plus their own
+            // reach: ~2.6 radii of world space, framed to fill most of the row
+            // so the leaf units and the sky gaps between them are readable.
+            let world_span = foliage.radius * 2.6;
+            let scale = (usable_h / world_span).min(260.0);
+            let panel_cx = SHEET_MARGIN_X + column_w * (species as f32 + 0.5);
+
+            // Centre the cluster: shift the sheet origin so the cluster's
+            // centre lands at the panel's centre.
+            let (sin, cos) = SHEET_YAW.sin_cos();
+            let cx_rot = foliage.center[0] * cos + foliage.center[2] * sin;
+            let sheet = Sheet {
+                scale,
+                origin_x: panel_cx - cx_rot * scale,
+                ground_y: panel_cy + foliage.center[1] * scale,
+                yaw: SHEET_YAW,
+            };
+            draw_leaf_cards(&mut canvas, foliage, &sheet, species, &atlas);
+
+            let label = match species {
+                0 => "aspen/yang",
+                1 => "street/huai (pinnate)",
+                _ => "broadleaf/liu",
+            };
+            canvas.text(
+                panel_cx - 60.0,
+                (close_top + SHEET_HEIGHT - SHEET_BASELINE + 12) as f32,
+                label,
                 [0.72, 0.74, 0.78],
             );
         }
