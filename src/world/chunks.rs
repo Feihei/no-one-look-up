@@ -15,11 +15,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use bevy::prelude::*;
 
+use crate::plugins::facade::{FacadeMaterial, facade_material};
 use crate::world::collision::CollisionIndex;
+use crate::world::facade::{FacadeStyle, VARIANT_COUNT, bake_facade, texture_image};
 use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::placement;
+use crate::world::roof::{RoofKind, RoofProfile, bake_gable, bake_tooth};
 use crate::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
 use crate::world::tree_shape::TREE_PROFILES;
 use crate::world::{CHUNK_AHEAD, CHUNK_BEHIND, CHUNK_SIZE, CHUNKS_PER_FRAME, GRID_CELLS};
@@ -303,17 +306,37 @@ pub(crate) fn update_chunk_streaming(
 
 /// Shared placeholder materials + tree scenes, built once (Draw Call
 /// control, ADR-0004).
+/// The roof geometry and material of one style.
+pub struct RoofAssets {
+    pub material: Handle<StandardMaterial>,
+    /// 双坡 gable, unit footprint with the eave overhang baked.
+    pub gable: Handle<Mesh>,
+    /// One sawtooth tooth, unit footprint.
+    pub tooth: Handle<Mesh>,
+}
+
 #[derive(Resource)]
 pub(crate) struct PlacementAssets {
-    /// `building_materials[type][bucket]`: one shared material per (style,
-    /// wear bucket) pair, so per-building weathering costs no extra draw
-    /// state beyond the bucket switch (R3.6).
-    building_materials: [[Handle<StandardMaterial>; placement::WEAR_BUCKETS]; 3],
+    /// `facade_materials[style][variant][bucket]`: one shared material per
+    /// (style, pattern variant, wear bucket), so a building's facade costs no
+    /// draw state beyond the bucket switch (R3.6) and neighbours rarely share
+    /// the same 12 m tile (R3.11).
+    ///
+    /// 3 x 2 x 4 = 24 materials for the whole city, which is the number that
+    /// makes this affordable at all: one material per building would put a
+    /// streaming window into the thousands of draw calls.
+    facade_materials:
+        [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3],
+    /// One roof material and mesh set per style. The gable and sawtooth tooth
+    /// are unit meshes scaled per instance; the parapet is four instances of the
+    /// shared unit cube, because its wall thickness must stay ~0.25 m absolute
+    /// and a baked ring would scale it with the building.
+    roofs: [RoofAssets; 3],
     plaza_material: Handle<StandardMaterial>,
-    /// One baked mesh per `(lod, species, variant)` (R3.9): a whole tree in a
-    /// single `Mesh3d`, so a chunk costs one entity per tree per LOD tier.
-    /// Indices follow `lod * TreeMeshKey::VARIANTS * TREE_PROFILES.len() +
-    /// species * TreeMeshKey::VARIANTS + variant`.
+    /// One baked mesh pair per `(lod, species, variant)` (R3.9): a whole tree
+    /// in a single `Mesh3d` per part, so a chunk costs one entity per tree part
+    /// per LOD tier. Indices follow `lod * TreeMeshKey::VARIANTS *
+    /// TREE_PROFILES.len() + species * TreeMeshKey::VARIANTS + variant`.
     tree_meshes: Vec<(Handle<Mesh>, Handle<Mesh>)>,
     /// Opaque silhouette material for the branches.
     tree_material: Handle<crate::plugins::season::TreeSeasonMaterial>,
@@ -346,12 +369,108 @@ impl PlacementAssets {
     }
 }
 
+/// Builds one roof material and mesh set per style.
+///
+/// Split from the facade materials because the roofs are plain
+/// `StandardMaterial`s: the roofline reads as a silhouette, so they use the
+/// tree recipe (fully rough, no specular) instead of the facade's reflective
+/// one. A wet-looking glint along the roof edge is exactly what the tree
+/// material's comment warns about.
+fn build_roof_assets(
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> [RoofAssets; 3] {
+    FacadeStyle::ALL.map(|style| {
+        let profile = RoofProfile::of(style);
+        RoofAssets {
+            material: materials.add(StandardMaterial {
+                base_color: Color::srgb(profile.tint[0], profile.tint[1], profile.tint[2]),
+                // The tree recipe: a rim highlight on the roofline would read as
+                // wet plastic against the sky it is meant to cut.
+                perceptual_roughness: 1.0,
+                metallic: 0.0,
+                reflectance: 0.0,
+                ..default()
+            }),
+            gable: meshes.add(bake_gable()),
+            tooth: meshes.add(bake_tooth()),
+        }
+    })
+}
+
+/// Builds every `(style, variant, wear bucket)` facade material.
+///
+/// Split out of [`build_placement_assets`] because the three nested loops there
+/// made that system unreadable, and because this is the part with a decision in
+/// it: the maps are shared across wear buckets (four materials per bake, not
+/// four bakes), so wear costs 24 handles and 18 textures, never 24 textures.
+fn build_facade_materials(
+    materials: &mut Assets<FacadeMaterial>,
+    mut images: Option<&mut Assets<Image>>,
+    palette: &placement::StylePalette,
+) -> [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3] {
+    let mut out: [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3] =
+        std::array::from_fn(|_| {
+            std::array::from_fn(|_| std::array::from_fn(|_| Handle::<FacadeMaterial>::default()))
+        });
+
+    for (style_index, style) in FacadeStyle::ALL.into_iter().enumerate() {
+        let tint = match style {
+            FacadeStyle::OldCity => palette.old_city,
+            FacadeStyle::Apartment => palette.apartment,
+            FacadeStyle::Factory => palette.factory,
+        };
+        for (variant_index, slot) in out[style_index].iter_mut().enumerate() {
+            let variant = variant_index as u8;
+            // Headless tests have no `Assets<Image>`: the material then carries
+            // no maps, which renders as a flat wall and is irrelevant there
+            // (nothing is drawn). The material itself is still built, so the
+            // material-count test covers the real pipeline in both worlds.
+            let (albedo, mr, emissive) = match images.as_deref_mut() {
+                Some(images) => {
+                    let baked = bake_facade(style, variant);
+                    (
+                        images.add(texture_image(&baked.base, baked.base_size, true)),
+                        images.add(texture_image(
+                            &baked.metallic_roughness,
+                            baked.channel_size,
+                            false,
+                        )),
+                        images.add(texture_image(&baked.emissive, baked.channel_size, true)),
+                    )
+                }
+                None => (
+                    Handle::<Image>::default(),
+                    Handle::<Image>::default(),
+                    Handle::<Image>::default(),
+                ),
+            };
+            for (bucket, handle) in slot.iter_mut().enumerate() {
+                let t = bucket as f32 / (placement::WEAR_BUCKETS - 1) as f32;
+                let luma = tint[0] * 0.3 + tint[1] * 0.6 + tint[2] * 0.1;
+                let desat = 0.25 * t;
+                let darken = 1.0 - 0.35 * t;
+                let mixed = |c: f32| (luma * desat + c * (1.0 - desat)) * darken;
+                *handle = materials.add(facade_material(
+                    style,
+                    albedo.clone(),
+                    mr.clone(),
+                    emissive.clone(),
+                    [mixed(tint[0]), mixed(tint[1]), mixed(tint[2])],
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Builds the placement assets on first chunk spawn (lazy: `Mesh3d` handles
 /// need the render `Assets` stores, which headless tests do not run).
 fn build_placement_assets(
     mut commands: Commands,
     meshes: Option<ResMut<Assets<Mesh>>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
+    facade_materials: Option<ResMut<Assets<FacadeMaterial>>>,
     tree_materials: Option<ResMut<Assets<crate::plugins::season::TreeSeasonMaterial>>>,
     mut images: Option<ResMut<Assets<Image>>>,
     existing: Option<Res<PlacementAssets>>,
@@ -376,8 +495,12 @@ fn build_placement_assets(
     // do add, so trees stay testable). Waiting for it — instead of returning
     // after the meshes have been allocated — is what keeps this system
     // idempotent; returning late would leak a fresh set of meshes every frame.
-    let (Some(mut meshes), Some(mut materials), Some(mut tree_materials)) =
-        (meshes, materials, tree_materials)
+    let (
+        Some(mut meshes),
+        Some(mut materials),
+        Some(mut facade_materials),
+        Some(mut tree_materials),
+    ) = (meshes, materials, facade_materials, tree_materials)
     else {
         return;
     };
@@ -397,13 +520,21 @@ fn build_placement_assets(
             ..default()
         })
     };
-    let mut style_wear = |rgb: [f32; 3]| std::array::from_fn(|bucket| wear_color(rgb, bucket));
-    let building_materials = [
-        style_wear(palette.old_city),
-        style_wear(palette.apartment),
-        style_wear(palette.factory),
-    ];
     let plaza_material = wear_color(palette.plaza, 1);
+
+    // R3.11 step 11.3: roofs. One dark material per style (the roofline reads as
+    // a silhouette; see `world::roof`), and the two unit meshes the styles need.
+    let roofs = build_roof_assets(&mut meshes, &mut materials);
+
+    // R3.11: the wall is a facade texture now. Bake three maps per (style,
+    // variant) once — 6 bakes of 1024^2 + 2 x 512^2, a few tens of MB and one
+    // startup hitch nobody sees, because the world is already streaming behind
+    // the menu — then build one material per (style, variant, wear bucket).
+    //
+    // The tint keeps the R3.6 wear recipe: the maps carry the pattern and stay
+    // neutral, the tint carries the style and its grime grade.
+    let facade_materials_out =
+        build_facade_materials(&mut facade_materials, images.as_deref_mut(), &palette);
     // R3.9: trees are procedural, baked to one mesh per (species, variant).
     // 3 species x 4 variants = 12 meshes for the whole world, reused by every
     // chunk that spawns a tree.
@@ -446,19 +577,108 @@ fn build_placement_assets(
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
     info!(
-        "placement assets built: {} tree meshes ({} LODs), {} building materials",
+        "placement assets built: {} tree meshes ({} LODs), {} facade materials          ({} styles x {} variants x {} wear buckets)",
         tree_meshes.len(),
         TreeLod::ALL.len(),
-        building_materials.len()
+        facade_materials_out.len() * VARIANT_COUNT as usize * placement::WEAR_BUCKETS,
+        facade_materials_out.len(),
+        VARIANT_COUNT,
+        placement::WEAR_BUCKETS
     );
     commands.insert_resource(PlacementAssets {
-        building_materials,
+        facade_materials: facade_materials_out,
+        roofs,
         plaza_material,
         tree_meshes,
         tree_material,
         tree_leaf_material,
         unit_cube,
     });
+}
+
+/// Spawns one building's roof (R3.11 step 11.3).
+///
+/// The roof sits on the wall top and is a child of the same chunk root, so it
+/// despawns with the building. All three kinds are instances of shared meshes:
+/// one gable and one sawtooth tooth for the whole city, and the shared unit
+/// cube for the parapet's four walls.
+///
+/// Rotation matters as much as height here: the roof is baked with its ridge
+/// along local +X, which after the yaw fix is the street direction, so the
+/// gable ends face the side streets and the sawtooth teeth cut the skyline
+/// across the frontage.
+fn spawn_roof(
+    parent: &mut ChildSpawnerCommands,
+    roof: &RoofAssets,
+    unit_cube: &Handle<Mesh>,
+    object: &placement::PlacedObject,
+) {
+    let style = match object.kind {
+        placement::PlacedKind::Building(kind) => FacadeStyle::of(kind).expect("roof of a building"),
+        _ => return,
+    };
+    let profile = RoofProfile::of(style);
+    let yaw = Quat::from_rotation_y(object.yaw);
+    let (x, z) = (object.position.x, object.position.y);
+    let (l, h, d) = (object.size.x, object.size.y, object.size.z);
+    let rise = profile.rise_for(object.variant);
+
+    match profile.kind {
+        RoofKind::Gable => {
+            // One scaled instance: ridge along local +X, eaves overhanging
+            // local z (the overhang is baked into the unit mesh).
+            parent.spawn((
+                Name::new("Roof"),
+                Mesh3d(roof.gable.clone()),
+                MeshMaterial3d(roof.material.clone()),
+                Transform::from_translation(Vec3::new(x, h, z))
+                    .with_rotation(yaw)
+                    .with_scale(Vec3::new(l, rise, d)),
+            ));
+        }
+        RoofKind::Parapet => {
+            // Four walls of the shared unit cube. The wall thickness stays
+            // absolute: a baked ring would scale it with the building and end
+            // up metres thick on a 40 m slab.
+            const WALL: f32 = 0.25;
+            let walls = [
+                // front / back, spanning the frontage
+                ([0.0, 0.0, (d - WALL) * 0.5], [l, rise, WALL]),
+                ([0.0, 0.0, -(d - WALL) * 0.5], [l, rise, WALL]),
+                // sides, spanning the depth between the front and back walls
+                ([(l - WALL) * 0.5, 0.0, 0.0], [WALL, rise, d - WALL * 2.0]),
+                ([-(l - WALL) * 0.5, 0.0, 0.0], [WALL, rise, d - WALL * 2.0]),
+            ];
+            for (local, scale) in walls {
+                let offset = yaw * Vec3::new(local[0], local[1], local[2]);
+                parent.spawn((
+                    Name::new("Roof"),
+                    Mesh3d(unit_cube.clone()),
+                    MeshMaterial3d(roof.material.clone()),
+                    Transform::from_translation(Vec3::new(x, h, z) + offset)
+                        .with_rotation(yaw)
+                        .with_scale(Vec3::new(scale[0], scale[1], scale[2])),
+                ));
+            }
+        }
+        RoofKind::Sawtooth => {
+            // Teeth repeat along the FRONTAGE (local +X), so the roofline cuts
+            // the sky across the street-facing elevation.
+            let (count, width) = profile.teeth(l);
+            for i in 0..count {
+                let lx = -l * 0.5 + (i as f32 + 0.5) * width;
+                let offset = yaw * Vec3::new(lx, rise * 0.5, 0.0);
+                parent.spawn((
+                    Name::new("RoofTooth"),
+                    Mesh3d(roof.tooth.clone()),
+                    MeshMaterial3d(roof.material.clone()),
+                    Transform::from_translation(Vec3::new(x, h, z) + offset)
+                        .with_rotation(yaw)
+                        .with_scale(Vec3::new(width, rise, d)),
+                ));
+            }
+        }
+    }
 }
 
 /// Spawns a chunk's planned content under its root: buildings as BoxMesh
@@ -479,8 +699,10 @@ fn spawn_chunk_content(
                     BlockType::Apartment => 1,
                     _ => 2,
                 };
-                let material =
-                    &assets.building_materials[style][placement::wear_bucket(object.wear)];
+                let roof = &assets.roofs[style];
+                let material = &assets.facade_materials[style]
+                    [object.variant as usize % VARIANT_COUNT as usize]
+                    [placement::wear_bucket(object.wear)];
                 let mesh = assets.unit_cube.clone();
                 let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
                 let rotation = Quat::from_rotation_y(object.yaw);
@@ -496,6 +718,11 @@ fn spawn_chunk_content(
                             .with_rotation(rotation)
                             .with_scale(object.size),
                     ));
+
+                    // R3.11 step 11.3: the roof. The silhouette is made of
+                    // building tops watched from the shoulders up, and the wall
+                    // texture stops at the parapet.
+                    spawn_roof(parent, roof, &assets.unit_cube, object);
                 });
             }
             placement::PlacedKind::PlazaPad => {
@@ -579,6 +806,12 @@ impl Plugin for WorldPlugin {
             // twice is a no-op, so the real app (which also has the
             // `MaterialPlugin` that needs it) is unaffected.
             .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>()
+            // Same arrangement for the facade material: `MaterialPlugin` lives
+            // in the render app (see `plugins::facade::FacadePlugin`), while
+            // `Assets<FacadeMaterial>` must exist before
+            // `build_placement_assets` runs — including in headless tests,
+            // which have no renderer at all.
+            .init_resource::<Assets<FacadeMaterial>>()
             .add_message::<crate::world::explored::PlayerChunkChanged>()
             .add_systems(Startup, generate_layout)
             .add_systems(PreUpdate, build_placement_assets)
@@ -893,6 +1126,7 @@ mod tests {
         }
         let meshes_after_warmup = app.world().resource::<Assets<Mesh>>().len();
         let materials_after_warmup = app.world().resource::<Assets<StandardMaterial>>().len();
+        let facades_after_warmup = app.world().resource::<Assets<FacadeMaterial>>().len();
 
         // Run a lot more frames with no world change: nothing may be
         // allocated.
@@ -908,6 +1142,54 @@ mod tests {
             app.world().resource::<Assets<StandardMaterial>>().len(),
             materials_after_warmup,
             "material assets grow every frame"
+        );
+        assert_eq!(
+            app.world().resource::<Assets<FacadeMaterial>>().len(),
+            facades_after_warmup,
+            "facade materials grow every frame; the facade bake ran more than once"
+        );
+    }
+
+    /// The facade materials must be exactly `styles x variants x wear buckets`.
+    ///
+    /// A per-building material is the failure this guards: it would still look
+    /// correct and would put a streaming window into thousands of draw calls,
+    /// which no unit test would notice unless it counts the materials.
+    #[test]
+    fn facades_are_shared_not_built_per_building() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+        for _ in 0..12 {
+            app.update();
+        }
+
+        let assets = app.world().resource::<PlacementAssets>();
+        let mut unique = std::collections::HashSet::new();
+        for style in &assets.facade_materials {
+            for variant in style {
+                for handle in variant {
+                    unique.insert(handle.id());
+                }
+            }
+        }
+        let expected = FacadeStyle::ALL.len() * VARIANT_COUNT as usize * placement::WEAR_BUCKETS;
+        assert_eq!(
+            unique.len(),
+            expected,
+            "expected {expected} distinct facade materials (styles x variants x buckets)"
+        );
+        // And the store agrees: the only other entries are the plaza material.
+        assert_eq!(
+            app.world().resource::<Assets<FacadeMaterial>>().len(),
+            expected
         );
     }
 
