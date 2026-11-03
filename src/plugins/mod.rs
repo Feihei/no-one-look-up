@@ -5,6 +5,7 @@
 //! MenuPlugin. Each milestone fills in the corresponding plugin.
 
 pub mod cirrus;
+pub mod facade;
 pub mod menu;
 pub mod save;
 pub mod save_data;
@@ -24,6 +25,7 @@ use bevy::app::PluginGroupBuilder;
 use bevy::prelude::*;
 
 use cirrus::CirrusPlugin;
+use facade::FacadePlugin;
 use menu::MenuPlugin;
 use save::SavePlugin;
 use season::SeasonPlugin;
@@ -51,6 +53,10 @@ impl PluginGroup for HeadsUpPlugins {
             // from chunk content (`chunks.rs` + `world::tree_mesh`); the
             // gallery module stays as a shape reference for
             // `examples/tree_gallery.rs`.
+            // Facade material type: registered before the world streams any
+            // building, because the material only renders once its
+            // `MaterialPlugin` exists.
+            .add(FacadePlugin)
             .add(SeasonPlugin)
             .add(SavePlugin)
             .add(MenuPlugin)
