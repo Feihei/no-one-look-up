@@ -337,7 +337,12 @@ pub(crate) struct PlacementAssets {
     /// in a single `Mesh3d` per part, so a chunk costs one entity per tree part
     /// per LOD tier. Indices follow `lod * TreeMeshKey::VARIANTS *
     /// TREE_PROFILES.len() + species * TreeMeshKey::VARIANTS + variant`.
-    tree_meshes: Vec<(Handle<Mesh>, Handle<Mesh>)>,
+    ///
+    /// The wood slot is `None` where the tier drops every branch (Far keeps
+    /// leaves only): baking an empty mesh there costs nothing to draw but
+    /// makes the mesh allocator warn 12 times per run, which buries real
+    /// warnings.
+    tree_meshes: Vec<(Option<Handle<Mesh>>, Handle<Mesh>)>,
     /// Opaque silhouette material for the branches.
     tree_material: Handle<crate::plugins::season::TreeSeasonMaterial>,
     /// Alpha-tested material for the foliage cards, textured with a species
@@ -358,7 +363,7 @@ impl PlacementAssets {
         asset: u8,
         wear: f32,
         lod: TreeLod,
-    ) -> Option<&(Handle<Mesh>, Handle<Mesh>)> {
+    ) -> Option<&(Option<Handle<Mesh>>, Handle<Mesh>)> {
         let key = crate::world::tree_mesh::TreeMeshKey::from_placement(asset, wear);
         let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
         let tier = TreeLod::ALL.iter().position(|t| *t == lod)?;
@@ -542,13 +547,20 @@ fn build_placement_assets(
     // stay opaque while the foliage cards are alpha-tested. See
     // `world::tree_mesh`'s header for why they cannot share a material.
     let per_lod = TREE_PROFILES.len() * TreeMeshKey::VARIANTS as usize;
-    let mut tree_meshes: Vec<(Handle<Mesh>, Handle<Mesh>)> =
+    let mut tree_meshes: Vec<(Option<Handle<Mesh>>, Handle<Mesh>)> =
         Vec::with_capacity(per_lod * TreeLod::ALL.len());
     for lod in TreeLod::ALL {
         for species in 0..TREE_PROFILES.len() as u8 {
             for variant in 0..TreeMeshKey::VARIANTS {
                 let parts = bake_tree_mesh_lod(TreeMeshKey { species, variant }, lod);
-                tree_meshes.push((meshes.add(parts.wood), meshes.add(parts.leaves)));
+                // An empty branch mesh is a tier that carries no branches (Far);
+                // shipping it as None keeps the mesh allocator quiet.
+                let wood = if parts.wood.count_vertices() > 0 {
+                    Some(meshes.add(parts.wood))
+                } else {
+                    None
+                };
+                tree_meshes.push((wood, meshes.add(parts.leaves)));
             }
         }
     }
@@ -766,15 +778,31 @@ fn spawn_chunk_content(
                         // The wood entity carries the tier's canonical name
                         // (`Tree` / `TreeMid` / `TreeFar`) so the LOD and
                         // streaming tests keep working; the leaf entity is
-                        // named alongside it.
-                        for (part_name, mesh, material) in [
-                            (format!("Tree{suffix}"), wood, &assets.tree_material),
-                            (
-                                format!("TreeLeaves{suffix}"),
-                                leaves,
-                                &assets.tree_leaf_material,
-                            ),
-                        ] {
+                        // named alongside it. A tier with no branches (Far)
+                        // skips the wood entity entirely and hands its name to
+                        // the leaves, which is what the LOD tests match on.
+                        let mut parts: Vec<(
+                            String,
+                            Handle<Mesh>,
+                            &Handle<crate::plugins::season::TreeSeasonMaterial>,
+                        )> = Vec::with_capacity(2);
+                        if let Some(wood) = wood {
+                            parts.push((
+                                format!("Tree{suffix}"),
+                                wood.clone(),
+                                &assets.tree_material,
+                            ));
+                        }
+                        parts.push((
+                            if wood.is_some() {
+                                format!("TreeLeaves{suffix}")
+                            } else {
+                                format!("Tree{suffix}")
+                            },
+                            leaves.clone(),
+                            &assets.tree_leaf_material,
+                        ));
+                        for (part_name, mesh, material) in parts {
                             let mut entity = parent.spawn((
                                 Name::new(part_name),
                                 Mesh3d(mesh.clone()),
