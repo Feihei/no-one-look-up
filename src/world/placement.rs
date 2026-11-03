@@ -27,9 +27,10 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::world::facade::{FacadeStyle, VARIANT_COUNT, snap_to_bay};
 use crate::world::geometry::{
-    convex_hull, dist_point_to_segment, dist_segment_to_segment, point_in_polygon,
-    rect_inside_polygon,
+    convex_hull, dist_point_to_segment, dist_segment_to_segment, oriented_rect_inside_polygon,
+    point_in_polygon,
 };
 use crate::world::layout_graph::{BlockType, LayoutGraph};
 use crate::world::{CELL_SIZE, CHUNK_SIZE, GRID_CELLS};
@@ -166,6 +167,12 @@ pub struct PlacedObject {
     /// the placement RNG at plan time so the same seed always produces the
     /// same weathering per building (R3.6). Unused for trees.
     pub wear: f32,
+    /// Which facade pattern variant this building draws (R3.11), so two
+    /// neighbours rarely share the same 12 m tile. Derived from the building's
+    /// own position rather than from the RNG: taking another draw from the
+    /// per-edge stream would shift every wear value downstream of it, and the
+    /// existing weathering is already approved.
+    pub variant: u8,
     /// Tree variation, `None` for buildings and the plaza pad.
     pub tree: Option<TreeInstance>,
 }
@@ -259,44 +266,44 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
                     normal * sign
                 );
             }
-            // Merged runs span one cell each (see `street_unit_edges`): place
-            // per cell, so a 4-6 m module grid lines up with the 50 m blocks
-            // instead of being spread over a 1900 m run.
+            // One run per (edge, side). The old three-way split existed to keep
+            // the depth probe off the block's mitred corners, but it also capped
+            // every frontage at ~15 m, which is shorter than an apartment's
+            // 25-40 m table length: every apartment and factory row failed and
+            // fell back to 3-6 m modules, and no building in the city ever
+            // showed its intended footprint. `place_buildings` now measures the
+            // block's own usable frontage (`usable_frontage`), so the corners
+            // are handled where they are understood.
+            //
             // The curb sits at this street's own half-width from the
             // centerline; buildings and trees offset from the curb, not from
             // a global corridor (streets vary 6-10 m).
             let curb = edge.width * 0.5;
-            let thirds = 3.max((length / CELL_SIZE).round() as usize);
-            for part in 0..thirds {
-                let t = (part as f32 + 0.5) / thirds as f32;
-                let part_mid = a + (b - a) * t;
-                let part_length = length / thirds as f32;
-                let mut rng = edge_rng(seed, edge_index as u32, side * 16 + part as u32);
-                place_buildings(
-                    graph,
-                    &mut plan,
-                    &mut rng,
-                    block,
-                    &params,
-                    part_mid,
-                    dir,
-                    normal * sign,
-                    part_length,
-                    curb,
-                );
-                let mut rng = edge_rng(seed, edge_index as u32, 1000 + side * 16 + part as u32);
-                place_street_trees(
-                    &mut plan,
-                    &mut rng,
-                    &params,
-                    part_mid,
-                    dir,
-                    normal * sign,
-                    part_length,
-                    tree_assets,
-                    curb,
-                );
-            }
+            let mut rng = edge_rng(seed, edge_index as u32, side * 16);
+            place_buildings(
+                graph,
+                &mut plan,
+                &mut rng,
+                block,
+                &params,
+                (a + b) * 0.5,
+                dir,
+                normal * sign,
+                length,
+                curb,
+            );
+            let mut rng = edge_rng(seed, edge_index as u32, 1000 + side * 16);
+            place_street_trees(
+                &mut plan,
+                &mut rng,
+                &params,
+                (a + b) * 0.5,
+                dir,
+                normal * sign,
+                length,
+                tree_assets,
+                curb,
+            );
         }
     }
 
@@ -341,6 +348,7 @@ impl PlazaPadObject {
             size: bevy::math::Vec3::new(10.0, 0.2, 10.0),
             footprint_half: bevy::math::Vec2::splat(5.0),
             wear: 0.0,
+            variant: 0,
             tree: None,
         }
     }
@@ -367,66 +375,88 @@ fn place_buildings(
     let rand_depth: f32 = rng.random_range(depth_min..=depth_max);
     let height: f32 = rng.random_range(height_min..=height_max);
 
-    let angle = edge_dir.x.atan2(edge_dir.y);
+    // Yaw that puts the building's LENGTH along the street.
+    //
+    // `rotated_corners` (and Bevy's `Quat::from_rotation_y`) maps local +X to
+    // `(cos y, -sin y)` in the ground plane, so aligning +X with `edge_dir`
+    // needs `cos y = dir.x, -sin y = dir.z` -- hence the negated z. The previous
+    // `atan2(dir.x, dir.z)` put local +Z along the street instead: the 25-40 m
+    // apartment length then pointed at the opposite block, every table-sized
+    // footprint failed the street-corridor test, and the whole city fell back to
+    // 3-6 m modules. Measured before the fix: an apartment was 3.3 m of frontage
+    // by 6 m of depth, with 18 m of height on it.
+    let angle = (-edge_dir.y).atan2(edge_dir.x);
 
-    // How deep the block really is behind this facade, sampled along the
-    // whole edge: the ADR footprint was tuned for the original's merged
-    // blocks, and a perturbed 1x1 block is only ~39 m inside its inset
-    // outline, so the table's depth + setback often cannot exist at all near
-    // the corners. The row uses the shallowest sample of the columns it
-    // actually occupies.
-    let columns = row_columns(edge_length, facade_length.max(MIN_FACADE), params.spacing);
+    // Facades are metric now (R3.11): the wall texture repeats every 4 bays and
+    // its UVs are derived from the building's own size, so a frontage that is
+    // not a whole number of bays ends with a sliced window at the corner.
+    // Snapping the footprint (not the bay) keeps every window physically
+    // identical down the street, which is what makes a row read as built.
+    //
+    // The frontage IS `size.x` with this yaw, so the snap goes on
+    // `building_length` -- the same axis the ADR table calls "along edge".
+    let dims = FacadeStyle::of(block.kind).map(|style| style.dims());
+    let facade_length = match dims {
+        Some(d) => snap_to_bay(facade_length, d.bay),
+        None => facade_length,
+    };
+
+    // How much of this edge actually has block behind it.
+    //
+    // The street edge spans the full lattice cell side, but the block polygon is
+    // inset from the centerline and its corners are mitred, so roughly the first
+    // and last street-half-width metres of the edge have NO block behind them.
+    // Laying a row over the full edge puts its end buildings in the street --
+    // and, worse, makes the depth probe return a zero chord at those ends,
+    // which failed the whole row. This is why the old per-edge three-way split
+    // was load-bearing: it never sampled the corners.
     let (start, end) = edge_span(edge_mid, edge_dir, edge_length);
-    let depth_budget = shallowest_column_depth(block, start, end, edge_normal, &columns);
+    let (u_lo, u_hi) = usable_frontage(block, start, end);
+    let frontage = (u_hi - u_lo) * edge_length;
+    if frontage < MIN_FACADE {
+        return;
+    }
 
-    // Facade length: the table size first; when that cannot fit a row, fall
-    // back to 4-6 m modules (a big block still reads as a slab, a small one
-    // gets the old city's rhythm) and only then give up on this frontage.
+    // Facade length: the table size first; when that cannot fit the usable
+    // frontage, fall back to 4-6 m modules (a big block still reads as a slab, a
+    // small one gets the old city's rhythm) and only then give up.
     let mut building_length = facade_length.max(MIN_FACADE);
-    let mut building_depth = rand_depth.max(MIN_FACADE);
-    let mut budget = depth_budget;
-    if !row_fits(
-        block,
-        start,
-        end,
-        edge_normal,
-        &columns_for(edge_length, building_length, params.spacing),
-        building_length,
-        building_depth,
-        budget - params.setback,
-        curb,
-        params.setback,
-    ) {
+    if frontage < building_length {
         let (lmin, lmax) = if params.length.1 - params.length.0 > 4.0 {
             (MIN_FACADE, MODULE_LENGTH_MAX)
         } else {
             params.length
         };
-        building_length = lmin + (lmax - lmin) * 0.5;
-        building_depth = building_depth.min(MODULE_DEPTH_MAX);
-        let modules = columns_for(edge_length, building_length, params.spacing);
-        budget = shallowest_column_depth(block, start, end, edge_normal, &modules);
-        if !row_fits(
-            block,
-            start,
-            end,
-            edge_normal,
-            &modules,
-            building_length,
-            building_depth,
-            budget - params.setback,
-            curb,
-            params.setback,
-        ) {
-            return; // Block too shallow for any building at this frontage.
+        building_length = (lmin + (lmax - lmin) * 0.5).min(frontage);
+        if let Some(d) = dims {
+            building_length = snap_to_bay(building_length, d.bay);
+        }
+        if frontage < building_length {
+            return;
         }
     }
 
-    let count = columns_for(edge_length, building_length, params.spacing).len();
+    // Row columns, inside the usable frontage.
+    let count = columns_for(frontage, building_length, params.spacing).len();
+    let step = (u_hi - u_lo) / count as f32;
+    let columns: Vec<f32> = (0..count).map(|i| u_lo + (i as f32 + 0.5) * step).collect();
 
-    for i in 0..count {
-        let t = (i as f32 + 0.5) / count as f32;
-        let along = (t - 0.5) * edge_length;
+    // Depth per column, clamped to the shallowest one: a perturbed block is a
+    // quadrilateral, so its chord along the edge varies by several metres from
+    // one end of the frontage to the other. The old whole-row `row_fits` gate
+    // turned that taper into a rejection of ALL the row's buildings whenever one
+    // column (usually the last, near a mitred corner) came up shallow. Shrinking
+    // the row instead keeps the street lined -- a street whose buildings follow
+    // their block reads as built; a street that silently loses them does not.
+    let budget = shallowest_column_depth(block, start, end, edge_normal, &columns);
+    let available = budget - params.setback;
+    if available < MIN_FACADE {
+        return;
+    }
+    let building_depth = rand_depth.max(MIN_FACADE).min(available);
+
+    for t in &columns {
+        let along = (*t - 0.5) * edge_length;
         let perp = curb + params.setback + building_depth * 0.5;
         let position = edge_mid + edge_dir * along + edge_normal * perp;
 
@@ -434,15 +464,35 @@ fn place_buildings(
             continue;
         }
         let half = bevy::math::Vec2::new(building_length, building_depth) * 0.5;
-        if !rect_inside_polygon(position, half, &block.polygon) {
+        // The footprint test MUST use the same corners the renderer does. The
+        // axis-aligned version agreed with the drawn box only by accident (the
+        // old yaw put the length across the street, so the tested box and the
+        // drawn box were both wrong in the same way); with the length along the
+        // street they diverge and every table-sized footprint is rejected.
+        if !oriented_rect_inside_polygon(position, half, angle, &block.polygon) {
             continue;
         }
-        if !rect_inside_polygon(position, half, &convex_hull(&block.polygon)) {
+        if !oriented_rect_inside_polygon(position, half, angle, &convex_hull(&block.polygon)) {
             continue;
         }
         if !within_bounds(graph, position, building_length.max(building_depth) * 0.5) {
             continue;
         }
+
+        // Height snaps to whole floors for the same reason as the length: the
+        // shader's `v` counts floors from the roofline, so a fractional top
+        // floor would shrink every window on the building to fit.
+        //
+        // Rounding, NOT ceiling: `ceil` on a 3-6 m range with a 3 m storey
+        // turned every old-city building into exactly 6 m (measured: 1219 of
+        // 1219), which flattens the roofline the whole design rests on.
+        let height = match dims {
+            Some(d) => {
+                let floors = (height / d.floor).round().max(1.0);
+                floors * d.floor
+            }
+            None => height,
+        };
 
         plan.objects.push(PlacedObject {
             kind: PlacedKind::Building(block.kind),
@@ -451,9 +501,27 @@ fn place_buildings(
             size: bevy::math::Vec3::new(building_length, height, building_depth),
             footprint_half: half,
             wear: rng.random_range(0.0..=1.0),
+            variant: facade_variant(position),
             tree: None,
         });
     }
+}
+
+/// Facade pattern variant for a building at `position` (R3.11).
+///
+/// Hashed from the position rather than drawn from the RNG on purpose: the
+/// per-edge stream already produces the wear grade, and taking one more draw
+/// would shift every downstream value, changing the weathering of the whole
+/// city for a purely cosmetic addition. Position hashing is also what makes
+/// neighbouring buildings differ: two buildings on the same edge sit at
+/// different points, so they almost never land on the same variant.
+pub fn facade_variant(position: bevy::math::Vec2) -> u8 {
+    // 0.37 m of quantisation, so tiny float differences within one building's
+    // own footprint cannot flip the variant mid-bake.
+    let x = (position.x * 2.7).floor() as i64;
+    let z = (position.y * 2.7).floor() as i64;
+    let mixed = (x.wrapping_mul(0x9E37_79B1) ^ z.wrapping_mul(0x85EB_CA77)) as u64;
+    (mixed >> 13) as u8 % VARIANT_COUNT
 }
 
 /// Smallest facade length/depth tried before giving up on a block frontage
@@ -464,7 +532,6 @@ const MIN_FACADE: f32 = 3.0;
 /// Middle-of-the-road module size used when a block cannot hold the table
 /// footprint (m): the old city's rhythm, applied to any type.
 const MODULE_LENGTH_MAX: f32 = 6.0;
-const MODULE_DEPTH_MAX: f32 = 6.0;
 
 /// Material wear buckets (R3.6). Buildings pick a bucket from their planned
 /// `wear` level; each bucket owns one shared `StandardMaterial` per block
@@ -492,14 +559,6 @@ fn columns_for(edge_length: f32, length: f32, spacing: f32) -> Vec<f32> {
     build_columns(count)
 }
 
-/// Depth anchors used to sample a row: the row centres plus both ends, so
-/// the shallowest corner of the block limits every building of the row.
-fn row_columns(edge_length: f32, length: f32, spacing: f32) -> Vec<f32> {
-    let mut columns = columns_for(edge_length, length, spacing);
-    columns.extend_from_slice(&[0.02, 0.98]);
-    columns
-}
-
 /// Shallowest depth among the given column positions (m from the curb).
 fn shallowest_column_depth(
     block: &crate::world::layout_graph::LayoutBlock,
@@ -522,35 +581,6 @@ fn edge_span(
     length: f32,
 ) -> (bevy::math::Vec2, bevy::math::Vec2) {
     (mid - dir * (length * 0.5), mid + dir * (length * 0.5))
-}
-
-/// True if every building of the row at `columns` fits its block footprint.
-#[allow(clippy::too_many_arguments)]
-fn row_fits(
-    block: &crate::world::layout_graph::LayoutBlock,
-    a: bevy::math::Vec2,
-    b: bevy::math::Vec2,
-    edge_normal: bevy::math::Vec2,
-    columns: &[f32],
-    length: f32,
-    depth: f32,
-    available_depth: f32,
-    curb: f32,
-    setback: f32,
-) -> bool {
-    if depth > available_depth {
-        return false;
-    }
-    let half = bevy::math::Vec2::new(length, depth) * 0.5;
-    // Same offset the row is actually placed at; fitting with a shallower
-    // offset let the front face poke past the facade (rejected there, then
-    // the module fallback failed identically and the frontage went empty).
-    let perp = curb + setback + depth * 0.5;
-    columns.iter().all(|t| {
-        let point = a + (b - a) * *t;
-        let center = point + edge_normal * perp;
-        rect_inside_polygon(center, half, &block.polygon)
-    })
 }
 
 /// Places the street trees of one block along one street edge (inside the
@@ -659,6 +689,7 @@ fn push_tree(
         size: bevy::math::Vec3::ZERO,
         footprint_half: bevy::math::Vec2::ZERO,
         wear: 0.0,
+        variant: 0,
         tree: Some(TreeInstance { asset, scale, yaw }),
     });
 }
@@ -721,6 +752,37 @@ fn rect_clear_of_roads(
 /// than the convex hull, because a facade must stay inside the visible
 /// outline; the hull check later is the safety net for the collision body.
 /// Returns `0` when the ray leaves the polygon immediately.
+/// The span of the edge (as fractions of `a..b`) over which the block's own
+/// polygon actually runs.
+///
+/// A street edge spans the full lattice cell side, but the block polygon is
+/// inset from the centerline, so its frontage is shorter than the edge by about
+/// one street half-width at each end. Projecting the polygon onto the edge
+/// measures that frontage instead of guessing it, and it is what lets a row
+/// stop before the mitred corners -- where the block's chord collapses to zero
+/// and a depth probe would fail the whole row.
+///
+/// Both fractions are clamped into `0..1`: a polygon that only touches the edge
+/// at a point must not produce an inverted span.
+fn usable_frontage(
+    block: &crate::world::layout_graph::LayoutBlock,
+    a: bevy::math::Vec2,
+    b: bevy::math::Vec2,
+) -> (f32, f32) {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    if len2 < 1e-9 {
+        return (0.0, 1.0);
+    }
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in &block.polygon {
+        let t = (*p - a).dot(ab) / len2;
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    (lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0))
+}
+
 pub fn block_depth_along_pub(
     block: &crate::world::layout_graph::LayoutBlock,
     origin: bevy::math::Vec2,
@@ -817,6 +879,7 @@ fn within_bounds(graph: &LayoutGraph, position: bevy::math::Vec2, extent: f32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::geometry::oriented_rect_inside_polygon;
     use crate::world::path_network::generate_world;
 
     /// Every seed used by the placement assertions.
@@ -923,13 +986,20 @@ mod tests {
                             );
                         }
                     }
+                    // Same corners the renderer draws: an axis-aligned test
+                    // here would validate a box the game never builds.
                     assert!(graph.blocks.iter().any(|block| {
-                        rect_inside_polygon(object.position, object.footprint_half, &block.polygon)
-                            || rect_inside_polygon(
-                                object.position,
-                                object.footprint_half,
-                                &convex_hull(&block.polygon),
-                            )
+                        oriented_rect_inside_polygon(
+                            object.position,
+                            object.footprint_half,
+                            object.yaw,
+                            &block.polygon,
+                        ) || oriented_rect_inside_polygon(
+                            object.position,
+                            object.footprint_half,
+                            object.yaw,
+                            &convex_hull(&block.polygon),
+                        )
                     }));
                 }
             }
@@ -1048,6 +1118,110 @@ mod tests {
         let size = max - min;
         assert!((size.x - 2.0).abs() < 1e-4, "x extent {}", size.x);
         assert!((size.y - 4.0).abs() < 1e-4, "z extent {}", size.y);
+    }
+
+    /// Every building's FRONTAGE must be a whole number of facade bays.
+    ///
+    /// This is what stops the wall texture from cutting a window in half at a
+    /// corner. With `yaw = atan2(-dir.z, dir.x)` the frontage is `size.x` (the
+    /// ADR's "length along the edge"), so the assertion is on `size.x` —
+    /// asserting on the other axis would test the party wall instead and pass
+    /// while every street facade was still sliced.
+    #[test]
+    fn frontages_are_whole_bays() {
+        for seed in SEEDS {
+            let (_, graph) = generate_world(seed).unwrap();
+            let mut checked = 0;
+            for chunk in all_chunks(&graph) {
+                for object in plan_chunk(&graph, seed, chunk, 3).objects {
+                    let PlacedKind::Building(kind) = object.kind else {
+                        continue;
+                    };
+                    let Some(style) = FacadeStyle::of(kind) else {
+                        continue;
+                    };
+                    let bay = style.dims().bay;
+                    let ratio = object.size.x / bay;
+                    assert!(
+                        (ratio - ratio.round()).abs() < 1e-3,
+                        "seed {seed}: {} frontage {:.2} m is not a whole multiple of the {bay} m bay ({ratio:.3} bays)",
+                        style.label(),
+                        object.size.x
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "seed {seed}: no buildings checked");
+        }
+    }
+
+    /// Heights are whole storeys, and the old city keeps at least two distinct
+    /// ones. The second half is the regression: a `ceil` snap turned all 1219
+    /// old-city buildings into exactly 6 m, flattening the roofline ADR-0001
+    /// is built on, and a count-only test would not have noticed.
+    #[test]
+    fn heights_snap_to_storeys_without_flattening_the_skyline() {
+        for seed in SEEDS {
+            let (_, graph) = generate_world(seed).unwrap();
+            let mut storeys_seen = std::collections::BTreeSet::new();
+            for chunk in all_chunks(&graph) {
+                for object in plan_chunk(&graph, seed, chunk, 3).objects {
+                    let PlacedKind::Building(kind) = object.kind else {
+                        continue;
+                    };
+                    let Some(style) = FacadeStyle::of(kind) else {
+                        continue;
+                    };
+                    let floor = style.dims().floor;
+                    let ratio = object.size.y / floor;
+                    assert!(
+                        (ratio - ratio.round()).abs() < 1e-3,
+                        "seed {seed}: height {:.2} m is not a whole number of {floor} m storeys",
+                        object.size.y
+                    );
+                    if kind == BlockType::OldCity {
+                        storeys_seen.insert(ratio.round() as i32);
+                    }
+                }
+            }
+            assert!(
+                storeys_seen.len() >= 2,
+                "seed {seed}: every old-city building is {} storey(s); the roofline is flat",
+                storeys_seen.iter().next().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// The variant must be stable for one position and spread over the whole
+    /// range, or "two neighbours rarely share a tile" is false.
+    #[test]
+    fn facade_variants_are_stable_and_spread() {
+        let mut counts = [0usize; VARIANT_COUNT as usize];
+        for seed in SEEDS {
+            let (_, graph) = generate_world(seed).unwrap();
+            for chunk in all_chunks(&graph) {
+                for object in plan_chunk(&graph, seed, chunk, 3).objects {
+                    if !matches!(object.kind, PlacedKind::Building(_)) {
+                        continue;
+                    }
+                    assert_eq!(
+                        object.variant,
+                        facade_variant(object.position),
+                        "the planned variant must be the position hash"
+                    );
+                    counts[object.variant as usize] += 1;
+                }
+            }
+        }
+        let total: usize = counts.iter().sum();
+        for (variant, count) in counts.iter().enumerate() {
+            let share = *count as f32 / total as f32;
+            assert!(
+                (0.25..0.75).contains(&share),
+                "variant {variant} covers {:.0}% of the city; the split is lopsided",
+                share * 100.0
+            );
+        }
     }
 
     const GRAPH_LAST_CHUNK: i32 = (CELL_SIZE * GRID_CELLS as f32 / CHUNK_SIZE) as i32 - 1;

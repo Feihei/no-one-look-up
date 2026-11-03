@@ -294,6 +294,46 @@ pub fn rect_inside_polygon(center: Vec2, half: Vec2, polygon: &[Vec2]) -> bool {
     })
 }
 
+/// Footprint corners of a rectangle rotated by `yaw` about `center`.
+///
+/// The winding matches [`crate::world::placement::rotated_corners`] and
+/// therefore Bevy's `Quat::from_rotation_y` -- a placement test that disagrees
+/// with the drawn transform is how a whole block type silently disappears.
+pub fn oriented_rect_corners(center: Vec2, half: Vec2, yaw: f32) -> [Vec2; 4] {
+    let (s, c) = yaw.sin_cos();
+    let offset =
+        |lx: f32, lz: f32| Vec2::new(center.x + lx * c + lz * s, center.y - lx * s + lz * c);
+    [
+        offset(-half.x, -half.y),
+        offset(half.x, -half.y),
+        offset(half.x, half.y),
+        offset(-half.x, half.y),
+    ]
+}
+
+/// True if a footprint rotated by `yaw` lies entirely inside a simple polygon
+/// and never crosses its boundary.
+///
+/// This exists because the axis-aligned version was wrong the moment buildings
+/// started facing the street: `placement` draws every building at a yaw that
+/// points its length along the street, so a 25 m apartment is a 25 x 12 m
+/// rectangle turned 90 degrees from the axis-aligned box the old test measured.
+/// The test has to use the same corners the renderer does.
+pub fn oriented_rect_inside_polygon(center: Vec2, half: Vec2, yaw: f32, polygon: &[Vec2]) -> bool {
+    let corners = oriented_rect_corners(center, half, yaw);
+    if !corners
+        .iter()
+        .all(|c| point_in_polygon(*c, polygon) || point_in_convex_inclusive(*c, polygon))
+    {
+        return false;
+    }
+    let n = polygon.len();
+    (0..4).all(|i| {
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        (0..n).all(|j| !segments_intersect(a, b, polygon[j], polygon[(j + 1) % n]))
+    })
+}
+
 /// True if a point lies inside or on the boundary of a convex polygon.
 ///
 /// Placement rejects a footprint whose corner sits exactly on a curb, so the
