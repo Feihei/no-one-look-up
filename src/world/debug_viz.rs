@@ -1,8 +1,10 @@
 //! Debug visualization (R2.7): chunk boundaries, street network, and block
 //! labels drawn with Bevy Gizmos in development mode.
 //!
-//! Toggled with [`crate::core::input::DEV_TOGGLE_GIZMOS`] (G). Enabled by
-//! default in debug builds, off in release builds. The label entities are
+//! Toggled with [`crate::core::input::DEV_TOGGLE_GIZMOS`] (G). Off by
+//! default in all builds (user asked: no boundary lines until you press G);
+//! [`examples/top_view.rs`] and [`tests/top_view.rs`] force their own gizmo
+//! capture. The label entities are
 //! plain `Text2d` markers; the gizmo drawing is immediate-mode per frame.
 
 use bevy::prelude::*;
@@ -14,14 +16,12 @@ use crate::world::collision::{CollisionIndex, PrismKind};
 use crate::world::layout_graph::{BlockType, LayoutGraph};
 
 /// Whether debug visualization is on (toggled with G).
-#[derive(Resource, Debug, Clone, Copy)]
+///
+/// `bool`'s `Default` is `false`, which is the required off-until-G state (the
+/// toggle still works everywhere, and the top_view examples/tests force their
+/// own gizmo capture).
+#[derive(Resource, Debug, Clone, Copy, Default)]
 pub struct DebugVizEnabled(pub bool);
-
-impl Default for DebugVizEnabled {
-    fn default() -> Self {
-        Self(cfg!(debug_assertions))
-    }
-}
 
 /// Marker on block label entities.
 #[derive(Component, Debug)]
