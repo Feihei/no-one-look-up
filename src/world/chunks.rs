@@ -378,6 +378,18 @@ pub(crate) struct PropAssets {
     awning: Handle<Mesh>,
     /// The balcony slab + railing, wall plane at local z = 0 (real size).
     balcony: Handle<Mesh>,
+    /// The street-lamp bracket reaching local +x (real size).
+    lamp_arm: Handle<Mesh>,
+    /// The glowing lamp head in the bracket (real size).
+    lamp_head: Handle<Mesh>,
+    /// The unit catenary wire, x from 0 to 1.
+    wire: Handle<Mesh>,
+    /// Street-lamp head: the one emissive material in the world. The lamps
+    /// are on at golden hour -- warm dots along every street, picked up by
+    /// the bloom pass, no real light budget spent.
+    lamp_glow: Handle<StandardMaterial>,
+    /// Catenary cables: near-black, fully matte.
+    wire_dark: Handle<StandardMaterial>,
 }
 
 impl PropAssets {
@@ -401,6 +413,17 @@ fn build_prop_assets(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> PropAssets {
+    // The glow material is built before the `matte` closure takes its
+    // mutable borrow of the store.
+    let lamp_glow = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.8, 0.65),
+        emissive: LinearRgba::rgb(
+            crate::world::props::LAMP_EMISSIVE,
+            crate::world::props::LAMP_EMISSIVE * 0.72,
+            crate::world::props::LAMP_EMISSIVE * 0.42,
+        ),
+        ..default()
+    });
     let mut matte = |rgb: [f32; 3], rough: f32| {
         materials.add(StandardMaterial {
             base_color: Color::srgb(rgb[0], rgb[1], rgb[2]),
@@ -420,6 +443,11 @@ fn build_prop_assets(
         ],
         awning: meshes.add(crate::world::props::bake_awning()),
         balcony: meshes.add(crate::world::props::bake_balcony()),
+        lamp_arm: meshes.add(crate::world::props::bake_lamp_arm()),
+        lamp_head: meshes.add(crate::world::props::bake_lamp_head()),
+        wire: meshes.add(crate::world::props::bake_wire()),
+        lamp_glow,
+        wire_dark: matte([0.05, 0.05, 0.06], 1.0),
     }
 }
 
@@ -844,6 +872,36 @@ fn spawn_prop(
             assets.unit_cylinder.clone(),
             props.fixture(0),
             object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::Pole => (
+            "Pole",
+            assets.unit_cylinder.clone(),
+            props.fixture(0),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::LampArm => (
+            "LampArm",
+            props.lamp_arm.clone(),
+            props.fixture(0),
+            object.base,
+            object.size,
+        ),
+        PropKind::LampHead => (
+            "LampHead",
+            props.lamp_head.clone(),
+            props.lamp_glow.clone(),
+            object.base,
+            object.size,
+        ),
+        PropKind::Wire => (
+            "Wire",
+            props.wire.clone(),
+            props.wire_dark.clone(),
+            object.base,
+            // x spans pole to pole; y/z carry the span-proportional sag and
+            // keep the cable near-round (plan side sizes it, see bake_wire).
             object.size,
         ),
     };

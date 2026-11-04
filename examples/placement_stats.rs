@@ -38,6 +38,10 @@ fn main() {
                             PropKind::Chimney => "prop/chimney",
                             PropKind::StairBox => "prop/stair",
                             PropKind::RoofVent => "prop/vent",
+                            PropKind::Pole => "prop/pole",
+                            PropKind::LampArm => "prop/lamp_arm",
+                            PropKind::LampHead => "prop/lamp_head",
+                            PropKind::Wire => "prop/wire",
                         },
                     };
                     *counts.entry(key).or_default() += 1;

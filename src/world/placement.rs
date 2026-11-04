@@ -323,6 +323,20 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
                 tree_assets,
                 curb,
             );
+            // R3.11 step 11.5: utility poles, street lamps and the wires
+            // between them, on this side's curb line. Its RNG salt is
+            // private to the furniture, so nothing upstream moves.
+            crate::world::props::place_street_furniture(
+                &mut plan,
+                seed,
+                edge_index as u32,
+                side,
+                (a + b) * 0.5,
+                dir,
+                normal * sign,
+                length,
+                curb,
+            );
         }
     }
 
@@ -994,9 +1008,17 @@ mod tests {
             for chunk in all_chunks(&graph) {
                 let plan = plan_chunk(&graph, seed, chunk, 3);
                 for object in &plan.objects {
-                    let PlacedKind::Prop(_) = object.kind else {
+                    let PlacedKind::Prop(kind) = object.kind else {
                         continue;
                     };
+                    // Street furniture stands on the curb line by design --
+                    // `streets_carry_poles_at_the_curb` owns that check.
+                    if matches!(
+                        kind,
+                        PropKind::Pole | PropKind::LampArm | PropKind::LampHead | PropKind::Wire
+                    ) {
+                        continue;
+                    }
                     props += 1;
                     assert!(
                         plan.objects.iter().any(|b| {
@@ -1009,6 +1031,41 @@ mod tests {
                 }
             }
             assert!(props > 0, "seed {seed}: no props planned at all");
+        }
+    }
+
+    #[test]
+    fn streets_carry_poles_at_the_curb() {
+        for seed in SEEDS {
+            let (_, graph) = generate_world(seed).unwrap();
+            let mut poles = 0;
+            for chunk in all_chunks(&graph) {
+                for object in plan_chunk(&graph, seed, chunk, 3).objects {
+                    let PlacedKind::Prop(PropKind::Pole) = object.kind else {
+                        continue;
+                    };
+                    poles += 1;
+                    // The pole stands `curb + standoff` off its own edge
+                    // line; the nearest edge must agree to a hair.
+                    let miss = graph
+                        .edges
+                        .iter()
+                        .map(|edge| {
+                            let a = graph.nodes[edge.from as usize].pos;
+                            let b = graph.nodes[edge.to as usize].pos;
+                            (dist_point_to_segment(object.position, a, b)
+                                - (edge.width * 0.5 + crate::world::props::POLE_STANDOFF))
+                                .abs()
+                        })
+                        .fold(f32::MAX, f32::min);
+                    assert!(
+                        miss < 0.05,
+                        "seed {seed}: pole at {:?} sits {miss} m off every curb line",
+                        object.position
+                    );
+                }
+            }
+            assert!(poles > 0, "seed {seed}: no utility poles planned");
         }
     }
 

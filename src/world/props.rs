@@ -1,5 +1,6 @@
-//! Facade and rooftop props (R3.11 step 11.4) -- the clutter that turns a
-//! textured box into a building someone lives in.
+//! Facade and rooftop props (R3.11 step 11.4) and street furniture
+//! (step 11.5) -- the clutter that turns a textured box into a building
+//! someone lives in, and a street gap into a street.
 //!
 //! ADR-0001 fixes the camera at 22.55-60 degrees of elevation, so the wall
 //! strip that reads is the upper one, and the roofline is the highest-value
@@ -7,25 +8,31 @@
 //! sit under the first-floor windows, AC condensers dot the wall bands, and
 //! the roofs grow water tanks, stair bulkheads, stove pipes and vents --
 //! silhouettes against the dusk sky, not furniture for a dollhouse view
-//! nobody has.
+//! nobody has. The streets get the same treatment from the other side:
+//! utility poles on the curb line, lamp arms reaching over the road with
+//! emissive heads (the lamps are on at golden hour), and catenary wires
+//! sagging between the poles -- lines against the sky are what a walk
+//! through an old district actually looks like.
 //!
 //! # Everything is a shared mesh, scaled per instance
 //!
 //! Like the roofs (11.3): one unit cube and one unit cylinder cover every
-//! box- or cylinder-shaped prop; the awning and the balcony are baked once
-//! at real size because their shape (a tilted slab, a slab with a railing)
-//! does not survive non-uniform scaling. Materials are shared city-wide,
-//! with a rust variant chosen by the building's wear -- the 锈蚀外挂件 the
-//! design asks for -- so a streaming window costs a handful of draw calls
-//! no matter how much clutter it carries.
+//! box- or cylinder-shaped prop; the awning, balcony, lamp arm, lamp head
+//! and wire are baked once at real size because their shape (a tilted
+//! slab, a slab with a railing, a sagging catenary) does not survive
+//! non-uniform scaling cleanly. Materials are shared city-wide, with a
+//! rust variant chosen by the building's wear -- the 锈蚀外挂件 the design
+//! asks for -- so a streaming window costs a handful of draw calls no
+//! matter how much clutter it carries.
 //!
 //! # Props are position-keyed, never stream-keyed
 //!
 //! The per-edge RNG streams are already spoken for (placement order, wear,
 //! facade variants). Every extra draw would shift the approved weathering
-//! of every later building on the edge, so props draw from their own
-//! generator seeded by the building's exact position bits -- the same trick
-//! `facade_variant` uses, and for the same reason.
+//! of every later building on the edge, so building props draw from their
+//! own generator seeded by the building's exact position bits -- the same
+//! trick `facade_variant` uses, and for the same reason -- and the street
+//! furniture gets a dedicated salt stream of its own.
 
 use bevy::prelude::*;
 use rand::Rng;
@@ -57,6 +64,14 @@ pub enum PropKind {
     StairBox,
     /// Small vent between factory sawtooth teeth.
     RoofVent,
+    /// 电线杆: concrete utility pole on the curb line.
+    Pole,
+    /// Street-lamp bracket bolted below the pole top, reaching over the road.
+    LampArm,
+    /// The lamp head at the arm's end -- the one emissive prop in the city.
+    LampHead,
+    /// One catenary wire span between two consecutive poles.
+    Wire,
 }
 
 /// Height of the 雨棚 wall mount above the ground (m): just under the
@@ -69,6 +84,43 @@ pub const AC_DEPTH: f32 = 0.3;
 /// Cap on AC condensers per apartment, so the per-bay roll cannot run away
 /// on a 12-bay, 6-floor slab.
 pub const APARTMENT_AC_CAP: usize = 14;
+
+/// Utility pole height (m). Tall enough that the lowest wire clears the
+/// tallest old-city ridge (6 m wall + ~1.27 m gable) with room to spare.
+pub const POLE_HEIGHT: f32 = 8.0;
+
+/// Pole offset from the curb, into the setback strip (m). Real poles hug
+/// the curb; the street trees stand further in (setback / 2), so the two
+/// lines rarely share a spot.
+pub const POLE_STANDOFF: f32 = 0.45;
+
+/// Nominal pole spacing along an edge (m). Edges are ~50 m cell sides, so
+/// most get two poles and one wire span.
+pub const POLE_SPACING: f32 = 30.0;
+
+/// Wire attachment heights on the pole (m), stacked the way concrete poles
+/// carry a three-wire run.
+pub const WIRE_HEIGHTS: [f32; 3] = [5.6, 6.1, 6.6];
+
+/// Lamp bracket mount height below the pole top (m).
+pub const LAMP_MOUNT: f32 = 7.5;
+
+/// Lamp head emissive strength. The lamps are ON at golden hour: a warm
+/// dot per pole, picked up by the bloom pass, no real light budget spent.
+pub const LAMP_EMISSIVE: f32 = 4.0;
+
+/// Wire sag baked into the unit-span mesh, at [`WIRE_NOMINAL`] span (m).
+/// Instances scale y by `span / WIRE_NOMINAL`, so the dip grows with the
+/// span the way a real catenary does.
+pub const WIRE_SAG: f32 = 0.9;
+
+/// Span the wire mesh is baked for (m); also the scale reference for the
+/// per-instance sag.
+pub const WIRE_NOMINAL: f32 = 30.0;
+
+/// Wire radius (m). A 2 cm cable at dusk distance reads as a clean line
+/// against the sky without blooming into a noodle.
+pub const WIRE_RADIUS: f32 = 0.02;
 
 /// Appends one prop. `variant` reuses the facade variant slot as a material
 /// selector: 0 = standard finish, 1 = rusted (or the second awning canvas).
@@ -351,6 +403,118 @@ pub fn place_building_props(
     }
 }
 
+/// Places the street furniture of one edge side (R3.11 step 11.5): utility
+/// poles, lamp arms with their emissive heads, and the wire spans between
+/// consecutive poles.
+///
+/// `edge_normal` points from the centerline INTO the block (the same
+/// convention `place_buildings` receives), so the poles stand on the block
+/// side of the curb and the lamp arms reach back over the road. Anchored
+/// like the street trees -- one slot per [`POLE_SPACING`] -- but from a
+/// dedicated RNG salt, so neither the approved wear sequence nor the tree
+/// stream moves by a single draw. Poles always spawn (every street carries
+/// lines); only the lamp brackets roll.
+#[allow(clippy::too_many_arguments)]
+pub fn place_street_furniture(
+    plan: &mut ChunkPlan,
+    seed: u64,
+    edge_index: u32,
+    side: u32,
+    edge_mid: bevy::math::Vec2,
+    edge_dir: bevy::math::Vec2,
+    edge_normal: bevy::math::Vec2,
+    edge_length: f32,
+    curb: f32,
+) {
+    let mut rng = edge_salt_rng(seed, edge_index, side);
+    let street_dir = -edge_normal;
+    let stand_line = edge_mid + edge_normal * (curb + POLE_STANDOFF);
+
+    // Pole slots along the edge, evenly spaced like the tree candidates,
+    // with one deterministic micro-jitter so a street of poles does not
+    // read as a parade. The jitter draws even when nothing else does, so
+    // the stream stays stable under any future rule change.
+    let slots = ((edge_length / POLE_SPACING).round() as usize).max(2);
+    let mut alongs: Vec<f32> = Vec::with_capacity(slots);
+    for i in 0..slots {
+        let t = (i as f32 + 0.5) / slots as f32;
+        let along = (t - 0.5) * edge_length + rng.random_range(-2.5..=2.5);
+        alongs.push(along);
+        let position = stand_line + edge_dir * along;
+        push_prop(
+            plan,
+            PropKind::Pole,
+            position,
+            0.0,
+            Vec3::new(0.28, POLE_HEIGHT, 0.28),
+            0.0,
+            0,
+        );
+        // Street lamps are common but not universal on old streets.
+        if rng.random::<f32>() < 0.45 {
+            // The arm is baked reaching local +x; aim it over the road.
+            let arm_yaw = (-street_dir.y).atan2(street_dir.x);
+            push_prop(
+                plan,
+                PropKind::LampArm,
+                position,
+                arm_yaw,
+                Vec3::ONE,
+                LAMP_MOUNT,
+                0,
+            );
+            push_prop(
+                plan,
+                PropKind::LampHead,
+                position,
+                arm_yaw,
+                Vec3::ONE,
+                LAMP_MOUNT,
+                0,
+            );
+        }
+    }
+
+    // Wire spans between consecutive poles, three stacked heights each.
+    // Each span starts at the earlier pole and scales to the actual gap;
+    // the yaw aims local +x along the street.
+    for w in 0..alongs.len().saturating_sub(1) {
+        let span = alongs[w + 1] - alongs[w];
+        if span <= 1.0 {
+            continue;
+        }
+        let start = stand_line + edge_dir * alongs[w];
+        for (rung, height) in WIRE_HEIGHTS.iter().enumerate() {
+            push_prop(
+                plan,
+                PropKind::Wire,
+                start,
+                edge_yaw(edge_dir),
+                Vec3::new(span, span / WIRE_NOMINAL, span / WIRE_NOMINAL),
+                *height,
+                rung as u8,
+            );
+        }
+    }
+}
+
+/// Yaw that turns local +x to `dir` (same convention as the buildings'
+/// yaw fix: `Quat::from_rotation_y` maps +x to `(cos y, -sin y)`).
+fn edge_yaw(dir: bevy::math::Vec2) -> f32 {
+    (-dir.y).atan2(dir.x)
+}
+
+/// Street-furniture RNG: a dedicated per-edge salt stream (12000 + side),
+/// kept well away from the building/tree salts so no existing sequence
+/// shifts by a single draw.
+fn edge_salt_rng(seed: u64, edge: u32, side: u32) -> StdRng {
+    let salt = 12_000u32.wrapping_add(side);
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
+        ^ (edge as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (salt as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    StdRng::seed_from_u64(mixed)
+}
+
 // --- mesh baking -----------------------------------------------------------
 
 /// One axis-aligned box, six quads wound CCW seen from outside.
@@ -411,6 +575,80 @@ pub fn bake_balcony() -> Mesh {
     buf.build()
 }
 
+/// The lamp arm: a bracket baked reaching toward local +x, mount plate at
+/// the origin, head end 1.4 m out and hanging just under the beam.
+pub fn bake_lamp_arm() -> Mesh {
+    let mut buf = MeshBuf::new();
+    // Mount plate against the pole face.
+    push_box(&mut buf, [-0.09, -0.09, -0.05], [0.09, 0.09, 0.05]);
+    // Arm: a thin horizontal beam reaching +x, sloping slightly down.
+    push_box(&mut buf, [0.0, -0.04, -0.04], [1.4, 0.02, 0.04]);
+    // Head housing at the far end, overlapping the beam's underside.
+    push_box(&mut buf, [1.15, -0.15, -0.12], [1.4, 0.0, 0.12]);
+    buf.build()
+}
+
+/// The lamp head: the glowing box that sits in the arm's bracket, same
+/// origin and orientation as [`bake_lamp_arm`]. Separate mesh so the head
+/// carries the emissive material while the arm stays matte.
+pub fn bake_lamp_head() -> Mesh {
+    let mut buf = MeshBuf::new();
+    push_box(&mut buf, [1.17, -0.13, -0.10], [1.38, -0.01, 0.10]);
+    buf.build()
+}
+
+/// One catenary wire span, baked from x = 0 to x = 1, sagging along a
+/// parabola pinned to y = 0 at both ends with an absolute [`WIRE_SAG`]
+/// dip at the middle.
+///
+/// Instances translate to the *earlier* pole of the span, scale x by the
+/// real pole-to-pole distance and y by `span / WIRE_NOMINAL`: the dip then
+/// grows with the span the way a real catenary does, and the 2 cm cable
+/// stays within a whisker of round (its z scale runs 0.013-0.027 over the
+/// 20-40 m spans the streets produce).
+pub fn bake_wire() -> Mesh {
+    const SEGMENTS: usize = 8;
+    let mut buf = MeshBuf::new();
+    let sag = |x: f32| 4.0 * WIRE_SAG * x * (1.0 - x);
+    // A thin tube with a diamond section: at 2 cm nobody can tell it from
+    // a circle, and it quarters the vertex count.
+    let ring = |x: f32| {
+        let r = WIRE_RADIUS;
+        let y = -sag(x);
+        [[x, y + r, 0.0], [x, y, r], [x, y - r, 0.0], [x, y, -r]]
+    };
+    for s in 0..SEGMENTS {
+        let x0 = s as f32 / SEGMENTS as f32;
+        let x1 = (s + 1) as f32 / SEGMENTS as f32;
+        let a = ring(x0);
+        let b = ring(x1);
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            // Side quads, CCW seen from outside.
+            buf.quad(a[i], a[j], b[j], b[i]);
+        }
+    }
+    // Tiny end caps (the wire meets a pole at each end anyway).
+    let a = ring(0.0);
+    let b = ring(1.0);
+    buf.tri(a[0], a[2], a[1]);
+    buf.tri(a[0], a[3], a[2]);
+    buf.tri(b[0], b[1], b[2]);
+    buf.tri(b[0], b[2], b[3]);
+    buf.build()
+}
+
+/// Places the street furniture of one edge side (R3.11 step 11.5): utility
+/// poles, lamp arms with their emissive heads, and the wire spans between
+/// consecutive poles.
+///
+/// `edge_normal` points from the centerline INTO the block (the same
+/// convention `place_buildings` receives), so the poles stand on the block
+/// side of the curb and the lamp arms reach back over the road. Anchored
+/// like the street trees -- one slot per [`POLE_SPACING`] -- but from a
+/// dedicated RNG salt, so neither the approved wear sequence nor the tree
+/// stream moves by a single draw. Poles always spawn (every street carries
+/// lines); only the lamp brackets roll.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +1002,209 @@ mod tests {
         assert!(
             outer < wall - 0.15,
             "the outer edge must hang clearly lower than the wall edge"
+        );
+    }
+
+    // --- street furniture (11.5) ---
+
+    const EDGE_MID: bevy::math::Vec2 = bevy::math::Vec2::new(500.0, 500.0);
+
+    /// Furniture for one synthetic edge side: dir = +x, curb at 4 m, the
+    /// into-block normal flipped per side like `plan_chunk` passes it.
+    fn furniture(side: u32, length: f32) -> Vec<PlacedObject> {
+        let mut plan = ChunkPlan::default();
+        place_street_furniture(
+            &mut plan,
+            7,
+            3,
+            side,
+            EDGE_MID,
+            bevy::math::Vec2::new(1.0, 0.0),
+            bevy::math::Vec2::new(0.0, if side == 0 { 1.0 } else { -1.0 }),
+            length,
+            4.0,
+        );
+        plan.objects
+    }
+
+    #[test]
+    fn poles_stand_at_the_curb_on_their_own_side() {
+        for side in [0u32, 1] {
+            let objects = furniture(side, 120.0);
+            let poles: Vec<&PlacedObject> = objects
+                .iter()
+                .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Pole)))
+                .collect();
+            assert_eq!(
+                poles.len(),
+                4,
+                "a 120 m edge carries round(120/30) = 4 poles"
+            );
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            for p in &poles {
+                let rel = p.position - EDGE_MID;
+                assert!(rel.x.abs() < 60.0, "pole wanders off the edge");
+                assert!(
+                    (rel.y - sign * (4.0 + POLE_STANDOFF)).abs() < 1e-4,
+                    "pole must stand at curb + standoff on side {side}"
+                );
+                assert!(
+                    (p.size.y - POLE_HEIGHT).abs() < 1e-4,
+                    "pole is {POLE_HEIGHT} m"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lamp_arms_reach_over_the_road() {
+        for side in [0u32, 1] {
+            let objects = furniture(side, 120.0);
+            let arms: Vec<&PlacedObject> = objects
+                .iter()
+                .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::LampArm)))
+                .collect();
+            assert!(
+                !arms.is_empty() && arms.len() < 5,
+                "lamps are a 0.45 roll per pole, got {}",
+                arms.len()
+            );
+            let street = bevy::math::Vec2::new(0.0, if side == 0 { -1.0 } else { 1.0 });
+            for arm in &arms {
+                // Local +x (the arm's reach) maps to (cos y, -sin y).
+                let reach = bevy::math::Vec2::new(arm.yaw.cos(), -arm.yaw.sin());
+                assert!(
+                    reach.dot(street) > 0.999,
+                    "the arm must reach toward the centerline"
+                );
+                assert!(
+                    objects
+                        .iter()
+                        .any(|o| matches!(o.kind, PlacedKind::Prop(PropKind::LampHead))
+                            && o.position == arm.position
+                            && o.base == arm.base),
+                    "every arm carries its glowing head"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wires_bridge_consecutive_poles_at_stacked_heights() {
+        let objects = furniture(0, 120.0);
+        let mut alongs: Vec<f32> = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Pole)))
+            .map(|o| o.position.x - EDGE_MID.x)
+            .collect();
+        alongs.sort_by(f32::total_cmp);
+        let wires: Vec<&PlacedObject> = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Wire)))
+            .collect();
+        assert_eq!(
+            wires.len(),
+            (alongs.len() - 1) * WIRE_HEIGHTS.len(),
+            "three stacked wires per span"
+        );
+        for w in 0..alongs.len() - 1 {
+            let span = alongs[w + 1] - alongs[w];
+            for &height in WIRE_HEIGHTS.iter() {
+                let wire = wires
+                    .iter()
+                    .find(|o| o.base == height && o.position.x - EDGE_MID.x == alongs[w])
+                    .unwrap_or_else(|| panic!("no wire at {height} m from pole {w}"));
+                assert!((wire.size.x - span).abs() < 1e-4, "wire spans the real gap");
+                // The y and z scales carry the span-proportional sag and
+                // keep the cable near-round.
+                assert!((wire.size.y - span / WIRE_NOMINAL).abs() < 1e-4);
+                assert!((wire.size.z - span / WIRE_NOMINAL).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn furniture_streams_are_stable_and_edge_keyed() {
+        let a = furniture(0, 120.0);
+        let b = furniture(0, 120.0);
+        assert_eq!(a, b, "the same edge side must wire identically every plan");
+        // A different edge index re-rolls the jitter (30 samples, at least
+        // one must differ -- the streams are per-edge).
+        let differing = (0..30u32)
+            .filter(|e| {
+                let mut plan = ChunkPlan::default();
+                place_street_furniture(
+                    &mut plan,
+                    7,
+                    *e,
+                    0,
+                    EDGE_MID,
+                    bevy::math::Vec2::new(1.0, 0.0),
+                    bevy::math::Vec2::new(0.0, 1.0),
+                    120.0,
+                    4.0,
+                );
+                plan.objects != a
+            })
+            .count();
+        assert!(
+            differing >= 25,
+            "edge keying collapsed: {differing}/30 differ"
+        );
+    }
+
+    #[test]
+    fn short_edges_still_get_two_poles_and_wires() {
+        let objects = furniture(1, 20.0);
+        let poles = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Pole)))
+            .count();
+        assert_eq!(poles, 2, "even a 20 m alley carries a pole pair");
+        let wires = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Wire)))
+            .count();
+        assert_eq!(wires, WIRE_HEIGHTS.len(), "one span between the pair");
+    }
+
+    #[test]
+    fn lamp_and_wire_meshes_are_sound() {
+        // Arm and head are compounds of boxes; `push_box` winding is
+        // validated on its own above, so these only need to be non-empty.
+        assert!(
+            !triangles(&bake_lamp_arm()).is_empty(),
+            "lamp arm baked empty"
+        );
+        assert!(
+            !triangles(&bake_lamp_head()).is_empty(),
+            "lamp head baked empty"
+        );
+        // The wire is an open tube: unit span, endpoints level, middle
+        // sagged by exactly WIRE_SAG, nothing above the mount plane.
+        let tris = triangles(&bake_wire());
+        assert!(!tris.is_empty(), "wire baked empty");
+        let (mut min_y, mut max_y, mut min_x, mut max_x) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for (a, b, c) in &tris {
+            for p in [a, b, c] {
+                min_y = min_y.min(p[1]);
+                max_y = max_y.max(p[1]);
+                min_x = min_x.min(p[0]);
+                max_x = max_x.max(p[0]);
+            }
+        }
+        assert!(
+            min_x.abs() < 1e-6 && (max_x - 1.0).abs() < 1e-6,
+            "unit span"
+        );
+        // The tube's lowest point is the sag plus its own radius.
+        assert!(
+            (min_y + WIRE_SAG + WIRE_RADIUS).abs() < 1e-4,
+            "sag baked at the middle"
+        );
+        assert!(
+            max_y <= WIRE_RADIUS + 1e-5,
+            "the wire hangs from its mount height, not above it"
         );
     }
 }
