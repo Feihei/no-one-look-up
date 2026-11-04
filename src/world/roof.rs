@@ -121,8 +121,11 @@ impl RoofProfile {
 // --- mesh baking -----------------------------------------------------------
 
 /// Accumulates triangles with flat per-face normals and simple UVs.
+///
+/// Shared with `world::props`, which bakes its awning/balcony/lamp/wire
+/// meshes with the same recipe (flat normals, dummy UVs, CCW winding).
 #[derive(Default)]
-struct MeshBuf {
+pub(crate) struct MeshBuf {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
@@ -130,12 +133,12 @@ struct MeshBuf {
 }
 
 impl MeshBuf {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// One triangle, corners ordered CCW seen from outside.
-    fn tri(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
+    pub(crate) fn tri(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
         let n = face_normal(a, b, c);
         let base = self.positions.len() as u32;
         self.positions.extend_from_slice(&[a, b, c]);
@@ -148,12 +151,12 @@ impl MeshBuf {
     }
 
     /// One quad, corners ordered CCW seen from outside.
-    fn quad(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
+    pub(crate) fn quad(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
         self.tri(a, b, c);
         self.tri(a, c, d);
     }
 
-    fn build(self) -> Mesh {
+    pub(crate) fn build(self) -> Mesh {
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),

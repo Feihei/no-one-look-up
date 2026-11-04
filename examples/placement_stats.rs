@@ -8,6 +8,7 @@
 use heads_up_bevy::world::layout_graph::BlockType;
 use heads_up_bevy::world::path_network::generate_world;
 use heads_up_bevy::world::placement::{PlacedKind, plan_chunk};
+use heads_up_bevy::world::props::PropKind;
 use std::collections::HashMap;
 
 fn main() {
@@ -28,6 +29,16 @@ fn main() {
                         PlacedKind::ForestTree => "tree/forest",
                         PlacedKind::PlazaTree => "tree/plaza",
                         PlacedKind::PlazaPad => "plaza/pad",
+                        PlacedKind::Prop(kind) => match kind {
+                            PropKind::Awning => "prop/awning",
+                            PropKind::AcUnit => "prop/ac",
+                            PropKind::Downspout => "prop/pipe",
+                            PropKind::Balcony => "prop/balcony",
+                            PropKind::WaterTank => "prop/tank",
+                            PropKind::Chimney => "prop/chimney",
+                            PropKind::StairBox => "prop/stair",
+                            PropKind::RoofVent => "prop/vent",
+                        },
                     };
                     *counts.entry(key).or_default() += 1;
                     if matches!(o.kind, PlacedKind::Building(_)) {

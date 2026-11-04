@@ -1,0 +1,769 @@
+//! Facade and rooftop props (R3.11 step 11.4) -- the clutter that turns a
+//! textured box into a building someone lives in.
+//!
+//! ADR-0001 fixes the camera at 22.55-60 degrees of elevation, so the wall
+//! strip that reads is the upper one, and the roofline is the highest-value
+//! strip in the city. The prop tables are weighted by exactly that: awnings
+//! sit under the first-floor windows, AC condensers dot the wall bands, and
+//! the roofs grow water tanks, stair bulkheads, stove pipes and vents --
+//! silhouettes against the dusk sky, not furniture for a dollhouse view
+//! nobody has.
+//!
+//! # Everything is a shared mesh, scaled per instance
+//!
+//! Like the roofs (11.3): one unit cube and one unit cylinder cover every
+//! box- or cylinder-shaped prop; the awning and the balcony are baked once
+//! at real size because their shape (a tilted slab, a slab with a railing)
+//! does not survive non-uniform scaling. Materials are shared city-wide,
+//! with a rust variant chosen by the building's wear -- the 锈蚀外挂件 the
+//! design asks for -- so a streaming window costs a handful of draw calls
+//! no matter how much clutter it carries.
+//!
+//! # Props are position-keyed, never stream-keyed
+//!
+//! The per-edge RNG streams are already spoken for (placement order, wear,
+//! facade variants). Every extra draw would shift the approved weathering
+//! of every later building on the edge, so props draw from their own
+//! generator seeded by the building's exact position bits -- the same trick
+//! `facade_variant` uses, and for the same reason.
+
+use bevy::prelude::*;
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+use crate::world::facade::FacadeStyle;
+use crate::world::placement::{ChunkPlan, PlacedKind, PlacedObject};
+use crate::world::roof::MeshBuf;
+
+/// What a prop is. The spawn side maps each kind to one shared mesh and one
+/// shared material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PropKind {
+    /// 雨棚: tilted canvas over an old-city shopfront bay.
+    Awning,
+    /// 空调外机: wall-mounted condenser box.
+    AcUnit,
+    /// 落水管: vertical drainpipe hugging the facade.
+    Downspout,
+    /// 阳台: slab + railing strip on an apartment facade (one baked mesh).
+    Balcony,
+    /// 水箱: roof water tank on a flat (parapet) roof.
+    WaterTank,
+    /// 烟囱: a kitchen stove pipe through old-city gables, a tall stack on
+    /// factory sheds.
+    Chimney,
+    /// Rooftop stair bulkhead poking above an apartment parapet.
+    StairBox,
+    /// Small vent between factory sawtooth teeth.
+    RoofVent,
+}
+
+/// Height of the 雨棚 wall mount above the ground (m): just under the
+/// first-floor window line of a 3 m storey.
+pub const AWNING_MOUNT: f32 = 2.5;
+
+/// AC condenser depth (m): how far the box sticks out of the wall.
+pub const AC_DEPTH: f32 = 0.3;
+
+/// Cap on AC condensers per apartment, so the per-bay roll cannot run away
+/// on a 12-bay, 6-floor slab.
+pub const APARTMENT_AC_CAP: usize = 14;
+
+/// Appends one prop. `variant` reuses the facade variant slot as a material
+/// selector: 0 = standard finish, 1 = rusted (or the second awning canvas).
+fn push_prop(
+    plan: &mut ChunkPlan,
+    kind: PropKind,
+    position: bevy::math::Vec2,
+    yaw: f32,
+    size: Vec3,
+    base: f32,
+    variant: u8,
+) {
+    plan.objects.push(PlacedObject {
+        kind: PlacedKind::Prop(kind),
+        position,
+        yaw,
+        size,
+        footprint_half: bevy::math::Vec2::ZERO,
+        wear: 0.0,
+        variant,
+        tree: None,
+        base,
+    });
+}
+
+/// Per-building RNG for props, keyed on the exact position bits.
+///
+/// Positions are produced by the same arithmetic on every plan, so the bits
+/// are stable across runs; no quantisation is needed (unlike
+/// `facade_variant`, which must survive shader-side float drift).
+fn prop_rng(position: bevy::math::Vec2) -> StdRng {
+    let mixed = (position.x.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (position.y.to_bits() as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ 0x1656_67B1_9E37_79F9;
+    StdRng::seed_from_u64(mixed)
+}
+
+/// Centre offset along the facade of bay `b` of `bays` across length `l`.
+fn bay_u(b: usize, bays: usize, l: f32) -> f32 {
+    let step = l / bays as f32;
+    -l * 0.5 + (b as f32 + 0.5) * step
+}
+
+/// Hangs the facade and rooftop props of one building (11.4).
+///
+/// `street` is the unit vector from the building centre toward the street
+/// (the negated per-edge normal the building was placed with). Facade props
+/// are pushed onto the plane `street * depth/2` from the centre; roof props
+/// sit over the footprint at the wall-top height.
+pub fn place_building_props(
+    plan: &mut ChunkPlan,
+    building: &PlacedObject,
+    style: FacadeStyle,
+    street: bevy::math::Vec2,
+) {
+    let mut rng = prop_rng(building.position);
+    let (l, h, d) = (building.size.x, building.size.y, building.size.z);
+    let along = bevy::math::Vec2::new(street.y, -street.x);
+    let face = building.position + street * (d * 0.5);
+    // Props that care about facing (awning tilt, balcony railing) are baked
+    // with their outward side toward local +Z. Flip the yaw when the street
+    // sits on the building's local -Z instead.
+    let front = street.x * building.yaw.sin() + street.y * building.yaw.cos();
+    let out_yaw = building.yaw
+        + if front < 0.0 {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
+    // 锈蚀外挂件: heavily worn buildings get rusty fixtures far more often
+    // than fresh ones. Variant 1 selects the rust material at spawn time.
+    let rust_chance = if building.wear > 0.6 { 0.65 } else { 0.2 };
+
+    match style {
+        FacadeStyle::OldCity => {
+            // 雨棚: one canvas per shopfront bay, roughly half the bays.
+            let bays = (l / 2.0).round().max(1.0) as usize;
+            for b in 0..bays {
+                if rng.random::<f32>() >= 0.45 {
+                    continue;
+                }
+                let canvas = u8::from(rng.random::<f32>() < 0.5);
+                push_prop(
+                    plan,
+                    PropKind::Awning,
+                    face + along * bay_u(b, bays, l),
+                    out_yaw,
+                    Vec3::ONE,
+                    AWNING_MOUNT,
+                    canvas,
+                );
+            }
+            // 空调外机: two-storey houses get a pair under the upper window
+            // line; single-storey ones get one above the door.
+            if h >= 6.0 {
+                for u in [-l * 0.25, l * 0.25] {
+                    if rng.random::<f32>() < 0.5 {
+                        let variant = u8::from(rng.random::<f32>() < rust_chance);
+                        push_prop(
+                            plan,
+                            PropKind::AcUnit,
+                            face + along * u + street * (AC_DEPTH * 0.5),
+                            building.yaw,
+                            Vec3::new(0.75, 0.55, AC_DEPTH),
+                            3.3,
+                            variant,
+                        );
+                    }
+                }
+            } else if rng.random::<f32>() < 0.25 {
+                let variant = u8::from(rng.random::<f32>() < rust_chance);
+                push_prop(
+                    plan,
+                    PropKind::AcUnit,
+                    face + street * (AC_DEPTH * 0.5),
+                    building.yaw,
+                    Vec3::new(0.75, 0.55, AC_DEPTH),
+                    1.9,
+                    variant,
+                );
+            }
+            // 落水管: one per building, at a facade end.
+            if rng.random::<f32>() < 0.35 {
+                let side = if rng.random::<bool>() { 1.0 } else { -1.0 };
+                let variant = u8::from(rng.random::<f32>() < rust_chance);
+                push_prop(
+                    plan,
+                    PropKind::Downspout,
+                    face + along * (side * (l * 0.5 - 0.15)),
+                    building.yaw,
+                    Vec3::new(0.18, h, 0.18),
+                    0.0,
+                    variant,
+                );
+            }
+            // 烟囱: kitchen stove pipe through the gable.
+            if rng.random::<f32>() < 0.3 {
+                let u = rng.random_range(-l * 0.3..=l * 0.3);
+                push_prop(
+                    plan,
+                    PropKind::Chimney,
+                    building.position + along * u,
+                    building.yaw,
+                    Vec3::new(0.36, 1.8, 0.36),
+                    h - 0.3,
+                    0,
+                );
+            }
+        }
+        FacadeStyle::Apartment => {
+            let bays = (l / 3.3).round().max(1.0) as usize;
+            let floors = (h / 3.0).floor() as i32;
+            // 阳台: every other bay, most floors above the ground one.
+            let mut b = 0;
+            while b < bays {
+                let u = bay_u(b, bays, l);
+                for floor in 1..floors {
+                    if rng.random::<f32>() < 0.6 {
+                        push_prop(
+                            plan,
+                            PropKind::Balcony,
+                            face + along * u,
+                            out_yaw,
+                            Vec3::ONE,
+                            floor as f32 * 3.0,
+                            0,
+                        );
+                    }
+                }
+                b += 2;
+            }
+            // 空调外机 grid: one roll per (bay, floor), capped.
+            let mut hung = 0;
+            for floor in 0..floors {
+                for b in 0..bays {
+                    if hung >= APARTMENT_AC_CAP {
+                        break;
+                    }
+                    if rng.random::<f32>() < 0.18 {
+                        let variant = u8::from(rng.random::<f32>() < rust_chance);
+                        push_prop(
+                            plan,
+                            PropKind::AcUnit,
+                            face + along * bay_u(b, bays, l) + street * (AC_DEPTH * 0.5),
+                            building.yaw,
+                            Vec3::new(0.75, 0.55, AC_DEPTH),
+                            floor as f32 * 3.0 + 0.3,
+                            variant,
+                        );
+                        hung += 1;
+                    }
+                }
+            }
+            // 落水管: full-height pipe at a facade end.
+            if rng.random::<f32>() < 0.5 {
+                let side = if rng.random::<bool>() { 1.0 } else { -1.0 };
+                let variant = u8::from(rng.random::<f32>() < rust_chance);
+                push_prop(
+                    plan,
+                    PropKind::Downspout,
+                    face + along * (side * (l * 0.5 - 0.15)),
+                    building.yaw,
+                    Vec3::new(0.18, h, 0.18),
+                    0.0,
+                    variant,
+                );
+            }
+            // 水箱: flat parapet roof, so the tanks stand on the deck.
+            if rng.random::<f32>() < 0.7 {
+                let u = rng.random_range(-l * 0.25..=l * 0.25);
+                push_prop(
+                    plan,
+                    PropKind::WaterTank,
+                    building.position + along * u,
+                    building.yaw,
+                    Vec3::new(1.9, 2.2, 1.9),
+                    h,
+                    0,
+                );
+                if rng.random::<f32>() < 0.5 {
+                    let u = rng.random_range(-l * 0.25..=l * 0.25);
+                    push_prop(
+                        plan,
+                        PropKind::WaterTank,
+                        building.position + along * u,
+                        building.yaw,
+                        Vec3::new(1.9, 2.2, 1.9),
+                        h,
+                        0,
+                    );
+                }
+            }
+            // Rooftop stair bulkhead.
+            if rng.random::<f32>() < 0.8 {
+                let u = rng.random_range(-l * 0.2..=l * 0.2);
+                push_prop(
+                    plan,
+                    PropKind::StairBox,
+                    building.position + along * u,
+                    building.yaw,
+                    Vec3::new(4.0, 2.6, 3.0),
+                    h,
+                    0,
+                );
+            }
+        }
+        FacadeStyle::Factory => {
+            // 烟囱: one tall stack through the sawtooth, most sheds.
+            if rng.random::<f32>() < 0.8 {
+                let u = if rng.random::<bool>() {
+                    -l * 0.3
+                } else {
+                    l * 0.3
+                };
+                push_prop(
+                    plan,
+                    PropKind::Chimney,
+                    building.position + along * u,
+                    building.yaw,
+                    Vec3::new(1.1, 7.0, 1.1),
+                    h + 1.0,
+                    0,
+                );
+            }
+            // Vents between the teeth.
+            let vents = rng.random_range(2..=4);
+            for i in 0..vents {
+                let t = (i as f32 + 0.5) / vents as f32;
+                push_prop(
+                    plan,
+                    PropKind::RoofVent,
+                    building.position + along * ((t - 0.5) * l * 0.8),
+                    building.yaw,
+                    Vec3::new(0.5, 0.9, 0.5),
+                    h + 1.2,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+// --- mesh baking -----------------------------------------------------------
+
+/// One axis-aligned box, six quads wound CCW seen from outside.
+fn push_box(buf: &mut MeshBuf, min: [f32; 3], max: [f32; 3]) {
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    buf.quad([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]);
+    buf.quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
+    buf.quad([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]);
+    buf.quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+    buf.quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+    buf.quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]);
+}
+
+/// The 雨棚: a tilted canvas slab, wall edge at z = 0, outer edge toward
+/// local +Z and 0.21 m lower (a ~12 degree pitch so rain runs off the
+/// street side).
+///
+/// Baked at real size (1.8 m wide, 1.0 m deep) because the tilt does not
+/// survive non-uniform scaling; instances scale x only for width.
+pub fn bake_awning() -> Mesh {
+    const DEPTH: f32 = 1.0;
+    const DROP: f32 = 0.21;
+    const THICK: f32 = 0.05;
+    let (x0, x1) = (-0.9, 0.9);
+    // Cross-section in (z, y), CCW seen from +x.
+    let cs = [
+        [0.0, 0.0],
+        [DEPTH, -DROP],
+        [DEPTH, -DROP - THICK],
+        [0.0, -THICK],
+    ];
+    let p = |c: [f32; 2], x: f32| [x, c[1], c[0]];
+    let mut buf = MeshBuf::new();
+    // End caps: the +x cap follows the CCW section, the -x cap reverses it.
+    buf.quad(p(cs[0], x1), p(cs[1], x1), p(cs[2], x1), p(cs[3], x1));
+    buf.quad(p(cs[3], x0), p(cs[2], x0), p(cs[1], x0), p(cs[0], x0));
+    // The four swept faces, one per section edge ci -> ci+1.
+    for i in 0..4 {
+        let a = cs[i];
+        let b = cs[(i + 1) % 4];
+        buf.quad(p(a, x1), p(a, x0), p(b, x0), p(b, x1));
+    }
+    buf.build()
+}
+
+/// The 阳台: slab + railing baked as one mesh, wall plane at z = 0, floor
+/// level at y = 0 (the slab hangs 0.12 m below its own floor).
+pub fn bake_balcony() -> Mesh {
+    const RAIL_H: f32 = 0.95;
+    let hw = 1.2; // half of the 2.4 m slab
+    let mut buf = MeshBuf::new();
+    push_box(&mut buf, [-hw, -0.12, 0.0], [hw, 0.0, 1.0]);
+    // Railing: front panel on the outer edge, two side panels.
+    push_box(&mut buf, [-hw, 0.0, 0.93], [hw, RAIL_H, 1.0]);
+    push_box(&mut buf, [-hw, 0.0, 0.0], [-hw + 0.06, RAIL_H, 0.93]);
+    push_box(&mut buf, [hw - 0.06, 0.0, 0.0], [hw, RAIL_H, 0.93]);
+    buf.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::world::layout_graph::BlockType;
+
+    /// A synthetic building at a fixed spot; `street` points toward -z, so
+    /// the facade faces the -z side and the yaw-flip branch is exercised.
+    fn building(style: FacadeStyle, offset: f32, size: Vec3, wear: f32) -> PlacedObject {
+        PlacedObject {
+            kind: PlacedKind::Building(match style {
+                FacadeStyle::OldCity => BlockType::OldCity,
+                FacadeStyle::Apartment => BlockType::Apartment,
+                FacadeStyle::Factory => BlockType::Factory,
+            }),
+            position: bevy::math::Vec2::new(100.0 + offset, 200.0),
+            yaw: 0.0,
+            size,
+            footprint_half: bevy::math::Vec2::new(size.x * 0.5, size.z * 0.5),
+            wear,
+            variant: 0,
+            tree: None,
+            base: 0.0,
+        }
+    }
+
+    const STREET: bevy::math::Vec2 = bevy::math::Vec2::new(0.0, -1.0);
+
+    fn props_of(style: FacadeStyle, size: Vec3, wear: f32, offset: f32) -> Vec<PlacedObject> {
+        let mut plan = ChunkPlan::default();
+        let b = building(style, offset, size, wear);
+        place_building_props(&mut plan, &b, style, STREET);
+        plan.objects
+    }
+
+    #[test]
+    fn props_are_position_keyed_and_stable() {
+        let reference = props_of(
+            FacadeStyle::Apartment,
+            Vec3::new(33.0, 18.0, 13.0),
+            0.4,
+            0.0,
+        );
+        assert!(
+            !reference.is_empty(),
+            "an 33 m six-floor slab must grow some props"
+        );
+        let again = props_of(
+            FacadeStyle::Apartment,
+            Vec3::new(33.0, 18.0, 13.0),
+            0.4,
+            0.0,
+        );
+        assert_eq!(reference, again, "the same building must dress identically");
+        // Different positions dress differently: the rolls are position
+        // keyed, so 30 shifted copies must not all collapse onto one answer.
+        let differing = (0..30)
+            .filter(|i| {
+                props_of(
+                    FacadeStyle::Apartment,
+                    Vec3::new(33.0, 18.0, 13.0),
+                    0.4,
+                    *i as f32,
+                ) != reference
+            })
+            .count();
+        assert!(
+            differing >= 25,
+            "position keying collapsed: only {differing}/30 differ"
+        );
+    }
+
+    #[test]
+    fn facade_props_hug_the_front_plane() {
+        for (style, size) in [
+            (FacadeStyle::OldCity, Vec3::new(6.0, 6.0, 5.0)),
+            (FacadeStyle::Apartment, Vec3::new(33.0, 18.0, 13.0)),
+            (FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0)),
+        ] {
+            for offset in [0.0, 3.7, 11.2] {
+                let center = building(style, offset, size, 0.5).position;
+                for p in props_of(style, size, 0.5, offset) {
+                    let PlacedKind::Prop(kind) = p.kind else {
+                        continue;
+                    };
+                    let rel = p.position - center;
+                    // + means toward the street; `along` is the facade run.
+                    let out = rel.dot(STREET);
+                    let along = rel.dot(bevy::math::Vec2::new(STREET.y, -STREET.x));
+                    let roof_kind = matches!(
+                        kind,
+                        PropKind::WaterTank | PropKind::StairBox | PropKind::RoofVent
+                    );
+                    match kind {
+                        PropKind::Awning | PropKind::Balcony => {
+                            assert!(
+                                (out - size.z * 0.5).abs() < 1e-4,
+                                "{kind:?} must sit on the facade plane, got {out}"
+                            );
+                        }
+                        PropKind::AcUnit => {
+                            let want = size.z * 0.5 + AC_DEPTH * 0.5;
+                            assert!(
+                                (out - want).abs() < 1e-4,
+                                "{kind:?} must protrude {want} m, got {out}"
+                            );
+                        }
+                        PropKind::Downspout => {
+                            assert!((out - size.z * 0.5).abs() < 1e-4);
+                            assert!(along.abs() <= size.x * 0.5 + 1e-4);
+                        }
+                        PropKind::Chimney => assert!(out.abs() <= size.z * 0.4 + 1e-4),
+                        _ => {}
+                    }
+                    let along_limit = if roof_kind || kind == PropKind::Chimney {
+                        size.x * 0.45
+                    } else {
+                        size.x * 0.5
+                    };
+                    assert!(
+                        along.abs() <= along_limit + 1e-4,
+                        "{kind:?} drifted {along} m along the facade (limit {along_limit})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn roof_props_poke_above_the_roofline() {
+        for (style, size) in [
+            (FacadeStyle::OldCity, Vec3::new(6.0, 6.0, 5.0)),
+            (FacadeStyle::Apartment, Vec3::new(33.0, 18.0, 13.0)),
+            (FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0)),
+        ] {
+            for p in props_of(style, size, 0.5, 2.3) {
+                let PlacedKind::Prop(kind) = p.kind else {
+                    continue;
+                };
+                let top = p.base + p.size.y;
+                match kind {
+                    PropKind::WaterTank | PropKind::StairBox => {
+                        assert!(
+                            (p.base - size.y).abs() < 1e-4,
+                            "{kind:?} must stand on the roof deck"
+                        );
+                        assert!(top > size.y, "{kind:?} must rise above the parapet");
+                    }
+                    PropKind::Chimney => {
+                        assert!(top >= size.y + 0.5, "chimney must clear the roofline");
+                        assert!(p.base <= size.y + 1.2, "chimney base belongs at the roof");
+                    }
+                    PropKind::RoofVent => {
+                        assert!(p.base >= size.y, "vent sits on the roof");
+                        assert!(top <= size.y + 2.3, "vent stays under the tooth peaks");
+                    }
+                    _ => {
+                        assert!(
+                            p.base >= 0.0 && top <= size.y + 0.1,
+                            "{kind:?} belongs on the wall"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn styles_get_their_signature_props() {
+        let mut balcony = 0;
+        let mut tank = 0;
+        let mut stair = 0;
+        for i in 0..60 {
+            for p in props_of(
+                FacadeStyle::Apartment,
+                Vec3::new(33.0, 18.0, 13.0),
+                0.5,
+                i as f32 * 1.7,
+            ) {
+                match p.kind {
+                    PlacedKind::Prop(PropKind::Balcony) => balcony += 1,
+                    PlacedKind::Prop(PropKind::WaterTank) => tank += 1,
+                    PlacedKind::Prop(PropKind::StairBox) => stair += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(balcony > 100, "apartments need balcony rows, got {balcony}");
+        assert!(tank >= 25, "apartments need roof tanks, got {tank}");
+        assert!(stair >= 30, "apartments need stair bulkheads, got {stair}");
+
+        // Old city never grows apartment clutter: gable roofs have no deck.
+        for i in 0..40 {
+            for p in props_of(
+                FacadeStyle::OldCity,
+                Vec3::new(6.0, 6.0, 5.0),
+                0.5,
+                i as f32,
+            ) {
+                assert!(!matches!(
+                    p.kind,
+                    PlacedKind::Prop(PropKind::Balcony)
+                        | PlacedKind::Prop(PropKind::WaterTank)
+                        | PlacedKind::Prop(PropKind::StairBox)
+                        | PlacedKind::Prop(PropKind::RoofVent)
+                ));
+            }
+        }
+
+        // Factory sheds grow a chimney most of the time (0.8 roll).
+        let chimneys = (0..40)
+            .filter(|i| {
+                props_of(
+                    FacadeStyle::Factory,
+                    Vec3::new(50.0, 24.0, 50.0),
+                    0.5,
+                    *i as f32,
+                )
+                .iter()
+                .any(|p| matches!(p.kind, PlacedKind::Prop(PropKind::Chimney)))
+            })
+            .count();
+        assert!(
+            (26..=40).contains(&chimneys),
+            "chimney fraction {chimneys}/40 is off the 0.8 roll"
+        );
+    }
+
+    #[test]
+    fn prop_counts_stay_in_budget() {
+        let oc = props_of(FacadeStyle::OldCity, Vec3::new(6.0, 6.0, 5.0), 0.9, 0.0).len();
+        assert!(oc <= 9, "old city dressing {oc} exceeds the module budget");
+        let apt = props_of(
+            FacadeStyle::Apartment,
+            Vec3::new(39.6, 18.0, 14.0),
+            0.9,
+            0.0,
+        )
+        .len();
+        assert!(
+            apt <= 45,
+            "apartment dressing {apt} exceeds the slab budget"
+        );
+        let fac = props_of(FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0), 0.9, 0.0).len();
+        assert!(fac <= 8, "factory dressing {fac} exceeds the shed budget");
+    }
+
+    /// Extracts the triangle soup of a baked mesh.
+    fn triangles(mesh: &Mesh) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+        let positions: Vec<[f32; 3]> = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("positions")
+            .as_float3()
+            .expect("f32")
+            .to_vec();
+        let indices = match mesh.indices().expect("indices") {
+            bevy::mesh::Indices::U16(i) => i.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+            bevy::mesh::Indices::U32(i) => i.to_vec(),
+        };
+        indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| {
+                (
+                    positions[t[0] as usize],
+                    positions[t[1] as usize],
+                    positions[t[2] as usize],
+                )
+            })
+            .collect()
+    }
+
+    /// Every triangle's CCW normal must point away from the mesh centroid:
+    /// one inverted face shows in-game as a hole no other test can see.
+    fn assert_faces_outward(mesh: &Mesh, name: &str) {
+        let tris = triangles(mesh);
+        assert!(!tris.is_empty(), "{name} baked empty");
+        let mut centroid = [0.0f32; 3];
+        let mut count = 0;
+        for (a, b, c) in &tris {
+            for axis in 0..3 {
+                centroid[axis] += (a[axis] + b[axis] + c[axis]) / 3.0;
+            }
+            count += 1;
+        }
+        for value in &mut centroid {
+            *value /= count as f32;
+        }
+        for (i, (a, b, c)) in tris.iter().enumerate() {
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let to_face = [
+                (a[0] + b[0] + c[0]) / 3.0 - centroid[0],
+                (a[1] + b[1] + c[1]) / 3.0 - centroid[1],
+                (a[2] + b[2] + c[2]) / 3.0 - centroid[2],
+            ];
+            let dot = n[0] * to_face[0] + n[1] * to_face[1] + n[2] * to_face[2];
+            assert!(dot > 0.0, "{name} triangle {i} faces inward (dot {dot})");
+        }
+    }
+
+    #[test]
+    fn baked_prop_meshes_face_outward() {
+        // The awning is one convex slab, so the whole-mesh centroid test
+        // applies directly.
+        assert_faces_outward(&bake_awning(), "awning");
+        // The balcony is a compound of boxes: a whole-mesh centroid is not
+        // inside any one box, so the heuristic only makes sense per box.
+        // `push_box` is the thing that must be right -- every box it emits
+        // has to face away from its own centre.
+        let mut buf = MeshBuf::new();
+        push_box(&mut buf, [-1.0, -2.0, -3.0], [0.5, 0.7, 1.5]);
+        assert_faces_outward(&buf.build(), "push_box");
+        // And the assembled balcony is non-empty geometry.
+        assert!(
+            !triangles(&bake_balcony()).is_empty(),
+            "balcony baked empty"
+        );
+    }
+
+    #[test]
+    fn awning_tilts_down_toward_the_street() {
+        let tris = triangles(&bake_awning());
+        let mut wall_y = 0.0;
+        let mut wall_n = 0;
+        let mut outer_y = 0.0;
+        let mut outer_n = 0;
+        for (a, b, c) in &tris {
+            for p in [a, b, c] {
+                if p[2].abs() < 1e-5 {
+                    wall_y += p[1];
+                    wall_n += 1;
+                } else if p[2] > 0.9 {
+                    outer_y += p[1];
+                    outer_n += 1;
+                }
+            }
+        }
+        assert!(
+            wall_n > 0 && outer_n > 0,
+            "awning lost its wall or outer edge"
+        );
+        let outer = outer_y / outer_n as f32;
+        let wall = wall_y / wall_n as f32;
+        assert!(
+            outer < wall - 0.15,
+            "the outer edge must hang clearly lower than the wall edge"
+        );
+    }
+}

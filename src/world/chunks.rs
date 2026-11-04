@@ -22,6 +22,7 @@ use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{HeadsUpSeed, generate_world};
 use crate::world::placement;
+use crate::world::props::PropKind;
 use crate::world::roof::{RoofKind, RoofProfile, bake_gable, bake_tooth};
 use crate::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
 use crate::world::tree_shape::TREE_PROFILES;
@@ -352,6 +353,74 @@ pub(crate) struct PlacementAssets {
     /// scales it. Buildings used to call `meshes.add(Cuboid)` per object,
     /// which allocated a new mesh every time a chunk streamed in.
     unit_cube: Handle<Mesh>,
+    /// One unit cylinder (radius 0.5, height 1) for the round props:
+    /// downspouts, chimneys, water tanks, roof vents, utility poles.
+    unit_cylinder: Handle<Mesh>,
+    /// Shared prop meshes and materials (R3.11 step 11.4).
+    props: PropAssets,
+}
+
+/// Shared prop meshes and materials (R3.11 step 11.4). Built once; every
+/// prop instance reuses these handles, so a streaming window's prop clutter
+/// costs a handful of draw calls no matter how many boxes it hangs.
+pub(crate) struct PropAssets {
+    /// Fixtures: downspouts, water tanks, stair bulkheads, roof vents.
+    dark: Handle<StandardMaterial>,
+    /// Rusted variant for worn buildings' fixtures (锈蚀外挂件).
+    rusted: Handle<StandardMaterial>,
+    /// AC condenser cabinets.
+    ac: Handle<StandardMaterial>,
+    /// Brick chimneys.
+    brick: Handle<StandardMaterial>,
+    /// Awning canvases (the prop's variant bit picks the colour).
+    awning_canvas: [Handle<StandardMaterial>; 2],
+    /// The tilted canvas slab, wall edge at local z = 0 (real size).
+    awning: Handle<Mesh>,
+    /// The balcony slab + railing, wall plane at local z = 0 (real size).
+    balcony: Handle<Mesh>,
+}
+
+impl PropAssets {
+    /// Fixture material for a prop's variant bit: 0 = dark metal, 1 = rust.
+    fn fixture(&self, variant: u8) -> Handle<StandardMaterial> {
+        if variant % 2 == 1 {
+            self.rusted.clone()
+        } else {
+            self.dark.clone()
+        }
+    }
+}
+
+/// Builds the shared prop meshes and materials (R3.11 step 11.4).
+///
+/// The recipe is the tree/roof one: fully matte, `reflectance = 0` -- a
+/// glinting fixture reads as wet plastic against the dusk sky it is meant
+/// to silhouette against. The colours stay muted; the rust is the only
+/// saturated note, and it is earned by the building's wear roll.
+fn build_prop_assets(
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> PropAssets {
+    let mut matte = |rgb: [f32; 3], rough: f32| {
+        materials.add(StandardMaterial {
+            base_color: Color::srgb(rgb[0], rgb[1], rgb[2]),
+            perceptual_roughness: rough,
+            reflectance: 0.0,
+            ..default()
+        })
+    };
+    PropAssets {
+        dark: matte([0.28, 0.29, 0.31], 0.8),
+        rusted: matte([0.36, 0.21, 0.12], 0.95),
+        ac: matte([0.78, 0.76, 0.7], 0.85),
+        brick: matte([0.38, 0.22, 0.16], 0.95),
+        awning_canvas: [
+            matte([0.48, 0.22, 0.18], 0.95),
+            matte([0.3, 0.38, 0.28], 0.95),
+        ],
+        awning: meshes.add(crate::world::props::bake_awning()),
+        balcony: meshes.add(crate::world::props::bake_balcony()),
+    }
 }
 
 impl PlacementAssets {
@@ -587,6 +656,9 @@ fn build_placement_assets(
     let tree_leaf_material =
         tree_materials.add(crate::plugins::season::tree_leaf_material(leaf_texture));
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let unit_cylinder = meshes.add(bevy::shape::Cylinder::new(0.5, 1.0));
+    // R3.11 step 11.4: shared prop meshes and materials.
+    let props = build_prop_assets(&mut meshes, &mut materials);
 
     info!(
         "placement assets built: {} tree meshes ({} LODs), {} facade materials          ({} styles x {} variants x {} wear buckets)",
@@ -605,6 +677,8 @@ fn build_placement_assets(
         tree_material,
         tree_leaf_material,
         unit_cube,
+        unit_cylinder,
+        props,
     });
 }
 
@@ -693,6 +767,96 @@ fn spawn_roof(
     }
 }
 
+/// Spawns one prop entity (R3.11 step 11.4).
+///
+/// Two mesh conventions meet here: unit meshes (cube, cylinder) scale by
+/// `object.size` and centre at `base + size.y/2`; baked meshes (awning,
+/// balcony) carry real size with their mount point at the origin, so `base`
+/// is the spawn height directly and `size` is used as the scale as-is.
+fn spawn_prop(
+    parent: &mut ChildSpawnerCommands,
+    assets: &PlacementAssets,
+    object: &placement::PlacedObject,
+) {
+    let placement::PlacedKind::Prop(kind) = object.kind else {
+        return;
+    };
+    let props = &assets.props;
+    let rotation = Quat::from_rotation_y(object.yaw);
+    let (name, mesh, material, y, scale) = match kind {
+        PropKind::Awning => (
+            "Awning",
+            props.awning.clone(),
+            props.awning_canvas[object.variant as usize % 2].clone(),
+            object.base,
+            object.size,
+        ),
+        PropKind::AcUnit => (
+            "AcUnit",
+            assets.unit_cube.clone(),
+            // A fresh condenser is beige plastic; the rust variant takes
+            // over on worn buildings (the same variant bit as the fixtures).
+            if object.variant % 2 == 1 {
+                props.rusted.clone()
+            } else {
+                props.ac.clone()
+            },
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::Downspout => (
+            "Downspout",
+            assets.unit_cylinder.clone(),
+            props.fixture(object.variant),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::Balcony => (
+            "Balcony",
+            props.balcony.clone(),
+            props.fixture(0),
+            object.base,
+            object.size,
+        ),
+        PropKind::WaterTank => (
+            "WaterTank",
+            assets.unit_cylinder.clone(),
+            props.fixture(0),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::Chimney => (
+            "Chimney",
+            assets.unit_cylinder.clone(),
+            props.brick.clone(),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::StairBox => (
+            "StairBox",
+            assets.unit_cube.clone(),
+            props.fixture(0),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::RoofVent => (
+            "RoofVent",
+            assets.unit_cylinder.clone(),
+            props.fixture(0),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+    };
+    parent.spawn((
+        Name::new(name),
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::from_translation(Vec3::new(object.position.x, y, object.position.y))
+            .with_rotation(rotation)
+            .with_scale(scale),
+    ));
+}
+
 /// Spawns a chunk's planned content under its root: buildings as BoxMesh
 /// placeholders (ADR-0004 §4; R3.6 adds wear materials), trees as glTF
 /// scenes, the plaza pad as a thin box. Called inside the streaming system so
@@ -735,6 +899,12 @@ fn spawn_chunk_content(
                     // building tops watched from the shoulders up, and the wall
                     // texture stops at the parapet.
                     spawn_roof(parent, roof, &assets.unit_cube, object);
+                });
+            }
+            placement::PlacedKind::Prop(_) => {
+                // R3.11 step 11.4: facade / rooftop props.
+                commands.entity(root).with_children(|parent| {
+                    spawn_prop(parent, assets, object);
                 });
             }
             placement::PlacedKind::PlazaPad => {

@@ -19,6 +19,7 @@ pub mod layout_graph;
 pub mod leaf_shape;
 pub mod path_network;
 pub mod placement;
+pub mod props;
 pub mod roof;
 pub mod season;
 pub mod tree_mesh;

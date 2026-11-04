@@ -33,6 +33,7 @@ use crate::world::geometry::{
     point_in_polygon,
 };
 use crate::world::layout_graph::{BlockType, LayoutGraph};
+use crate::world::props::PropKind;
 use crate::world::{CELL_SIZE, CHUNK_SIZE, GRID_CELLS};
 
 /// Street trees are spaced on this grid along an edge (m).
@@ -136,6 +137,8 @@ pub enum PlacedKind {
     PlazaTree,
     /// The plaza's paved pad.
     PlazaPad,
+    /// A facade, roof or street prop (R3.11 steps 11.4-11.5).
+    Prop(PropKind),
 }
 
 /// A bare tree asset: which mesh, how big, which way it faces.
@@ -172,9 +175,17 @@ pub struct PlacedObject {
     /// own position rather than from the RNG: taking another draw from the
     /// per-edge stream would shift every wear value downstream of it, and the
     /// existing weathering is already approved.
+    ///
+    /// Props reuse the slot as a material selector: 0 = standard finish,
+    /// 1 = rusted (or the second awning canvas).
     pub variant: u8,
     /// Tree variation, `None` for buildings and the plaza pad.
     pub tree: Option<TreeInstance>,
+    /// Height of the object's bottom above the ground (m). Buildings, trees
+    /// and the plaza pad start at 0; props hang at their mount height. The
+    /// spawn side centres unit meshes at `base + size.y/2` and hangs baked
+    /// meshes (whose origin sits at the mount point) at `base` directly.
+    pub base: f32,
 }
 
 /// Everything one chunk displays, in spawn order.
@@ -198,6 +209,14 @@ impl ChunkPlan {
     /// Tree count, all reasons combined.
     pub fn tree_count(&self) -> usize {
         self.objects.iter().filter(|o| o.tree.is_some()).count()
+    }
+
+    /// Prop count, facade/roof/street combined (diagnostics/tests).
+    pub fn prop_count(&self) -> usize {
+        self.objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(_)))
+            .count()
     }
 }
 
@@ -350,6 +369,7 @@ impl PlazaPadObject {
             wear: 0.0,
             variant: 0,
             tree: None,
+            base: 0.0,
         }
     }
 }
@@ -494,7 +514,7 @@ fn place_buildings(
             None => height,
         };
 
-        plan.objects.push(PlacedObject {
+        let object = PlacedObject {
             kind: PlacedKind::Building(block.kind),
             position,
             yaw: angle,
@@ -503,7 +523,15 @@ fn place_buildings(
             wear: rng.random_range(0.0..=1.0),
             variant: facade_variant(position),
             tree: None,
-        });
+            base: 0.0,
+        };
+        // R3.11 step 11.4: facade and rooftop props. They draw from a
+        // position-keyed generator instead of this edge stream, so the
+        // approved wear sequence downstream stays untouched.
+        if let Some(style) = FacadeStyle::of(block.kind) {
+            crate::world::props::place_building_props(plan, &object, style, -edge_normal);
+        }
+        plan.objects.push(object);
     }
 }
 
@@ -691,6 +719,7 @@ fn push_tree(
         wear: 0.0,
         variant: 0,
         tree: Some(TreeInstance { asset, scale, yaw }),
+        base: 0.0,
     });
 }
 
@@ -935,10 +964,12 @@ mod tests {
                 let plan = plan_chunk(&graph, seed, chunk, 3);
                 for object in plan.objects {
                     total += 1;
+                    // Props stack at one xz spot (three wire heights on one
+                    // span), so the key carries the mount height too.
                     let key = (
                         chunk.0,
                         chunk.1,
-                        format!("{:?}@{:?}", object.kind, object.position),
+                        format!("{:?}@{:?}@{}", object.kind, object.position, object.base),
                     );
                     *seen.entry(key).or_default() += 1;
                 }
@@ -952,6 +983,32 @@ mod tests {
             // object planned twice would inflate the per-chunk sum.
             let distinct = seen.len();
             assert_eq!(total, distinct, "seed {seed}: duplicate placements");
+        }
+    }
+
+    #[test]
+    fn plans_carry_props_next_to_their_buildings() {
+        for seed in SEEDS {
+            let (_, graph) = generate_world(seed).unwrap();
+            let mut props = 0;
+            for chunk in all_chunks(&graph) {
+                let plan = plan_chunk(&graph, seed, chunk, 3);
+                for object in &plan.objects {
+                    let PlacedKind::Prop(_) = object.kind else {
+                        continue;
+                    };
+                    props += 1;
+                    assert!(
+                        plan.objects.iter().any(|b| {
+                            matches!(b.kind, PlacedKind::Building(_))
+                                && (b.position - object.position).length() <= 28.0
+                        }),
+                        "seed {seed}: prop at {:?} has no building nearby",
+                        object.position
+                    );
+                }
+            }
+            assert!(props > 0, "seed {seed}: no props planned at all");
         }
     }
 
