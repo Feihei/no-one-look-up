@@ -1046,17 +1046,17 @@ fn spawn_chunk_content(
                             &assets.tree_leaf_material,
                         ));
                         for (part_name, mesh, material) in parts {
-                            let mut entity = parent.spawn((
+                            // Every tier carries a range, including `Near`: near
+                            // has no start fade but needs an end margin to dither
+                            // out across 40-48 m, which is the first and most
+                            // visible swap.
+                            parent.spawn((
                                 Name::new(part_name),
                                 Mesh3d(mesh.clone()),
                                 MeshMaterial3d(material.clone()),
                                 transform,
+                                lod.range(),
                             ));
-                            // The near tier has nothing to fade from, so it
-                            // needs no range component at all.
-                            if lod != TreeLod::Near {
-                                entity.insert(lod.range());
-                            }
                         }
                     }
                 });
@@ -1334,9 +1334,14 @@ mod tests {
         assert_eq!(near, mid, "every tree needs a mid tier");
         assert_eq!(near, far, "every tree needs a far tier");
 
-        // The two distant tiers must carry ranges, and they must be the ones
-        // the LOD table defines.
-        for (name, expected) in [("TreeMid", TreeLod::Mid), ("TreeFar", TreeLod::Far)] {
+        // All three tiers carry ranges, near included: near has no start fade
+        // but needs an end margin to dissolve into mid across 40-48 m. Before
+        // the crossfade this first swap was a hard pop.
+        for (name, expected) in [
+            ("Tree", TreeLod::Near),
+            ("TreeMid", TreeLod::Mid),
+            ("TreeFar", TreeLod::Far),
+        ] {
             let mut query = app
                 .world_mut()
                 .query::<(&Name, Option<&bevy::camera::visibility::VisibilityRange>)>();
@@ -1348,29 +1353,11 @@ mod tests {
                 let range = range.unwrap_or_else(|| panic!("{name} has no VisibilityRange"));
                 // `VisibilityRange` has no Debug impl, so compare the parts.
                 let want = expected.range();
-                assert!(
-                    range.start_margin.start == want.start_margin.start
-                        && range.end_margin.end == want.end_margin.end,
-                    "{name} carries the wrong visibility range ({:?}-{:?}, expected {:?}-{:?})",
-                    range.start_margin.start,
-                    range.end_margin.end,
-                    want.start_margin.start,
-                    want.end_margin.end
-                );
+                assert_eq!(range.start_margin, want.start_margin, "{name} start margin");
+                assert_eq!(range.end_margin, want.end_margin, "{name} end margin");
                 checked += 1;
             }
             assert_eq!(checked, near, "{name} is missing on some trees");
-        }
-
-        // The near tier deliberately has no range (it is visible from 0 m and
-        // `VisibilityRange` cannot express an open start).
-        let mut query = app
-            .world_mut()
-            .query::<(&Name, Option<&bevy::camera::visibility::VisibilityRange>)>();
-        for (entity_name, range) in query.iter(app.world()) {
-            if entity_name.as_str() == "Tree" {
-                assert!(range.is_none(), "the near tier must not be range-gated");
-            }
         }
     }
 

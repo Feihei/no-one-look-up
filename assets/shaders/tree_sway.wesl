@@ -137,6 +137,18 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
     let world_position = season_world_position(world_from_local, v.position, color);
 
     out.world_position = vec4<f32>(world_position, 1.0);
+
+    // Tree LODs crossfade over the `VisibilityRange` margins, which the
+    // fragment stage implements by dithering. The level must be written here
+    // explicitly -- this file replaces Bevy's vertex stage, so nothing fills
+    // the field in for us. Distance is measured to the baked origin
+    // (`world_from_local[3]`), not the swayed vertex, so the fade does not
+    // shimmer with the wind phase.
+@if(VISIBILITY_RANGE_DITHER)
+    out.visibility_range_dither = mesh_functions::get_visibility_range_dither_level(
+        instance_index,
+        world_from_local[3],
+    );
 @if(PREPASS_PIPELINE)
     out.position = view.clip_from_world * vec4<f32>(world_position, 1.0);
 @else
@@ -193,10 +205,9 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
 @if(VERTEX_COLORS && PREPASS_PIPELINE)
     out.color = color;
 
-    // Tree LODs use `VisibilityRange::abrupt`, which never produces a crossfade,
-    // so the dither field stays unset. Asserted instead of implemented: adding
-    // a linear range would need this branch and a comment is cheaper than
-    // silently broken depth.
+    // Tree LODs crossfade with `VisibilityRange` margins (see the dither level
+    // written above); this only forwards the instance index the shadow and
+    // motion-vector stages need.
 @if(VERTEX_OUTPUT_INSTANCE_INDEX)
     out.instance_index = instance_index;
 

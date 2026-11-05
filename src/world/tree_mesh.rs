@@ -203,11 +203,35 @@ impl TreeLod {
     /// sees the swap rarely.
     pub const BOUNDARIES: [f32; 4] = [0.0, 40.0, 110.0, 220.0];
 
-    /// The visibility range for this tier, or `None` for `Near` (visible from
-    /// 0 m, which `VisibilityRange` expresses as an open start).
+    /// Distance over which neighbouring tiers crossfade (m).
+    ///
+    /// A tier's end margin and the next tier's start margin are the SAME range
+    /// -- that is what makes `VisibilityRange` dither a *cross*fade instead of
+    /// two independent vignettes. Within the band both tiers are drawn, each
+    /// discarding a complementary screen-space dither pattern, so the swap
+    /// dissolves instead of popping.
+    pub const CROSSFADE: f32 = 8.0;
+
+    /// The visibility range for this tier.
+    ///
+    /// Every tier carries one, including `Near`: `Near` has no start fade but
+    /// does need an end margin to dissolve into `Mid` at 40-48 m. Leaving
+    /// `Near` without a range is what made the first swap the harshest one.
     pub fn range(self) -> VisibilityRange {
         let index = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        VisibilityRange::abrupt(Self::BOUNDARIES[index], Self::BOUNDARIES[index + 1])
+        let start = Self::BOUNDARIES[index];
+        let end = Self::BOUNDARIES[index + 1];
+        // The nearest tier has nothing in front of it, so its start is hard.
+        let start_margin = if index == 0 {
+            start..start
+        } else {
+            start..start + Self::CROSSFADE
+        };
+        VisibilityRange {
+            start_margin,
+            end_margin: end..end + Self::CROSSFADE,
+            use_aabb: false,
+        }
     }
 
     /// Smallest branch radius kept at this tier (m).
@@ -1229,21 +1253,49 @@ mod tests {
     }
 
     #[test]
-    fn lod_ranges_tile_the_distances_without_gaps_or_overlap() {
+    fn lod_ranges_crossfade_without_gaps() {
+        // Neighbouring tiers must share the SAME margin range; that shared
+        // range is what makes the dither a crossfade instead of two separate
+        // vignettes (a gap would flash sky, an offset overlap would double-draw
+        // both tiers at full opacity).
         for pair in TreeLod::ALL.windows(2) {
             let (lower, upper) = (pair[0], pair[1]);
             assert_eq!(
-                lower.range().end_margin.end,
-                upper.range().start_margin.start,
-                "{lower:?} and {upper:?} leave a gap or overlap"
+                lower.range().end_margin,
+                upper.range().start_margin,
+                "{lower:?} and {upper:?} do not share their crossfade band"
+            );
+            assert!(
+                lower.range().end_margin.end - lower.range().end_margin.start
+                    >= TreeLod::CROSSFADE - 1e-5,
+                "{lower:?} crossfade is shorter than {:.0} m",
+                TreeLod::CROSSFADE
             );
         }
-        for distance in [0.0, 39.9, 40.0, 109.9, 110.0, 219.9] {
+        // Only the nearest tier starts hard; everything else eases in.
+        assert_eq!(TreeLod::Near.range().start_margin, 0.0..0.0);
+
+        // Inside a shared band TWO tiers are drawn at once (each with a
+        // partial dither); outside it exactly one.
+        for (distance, expected) in [
+            (0.0, 1),
+            (39.9, 1),
+            (44.0, 2),
+            (47.9, 2),
+            (48.0, 1),
+            (109.9, 1),
+            (114.0, 2),
+            (118.0, 1),
+            (219.9, 1),
+        ] {
             let visible = TreeLod::ALL
                 .iter()
                 .filter(|lod| !lod.range().is_culled(distance))
                 .count();
-            assert_eq!(visible, 1, "{distance} m: {visible} tiers visible at once");
+            assert_eq!(
+                visible, expected,
+                "{distance} m: expected {expected} tier(s), got {visible}"
+            );
         }
     }
 
