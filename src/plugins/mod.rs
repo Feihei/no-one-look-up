@@ -6,6 +6,7 @@
 
 pub mod cirrus;
 pub mod facade;
+pub mod hills;
 pub mod menu;
 pub mod save;
 pub mod save_data;
@@ -26,6 +27,7 @@ use bevy::prelude::*;
 
 use cirrus::CirrusPlugin;
 use facade::FacadePlugin;
+use hills::HillsPlugin;
 use menu::MenuPlugin;
 use save::SavePlugin;
 use season::SeasonPlugin;
@@ -44,6 +46,7 @@ impl PluginGroup for HeadsUpPlugins {
             .add(SkyPlugin)
             .add(SkyPanelPlugin)
             .add(CirrusPlugin)
+            .add(HillsPlugin)
             .add(WorldPlugin)
             .add(DebugVizPlugin)
             // NOTE (R3.9): the F7 gallery is NOT registered. It was a
