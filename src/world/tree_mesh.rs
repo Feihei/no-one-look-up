@@ -66,6 +66,15 @@ const SPECIES_LEAF: [&str; 3] = ["poplar", "sophora", "willow"];
 pub struct FoliageBake {
     /// The atlas (u0, u1) this species' cards sample.
     pub cell: (f32, f32),
+    /// Card aspect ratio (width / height) of this species' baked leaf mask.
+    ///
+    /// Drives the card quad's own proportions so the leaf texture is not
+    /// stretched into a fixed-shape box. A pinnate or lanceolate leaf is far
+    /// narrower than the broadleaf card the geometry used to assume, so without
+    /// this every species baked into the same ~0.87 (w/h) box and the compound
+    /// leaves collapsed into a solid blob. `leaf_cards` reads it to size the
+    /// quad's short axis; see `LeafProfile::mask_aspect`.
+    pub aspect: f32,
     /// Card-count multiplier. A pinnate crown reads finer with MORE, SMALLER
     /// cards (each compound leaf is one small unit, so the sky is cut into
     /// many more pieces); the simple blades keep the base count.
@@ -82,6 +91,12 @@ fn species_foliage(species: u8) -> FoliageBake {
         .unwrap_or(SPECIES_LEAF[0]);
     let cell =
         crate::world::leaf_shape::species_cell(species, crate::world::leaf_shape::ATLAS_HEIGHT);
+    // The card quad's proportions follow the baked leaf mask, not a fixed box,
+    // so a pinnate or lanceolate leaf keeps its own shape instead of being
+    // smeared into the old 0.87 broadleaf card.
+    let aspect = crate::world::leaf_shape::find_profile(species)
+        .map(|p| p.mask_aspect())
+        .unwrap_or(0.7);
     match species {
         // 槐: many small compound leaves, the finely fragmented silhouette.
         // The street profile grows fewer, larger clusters than the aspen, so
@@ -89,11 +104,13 @@ fn species_foliage(species: u8) -> FoliageBake {
         // silhouette of the three; the reach shrinks to match.
         "sophora" => FoliageBake {
             cell,
+            aspect,
             cards_scale: 2.6,
             reach_scale: 0.62,
         },
         _ => FoliageBake {
             cell,
+            aspect,
             cards_scale: 1.0,
             reach_scale: 1.0,
         },
@@ -406,7 +423,7 @@ pub fn bake_skeleton_lod(
             index,
             cards,
             top,
-            foliage_bake.cell,
+            foliage_bake,
         ));
     }
 
@@ -458,8 +475,8 @@ fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
 ///
 /// Cards are rotated about the vertical axis at even intervals plus a
 /// per-cluster offset, with a slow tilt, so a crown has cards facing every
-/// direction instead of a fan of parallel planes. `cell` is the species'
-/// atlas (u0, u1) the card texture samples (see [`species_foliage`]).
+/// direction instead of a fan of parallel planes. `foliage` carries the
+/// species' atlas (u0, u1) and its baked mask aspect (see [`species_foliage`]).
 fn leaf_cards(
     center: Vec3,
     cluster_radius: f32,
@@ -467,7 +484,7 @@ fn leaf_cards(
     cluster: usize,
     cards: usize,
     top: f32,
-    cell: (f32, f32),
+    foliage: &FoliageBake,
 ) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(cards * 4);
@@ -553,10 +570,18 @@ fn leaf_cards(
         let card_center = center + dir * shell;
 
         // A smaller card than the cluster, so several of them compose a clump.
-        // Slightly taller than wide: a leaf unit (one blade or one pinnate leaf)
-        // is longer than it is wide.
-        let half_w = cluster_radius * CARD_REACH_FRACTION;
-        let half_h = half_w * 1.15;
+        //
+        // Option A (2026-11-05): the card's LONG axis keeps the old size so the
+        // cluster silhouette is unchanged, and the SHORT axis follows the
+        // species' mask aspect. The old code forced every card into a fixed
+        // ~0.87 (w/h) box regardless of the leaf, which stretched the broadleaf
+        // mask but -- far worse -- smeared the narrow pinnate/lanceolate masks
+        // into a solid blob, so every species read as one "big leaf" with no
+        // compound structure and no readable orientation. `aspect` is the
+        // species' baked mask width/height (see `LeafProfile::mask_aspect`),
+        // carried through `FoliageBake`.
+        let half_h = cluster_radius * CARD_REACH_FRACTION * 1.15;
+        let half_w = half_h * foliage.aspect;
         let corners = [
             [-half_w, -half_h],
             [half_w, -half_h],
@@ -578,7 +603,7 @@ fn leaf_cards(
             normals.push(face_axis.to_array());
             // Map the card's unit quad into this species' atlas cell: u is
             // rescaled into (u0, u1), v spans the shared full height.
-            uvs.push([cell.0 + u * (cell.1 - cell.0), v]);
+            uvs.push([foliage.cell.0 + u * (foliage.cell.1 - foliage.cell.0), v]);
             colors.push([sway, 1.0, phase, 1.0]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1056,17 +1081,32 @@ mod tests {
         // The design's whole reason for cards: looking up, the sky must be cut
         // into pieces rather than blocked by a mass. A sphere scores 0 here; the
         // first card version measured under 20% and read as a solid clump.
-        let profile = crate::world::leaf_shape::find_profile("poplar")
-            .copied()
-            .unwrap_or(crate::world::leaf_shape::leaf_profiles()[0]);
-        let mask = crate::world::leaf_shape::bake_leaf_alpha(&profile, 256);
+        //
+        // Measured against EACH species' OWN leaf mask: openness is how much sky
+        // shows through a crown of that species' actual cards, not a poplar
+        // proxy. Using one poplar mask for every species hid real failures -- a
+        // fixed-shape card stretches every leaf into the same blob, so the test
+        // could never tell a pinnate crown from a broadleaf one.
         for species in 0..TREE_PROFILES.len() as u8 {
+            let leaf = SPECIES_LEAF
+                .get(species as usize)
+                .copied()
+                .unwrap_or(SPECIES_LEAF[0]);
+            let profile = crate::world::leaf_shape::find_profile(leaf)
+                .copied()
+                .expect("species has a leaf profile");
+            let mask = crate::world::leaf_shape::bake_leaf_alpha(&profile, 256);
             let parts = bake_tree_mesh(TreeMeshKey {
                 species,
                 variant: 0,
             });
             let openness = xz_openness(&parts, &mask);
             let side = side_openness(&parts, &mask);
+            println!(
+                "species {species} ({leaf}): top-down openness {:.1}%, side {:.1}%",
+                openness * 100.0,
+                side * 100.0
+            );
             assert!(
                 openness > 0.35,
                 "species {species}: only {:.0}% of the crown leaves sky visible; it reads as a solid clump",
