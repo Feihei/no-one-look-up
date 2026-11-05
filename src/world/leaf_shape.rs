@@ -752,6 +752,45 @@ pub fn default_mip_radius(level: u32, mask_width: u32, mask_height: u32) -> u32 
     ((short as f32) * 0.04).round().max(1.0) as u32
 }
 
+/// Dilation radius for the SHARED ATLAS, measured against its narrowest cell
+/// rather than against the whole sheet.
+///
+/// [`default_mip_radius`] sizes the radius from a mask's short side. That is
+/// correct for a standalone bake, where the short side IS the leaf's width,
+/// but the shipped texture packs every species side by side: at 272x256 its
+/// short side is 256, so level 1 asks for a 5 px dilation while the narrowest
+/// cell -- sophora's pinnate leaf -- is just 40 px (20 px at level 1). A 5 px
+/// max filter closes the gaps between the leaflets in one step, and every card
+/// reads as a solid rectangle from level 1 onward.
+///
+/// Scaling the narrowest cell down with each level keeps the radius
+/// proportional to the thing it is protecting. Once that cell is below
+/// [`MIN_SHAPE_WITH`], [`default_mip_radius`] already declines to dilate, which
+/// is the honest LOD behaviour: at that size there is no leaf shape left.
+pub fn atlas_mip_radius(atlas: &AlphaMask) -> impl Fn(u32, u32, u32) -> u32 {
+    let base_width = atlas.width.max(1) as f32;
+    let narrowest_cell = PROFILES
+        .iter()
+        .map(|p| mask_width(p, atlas.height))
+        .min()
+        .unwrap_or(atlas.width)
+        .max(1) as f32;
+    move |level, width, _height| {
+        let cell = (narrowest_cell * width as f32 / base_width)
+            .round()
+            .max(1.0) as u32;
+        if cell < ATLAS_DILATION_CELL_FLOOR {
+            return 0;
+        }
+        default_mip_radius(level, cell, cell)
+    }
+}
+
+/// Narrowest atlas cell that still has room for a 1 px dilation. One texel on
+/// each side of a 10 px cell is already 20% of its width and closes the gaps
+/// between leaflets, so below this the chain stops dilating entirely.
+const ATLAS_DILATION_CELL_FLOOR: u32 = MIN_SHAPE_WITH * 2;
+
 /// Width (px) below which a leaf mask has no useful shape left.
 ///
 /// A leaf silhouette needs a few texels across to show a margin, a rachis or a
@@ -793,7 +832,7 @@ pub fn mask_to_image(mask: &AlphaMask) -> bevy::image::Image {
     };
 
     let levels = image_mip_levels(mask.width.max(mask.height));
-    let chain = build_mip_chain(mask, levels, default_mip_radius);
+    let chain = build_mip_chain(mask, levels, atlas_mip_radius(mask));
 
     let mut data = Vec::with_capacity(
         chain
@@ -1051,6 +1090,79 @@ mod tests {
                 chain[last].visible_fraction(),
                 undilated.visible_fraction()
             );
+        }
+    }
+
+    /// Fraction of one atlas cell that survives the alpha test at a given mip.
+    fn cell_visible_fraction(mask: &AlphaMask, u0: f32, u1: f32) -> f32 {
+        let x0 = (u0 * mask.width as f32).round() as u32;
+        let x1 = ((u1 * mask.width as f32).round() as u32)
+            .max(x0 + 1)
+            .min(mask.width);
+        let cutoff = (ALPHA_CUTOFF * 255.0) as u8;
+        let mut visible = 0usize;
+        let mut total = 0usize;
+        for y in 0..mask.height {
+            for x in x0..x1 {
+                total += 1;
+                if mask.get(x, y) >= cutoff {
+                    visible += 1;
+                }
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            visible as f32 / total as f32
+        }
+    }
+
+    #[test]
+    fn atlas_mips_keep_the_leaf_gaps_open() {
+        // Regression for the TEXTURE THAT ACTUALLY SHIPS. The standalone-bake
+        // tests above use `default_mip_radius` on a single mask (short side =
+        // leaf width). The world instead bakes every species into one atlas,
+        // whose short side is the SHEET height; that made level 1 dilate by
+        // 5 px and close every leaflet gap, turning cards into solid quads.
+        // Assert the shipped chain on the metric the GPU uses: visible_fraction
+        // per cell, since a mean-coverage check cannot see alpha-test discard.
+        let atlas = bake_species_atlas(ATLAS_HEIGHT);
+        let levels = image_mip_levels(atlas.width.max(atlas.height));
+        let chain = build_mip_chain(&atlas, levels, atlas_mip_radius(&atlas));
+
+        for profile in leaf_profiles() {
+            let (u0, u1) = species_cell(profile.species, ATLAS_HEIGHT);
+            let base = cell_visible_fraction(&chain[0], u0, u1);
+            let values: Vec<f32> = chain
+                .iter()
+                .skip(1)
+                .take(4)
+                .map(|m| cell_visible_fraction(m, u0, u1))
+                .collect();
+            println!(
+                "{:>8}: mip0 {:.1}% | mip1..4 {}",
+                profile.species,
+                base * 100.0,
+                values
+                    .iter()
+                    .map(|v| format!("{:.1}%", v * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            );
+            for value in &values {
+                assert!(
+                    *value < 0.70,
+                    "{}: a shipped mip is {:.1}% solid; the leaf gaps were filled in",
+                    profile.species,
+                    value * 100.0
+                );
+                assert!(
+                    *value < base + 0.25,
+                    "{}: a shipped mip grew {:.1} points over mip0; dilation is eating the shape",
+                    profile.species,
+                    (value - base) * 100.0
+                );
+            }
         }
     }
 
