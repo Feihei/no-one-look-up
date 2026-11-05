@@ -164,6 +164,29 @@ fn bay_u(b: usize, bays: usize, l: f32) -> f32 {
     -l * 0.5 + (b as f32 + 0.5) * step
 }
 
+/// A random spot on the roof deck that keeps a `size` prop inside the
+/// footprint with a small margin.
+///
+/// Rooftop clutter used to sit on the building's centreline at a couple of
+/// fixed offsets, so a terrace of same-style apartments repeated the exact
+/// same boxes -- a regular sawtooth silhouette along the skyline instead of
+/// individual rooftops. Spreading the props over the deck, with the size
+/// chosen by the caller, breaks that rhythm.
+fn roof_spot(
+    rng: &mut StdRng,
+    along: bevy::math::Vec2,
+    street: bevy::math::Vec2,
+    l: f32,
+    d: f32,
+    size: Vec3,
+) -> bevy::math::Vec2 {
+    // Stay inside the footprint, and inside the 0.45 * length band the roof
+    // props are allowed to occupy (the same limit the placement test asserts).
+    let u_max = (((l - size.x).max(0.0) * 0.5 - 0.25).max(0.0)).min(l * 0.45);
+    let v_max = (((d - size.z).max(0.0) * 0.5 - 0.25).max(0.0)).min(d * 0.45);
+    along * rng.random_range(-u_max..=u_max) + street * rng.random_range(-v_max..=v_max)
+}
+
 /// Hangs the facade and rooftop props of one building (11.4).
 ///
 /// `street` is the unit vector from the building centre toward the street
@@ -329,39 +352,57 @@ pub fn place_building_props(
                 );
             }
             // 水箱: flat parapet roof, so the tanks stand on the deck.
-            if rng.random::<f32>() < 0.7 {
-                let u = rng.random_range(-l * 0.25..=l * 0.25);
+            //
+            // Density is down from the first pass (always a tank, half of the
+            // time a second one) and the size/spot now vary per building. The
+            // fixed 1.9 m cube on the centreline made a terrace row read as one
+            // repeated sawtooth of boxes rather than as separate rooftops.
+            if rng.random::<f32>() < 0.5 {
+                let size = Vec3::new(
+                    rng.random_range(1.3..=2.2),
+                    rng.random_range(1.4..=2.6),
+                    rng.random_range(1.3..=2.2),
+                );
                 push_prop(
                     plan,
                     PropKind::WaterTank,
-                    building.position + along * u,
+                    building.position + roof_spot(&mut rng, along, street, l, d, size),
                     building.yaw,
-                    Vec3::new(1.9, 2.2, 1.9),
+                    size,
                     h,
                     0,
                 );
-                if rng.random::<f32>() < 0.5 {
-                    let u = rng.random_range(-l * 0.25..=l * 0.25);
+                if rng.random::<f32>() < 0.3 {
+                    let size = Vec3::new(
+                        rng.random_range(1.2..=2.0),
+                        rng.random_range(1.2..=2.4),
+                        rng.random_range(1.2..=2.0),
+                    );
                     push_prop(
                         plan,
                         PropKind::WaterTank,
-                        building.position + along * u,
+                        building.position + roof_spot(&mut rng, along, street, l, d, size),
                         building.yaw,
-                        Vec3::new(1.9, 2.2, 1.9),
+                        size,
                         h,
                         0,
                     );
                 }
             }
-            // Rooftop stair bulkhead.
-            if rng.random::<f32>() < 0.8 {
-                let u = rng.random_range(-l * 0.2..=l * 0.2);
+            // Rooftop stair bulkhead. Size and spot vary, and it appears on
+            // just over half the buildings, so the roofline stops repeating.
+            if rng.random::<f32>() < 0.55 {
+                let size = Vec3::new(
+                    rng.random_range(2.6..=3.8),
+                    rng.random_range(2.2..=2.9),
+                    rng.random_range(2.2..=3.2),
+                );
                 push_prop(
                     plan,
                     PropKind::StairBox,
-                    building.position + along * u,
+                    building.position + roof_spot(&mut rng, along, street, l, d, size),
                     building.yaw,
-                    Vec3::new(4.0, 2.6, 3.0),
+                    size,
                     h,
                     0,
                 );
@@ -821,6 +862,10 @@ mod tests {
         let mut balcony = 0;
         let mut tank = 0;
         let mut stair = 0;
+        // Roof clutter must not repeat one identical box along a terrace row
+        // (that read as a regular sawtooth on the skyline).
+        let mut tank_widths = std::collections::HashSet::new();
+        let mut stair_heights = std::collections::HashSet::new();
         for i in 0..60 {
             for p in props_of(
                 FacadeStyle::Apartment,
@@ -830,8 +875,14 @@ mod tests {
             ) {
                 match p.kind {
                     PlacedKind::Prop(PropKind::Balcony) => balcony += 1,
-                    PlacedKind::Prop(PropKind::WaterTank) => tank += 1,
-                    PlacedKind::Prop(PropKind::StairBox) => stair += 1,
+                    PlacedKind::Prop(PropKind::WaterTank) => {
+                        tank += 1;
+                        tank_widths.insert((p.size.x * 10.0).round() as i32);
+                    }
+                    PlacedKind::Prop(PropKind::StairBox) => {
+                        stair += 1;
+                        stair_heights.insert((p.size.y * 10.0).round() as i32);
+                    }
                     _ => {}
                 }
             }
@@ -839,6 +890,16 @@ mod tests {
         assert!(balcony > 100, "apartments need balcony rows, got {balcony}");
         assert!(tank >= 25, "apartments need roof tanks, got {tank}");
         assert!(stair >= 30, "apartments need stair bulkheads, got {stair}");
+        assert!(
+            tank_widths.len() >= 4,
+            "roof tanks repeat {} sizes across buildings",
+            tank_widths.len()
+        );
+        assert!(
+            stair_heights.len() >= 3,
+            "stair bulkheads repeat {} heights across buildings",
+            stair_heights.len()
+        );
 
         // Old city never grows apartment clutter: gable roofs have no deck.
         for i in 0..40 {
