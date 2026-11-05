@@ -70,6 +70,8 @@ pub enum PropKind {
     LampArm,
     /// The lamp head at the arm's end -- the one emissive prop in the city.
     LampHead,
+    /// 电线杆横担: the crossarm at the pole top the wires meet.
+    CrossArm,
     /// One catenary wire span between two consecutive poles.
     Wire,
 }
@@ -101,6 +103,24 @@ pub const POLE_SPACING: f32 = 30.0;
 /// Wire attachment heights on the pole (m), stacked the way concrete poles
 /// carry a three-wire run.
 pub const WIRE_HEIGHTS: [f32; 3] = [5.6, 6.1, 6.6];
+
+/// Height of the crossarm beam (m): exactly at the top wire, so the run meets
+/// the arm rather than floating above it.
+pub const CROSSARM_MOUNT: f32 = 6.6;
+
+/// Half-length of the crossarm (m). 1.6 m end to end reads as a real pole top
+/// at street distance while staying shorter than the pole spacing.
+pub const CROSSARM_HALF: f32 = 0.8;
+
+/// Largest yaw deviation of a crossarm from square-across-the-street (rad).
+///
+/// Real pole tops are never perfectly aligned: each crossarm is set slightly
+/// askew. A jitter stays small enough that the three wire runs still read as
+/// one line from the street, but neighbouring poles no longer look stamped
+/// from the same mould. The design note says "绕 Z 轴" because the original
+/// Godot project is Z-up; in Bevy's Y-up world the vertical axis is Y, so this
+/// is a `Quat::from_rotation_y` yaw.
+pub const CROSSARM_YAW_JITTER: f32 = 0.17;
 
 /// Lamp bracket mount height below the pole top (m).
 pub const LAMP_MOUNT: f32 = 7.5;
@@ -514,8 +534,21 @@ pub fn place_street_furniture(
                 0,
             );
         }
+        // 横担: the crossarm the wire run meets. Square across the street by
+        // default (the wires run along it), with a small per-pole yaw so a
+        // street of poles does not read as stamped copies.
+        let crossarm_yaw =
+            edge_yaw(edge_normal) + rng.random_range(-CROSSARM_YAW_JITTER..=CROSSARM_YAW_JITTER);
+        push_prop(
+            plan,
+            PropKind::CrossArm,
+            position,
+            crossarm_yaw,
+            Vec3::ONE,
+            CROSSARM_MOUNT,
+            0,
+        );
     }
-
     // Wire spans between consecutive poles, three stacked heights each.
     // Each span starts at the earlier pole and scales to the actual gap;
     // the yaw aims local +x along the street.
@@ -613,6 +646,28 @@ pub fn bake_balcony() -> Mesh {
     push_box(&mut buf, [-hw, 0.0, 0.93], [hw, RAIL_H, 1.0]);
     push_box(&mut buf, [-hw, 0.0, 0.0], [-hw + 0.06, RAIL_H, 0.93]);
     push_box(&mut buf, [hw - 0.06, 0.0, 0.0], [hw, RAIL_H, 0.93]);
+    buf.build()
+}
+
+/// The crossarm: a horizontal beam across the pole top with two insulator
+/// pegs where the wire run sits, plus a clamp around the pole. Baked at real
+/// size with the beam centre at the origin, because the arm's proportions
+/// (beam to peg to clamp) do not survive scaling.
+pub fn bake_crossarm() -> Mesh {
+    let h = CROSSARM_HALF;
+    let mut buf = MeshBuf::new();
+    // Beam, slightly wider than deep so it reads as a timber/steel arm.
+    push_box(&mut buf, [-h, -0.055, -0.065], [h, 0.055, 0.065]);
+    // Insulator pegs: where a third wire would sit either side of the pole.
+    for x in [-h * 0.72, h * 0.72] {
+        push_box(
+            &mut buf,
+            [x - 0.045, 0.055, -0.045],
+            [x + 0.045, 0.20, 0.045],
+        );
+    }
+    // Clamp: the collar that holds the arm against the pole.
+    push_box(&mut buf, [-0.10, -0.20, -0.10], [0.10, 0.055, 0.10]);
     buf.build()
 }
 
@@ -1148,6 +1203,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_pole_carries_a_crossarm_at_the_wire_height() {
+        let objects = furniture(0, 120.0);
+        let poles = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Pole)))
+            .count();
+        let arms: Vec<&PlacedObject> = objects
+            .iter()
+            .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::CrossArm)))
+            .collect();
+        assert_eq!(arms.len(), poles, "one crossarm per pole");
+
+        // The run is along +x here, so a crossarm is square across it (local
+        // +x maps to the +y normal, `edge_yaw(0,1)`), give or take the
+        // per-pole jitter.
+        let square = edge_yaw(bevy::math::Vec2::new(0.0, 1.0));
+        let mut yaws = std::collections::HashSet::new();
+        for arm in &arms {
+            assert!(
+                (arm.base - CROSSARM_MOUNT).abs() < 1e-6,
+                "crossarm at {} m, expected {CROSSARM_MOUNT}",
+                arm.base
+            );
+            let jitter = arm.yaw - square;
+            assert!(
+                jitter.abs() <= CROSSARM_YAW_JITTER + 1e-5,
+                "crossarm yaw {jitter} rad exceeds the {CROSSARM_YAW_JITTER} rad jitter"
+            );
+            yaws.insert((arm.yaw * 1000.0).round() as i32);
+        }
+        // A stamped line of identical arms is exactly what the jitter is
+        // there to break, so neighbouring poles must differ.
+        assert!(
+            yaws.len() >= 3,
+            "crossarms share only {} distinct yaws across {poles} poles",
+            yaws.len()
+        );
     }
 
     #[test]

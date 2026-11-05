@@ -382,6 +382,8 @@ pub(crate) struct PropAssets {
     lamp_arm: Handle<Mesh>,
     /// The glowing lamp head in the bracket (real size).
     lamp_head: Handle<Mesh>,
+    /// The pole-top crossarm the wires meet (real size, beam along local +x).
+    crossarm: Handle<Mesh>,
     /// The unit catenary wire, x from 0 to 1.
     wire: Handle<Mesh>,
     /// Street-lamp head: the one emissive material in the world. The lamps
@@ -445,6 +447,7 @@ fn build_prop_assets(
         balcony: meshes.add(crate::world::props::bake_balcony()),
         lamp_arm: meshes.add(crate::world::props::bake_lamp_arm()),
         lamp_head: meshes.add(crate::world::props::bake_lamp_head()),
+        crossarm: meshes.add(crate::world::props::bake_crossarm()),
         wire: meshes.add(crate::world::props::bake_wire()),
         lamp_glow,
         wire_dark: matte([0.05, 0.05, 0.06], 1.0),
@@ -897,6 +900,13 @@ fn spawn_prop(
             "LampHead",
             props.lamp_head.clone(),
             props.lamp_glow.clone(),
+            object.base,
+            object.size,
+        ),
+        PropKind::CrossArm => (
+            "CrossArm",
+            props.crossarm.clone(),
+            props.fixture(0),
             object.base,
             object.size,
         ),

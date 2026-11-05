@@ -41,6 +41,7 @@ fn main() {
                             PropKind::Pole => "prop/pole",
                             PropKind::LampArm => "prop/lamp_arm",
                             PropKind::LampHead => "prop/lamp_head",
+                            PropKind::CrossArm => "prop/crossarm",
                             PropKind::Wire => "prop/wire",
                         },
                     };

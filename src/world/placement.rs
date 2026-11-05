@@ -1015,7 +1015,11 @@ mod tests {
                     // `streets_carry_poles_at_the_curb` owns that check.
                     if matches!(
                         kind,
-                        PropKind::Pole | PropKind::LampArm | PropKind::LampHead | PropKind::Wire
+                        PropKind::Pole
+                            | PropKind::LampArm
+                            | PropKind::LampHead
+                            | PropKind::CrossArm
+                            | PropKind::Wire
                     ) {
                         continue;
                     }
