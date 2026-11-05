@@ -101,12 +101,15 @@ fn species_foliage(species: u8) -> FoliageBake {
         // 槐: many small compound leaves, the finely fragmented silhouette.
         // The street profile grows fewer, larger clusters than the aspen, so
         // the card count more than doubles to keep the locust the finest
-        // silhouette of the three; the reach shrinks to match.
+        // silhouette of the three. The reach stays close to the base size:
+        // shrinking it with the card size left the crown visibly thinner than
+        // the aspen's, so the extra cards now buy density instead of only
+        // fragmentation.
         "sophora" => FoliageBake {
             cell,
             aspect,
             cards_scale: 2.6,
-            reach_scale: 0.62,
+            reach_scale: 0.80,
         },
         _ => FoliageBake {
             cell,
@@ -139,8 +142,18 @@ const FAR_CARDS_PER_CLUSTER: usize = 6;
 /// A card's half-extent as a fraction of the cluster radius.
 ///
 /// Small enough that several cards overlap to form one cluster, large enough
-/// that a leaf unit is still legible at a few metres.
-const CARD_REACH_FRACTION: f32 = 0.26;
+/// that a leaf unit is still legible at a few metres. Raised from 0.26 when the
+/// cards started growing out of the branch: a shell of cards filled the cluster
+/// with their CENTRES, so each card only had to be small; radial cards only fill
+/// it along their own length.
+const CARD_REACH_FRACTION: f32 = 0.30;
+/// Radius of the small ball around a cluster's branch point that petioles may
+/// attach within, as a fraction of the cluster radius.
+///
+/// A twig is a short line, not a mathematical point, so leaves hang off a
+/// stretch of it. Keeping the ball this small keeps every petiole visually on
+/// the branch while letting cards fill the inner volume instead of a shell.
+const ATTACH_FRACTION: f32 = 0.28;
 /// Branches thinner than this (m) are dropped from the bake: at any walking
 /// distance they are sub-pixel, and the finest twigs are ~40% of all parts.
 const MIN_BAKED_RADIUS: f32 = 0.035;
@@ -560,15 +573,6 @@ fn leaf_cards(
         };
         let face_axis = right.cross(grow).normalize();
 
-        // Cards sit on a SHELL, not throughout the volume: cards near the middle
-        // are hidden by the cards in front of them, so they cost triangles
-        // without ever showing. Foliage grows outside-in for the same reason,
-        // so the middle stays open and a sightline reads leaf-gap-leaf.
-        let dir = (face_axis + up * 0.35).normalize_or_zero();
-        let dir = if dir.length_squared() < 1e-6 { up } else { dir };
-        let shell = cluster_radius * (0.72 + 0.28 * next_unit());
-        let card_center = center + dir * shell;
-
         // A smaller card than the cluster, so several of them compose a clump.
         //
         // Option A (2026-11-05): the card's LONG axis keeps the old size so the
@@ -582,6 +586,34 @@ fn leaf_cards(
         // carried through `FoliageBake`.
         let half_h = cluster_radius * CARD_REACH_FRACTION * 1.15;
         let half_w = half_h * foliage.aspect;
+
+        // Anchor the card's PETIOLE edge on the twig and let it grow outward.
+        //
+        // The old bake pushed the card CENTRE out along a shell of 0.72-1.0
+        // cluster radii, and `dir` was mostly the card's plane normal, not the
+        // growth direction. The petiole edge therefore sat up to a full radius
+        // away from the branch and the clump baked into a hollow ring: a
+        // close-up showed a green wreath with the twig hanging in the empty
+        // middle.
+        //
+        // The attach point is drawn from a small ball around `center` rather
+        // than `center` itself. A twig is a short line, and leaves hang off a
+        // stretch of it; pinning every petiole to one coordinate made a
+        // pinpoint starburst that no longer looked like foliage on a branch.
+        // 0.28 cluster radii is close enough to read as "on the twig" while
+        // still filling the clump's interior.
+        let (u, v) = (next_unit(), next_unit());
+        let cos_theta = u * 2.0 - 1.0;
+        let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
+        let phi = v * std::f32::consts::TAU;
+        let attach_dir = Vec3::new(sin_theta * phi.cos(), cos_theta, sin_theta * phi.sin());
+        // sqrt biases the radius inwards: most petioles hug the twig, a few sit
+        // at the outer edge of the ball.
+        let attach = cluster_radius * ATTACH_FRACTION * next_unit().sqrt();
+        // A little sideways spread, capped below the card's own half-width so
+        // the petiole edge still crosses the attach point.
+        let lateral = (next_unit() * 2.0 - 1.0) * half_w * 0.35;
+        let card_center = center + attach_dir * attach + right * lateral + grow * half_h;
         let corners = [
             [-half_w, -half_h],
             [half_w, -half_h],
@@ -896,6 +928,79 @@ mod tests {
                     assert!(
                         along > 0.0,
                         "species {species}: a card points its tip back at the branch (dot {along:.3})"
+                    );
+                    checked += 1;
+                }
+                cursor += cards * 4;
+            }
+            assert!(
+                checked > 50,
+                "species {species}: only {checked} cards were checked"
+            );
+        }
+    }
+
+    #[test]
+    fn every_card_grows_out_of_its_branch_attachment_point() {
+        // Regression (2026-11-05): cards used to sit on a shell of 0.72-1.0
+        // cluster radii, displaced sideways along the card's plane normal, so a
+        // close-up showed a hollow green ring with the twig alone in the empty
+        // middle -- "the leaves do not touch the branch". The petiole edge now
+        // anchors at the cluster centre (the point on the twig the cluster
+        // hangs from), so every petiole must stay within a small fraction of
+        // the cluster radius of it.
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let skeleton = crate::world::tree_shape::grow_tree(
+                crate::world::tree_shape::TREE_SHAPE_SEED,
+                species,
+                0,
+            );
+            let profile = TREE_PROFILES[species as usize];
+            let parts = bake_skeleton(&skeleton, &profile, species);
+            let positions = positions(&parts.leaves);
+            let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+                bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+                other => panic!("unexpected uv layout: {other:?}"),
+            };
+
+            let foliage = species_foliage(species);
+            let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
+                as usize)
+                .max(1);
+            let mut cursor = 0usize;
+            let mut checked = 0usize;
+            for cluster in &skeleton.foliage {
+                if cursor + cards * 4 > positions.len() {
+                    break;
+                }
+                let center = Vec3::from_array(cluster.center);
+                // Near tier: blob stride 1, no radius cull, blob scale 1.
+                let radius = (cluster.radius * foliage.reach_scale).max(0.05);
+                for card in 0..cards {
+                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
+                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
+                    let mut petiole = Vec3::ZERO;
+                    let mut n = 0u32;
+                    for (uv, p) in quad.iter().zip(pos.iter()) {
+                        if uv[1] > 0.5 {
+                            petiole += Vec3::from_array(*p);
+                            n += 1;
+                        }
+                    }
+                    if n == 0 {
+                        continue;
+                    }
+                    let petiole = petiole / n as f32;
+                    let distance = petiole.distance(center);
+                    // Upper bound: the attach ball (0.28) plus the lateral
+                    // spread of the petiole edge (0.35 of a half-width, itself
+                    // 0.30 * 1.15 of the cluster radius) -- about 0.38r for the
+                    // widest mask. Still far below the 0.72-1.0 shell the cards
+                    // used to sit on.
+                    assert!(
+                        distance <= radius * 0.40,
+                        "species {species}: a petiole sits {:.2} cluster radii from the branch",
+                        distance / radius
                     );
                     checked += 1;
                 }
