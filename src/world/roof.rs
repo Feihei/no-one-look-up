@@ -189,9 +189,8 @@ fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 /// 4-6 m shophouse, which is the eave the style calls for.
 pub fn bake_gable() -> Mesh {
     let (x0, x1) = (-0.5, 0.5);
-    let (z_wall, z_eave) = (0.5, 0.56);
+    let z_eave = 0.56;
     let mut buf = MeshBuf::new();
-
     // Slopes. The ridge runs along x at z = 0; each slope drains to one eave.
     buf.quad(
         [x0, 0.0, z_eave],
@@ -205,10 +204,13 @@ pub fn bake_gable() -> Mesh {
         [x0, 1.0, 0.0],
         [x1, 1.0, 0.0],
     );
-    // 山墙: the gable-end walls, flush with the building footprint (the eave
-    // overhangs but the wall below is at ±z_wall, so the triangle stops there).
-    buf.tri([x1, 0.0, z_wall], [x1, 0.0, -z_wall], [x1, 1.0, 0.0]);
-    buf.tri([x0, 0.0, -z_wall], [x0, 0.0, z_wall], [x0, 1.0, 0.0]);
+    // 山墙: the gable-end walls. They run all the way to the EAVE, not just to
+    // the wall line: the slope's edge ends at z = ±z_eave, so capping at
+    // z_wall left a thin triangular slit of sky between the roof plane and the
+    // gable wall at each end (visible as a bright wedge from the side street).
+    // Reaching the eave closes it and reads as a rake board.
+    buf.tri([x1, 0.0, z_eave], [x1, 0.0, -z_eave], [x1, 1.0, 0.0]);
+    buf.tri([x0, 0.0, -z_eave], [x0, 0.0, z_eave], [x0, 1.0, 0.0]);
 
     buf.build()
 }
@@ -263,7 +265,7 @@ mod tests {
                 .unwrap();
 
             #[allow(clippy::chunks_exact_to_as_chunks)] // Indices is an enum, not a slice
-            for tri in indices.chunks_exact(3) {
+            for tri in indices.as_chunks::<3>().0 {
                 let (a, b, c) = (
                     positions[tri[0] as usize],
                     positions[tri[1] as usize],
@@ -314,6 +316,49 @@ mod tests {
         );
         assert!((extremes.0 - -0.56).abs() < 1e-5, "eave {extremes:?}");
         assert!((extremes.1 - 0.56).abs() < 1e-5, "eave {extremes:?}");
+    }
+
+    /// The gable-end caps must span the slope's full width. The slope edges run
+    /// out to the eave (|z| = 0.56) while the wall below is only 0.5 wide; a cap
+    /// built to the wall line leaves a thin triangular slit of sky between roof
+    /// and gable at each end, which reads as a hole in the skyline.
+    #[test]
+    fn gable_end_caps_reach_the_eave() {
+        let mesh = bake_gable();
+        let positions: Vec<[f32; 3]> = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap()
+            .to_vec();
+        let indices = match mesh.indices().expect("indices") {
+            Indices::U32(i) => i.clone(),
+            Indices::U16(i) => i.iter().map(|&v| v as u32).collect(),
+        };
+        let mut caps = 0;
+        for tri in indices.as_chunks::<3>().0 {
+            let pts = [
+                positions[tri[0] as usize],
+                positions[tri[1] as usize],
+                positions[tri[2] as usize],
+            ];
+            // A cap is the only triangle whose three vertices share one x end.
+            let at_x_end = pts.iter().all(|p| (p[0] - 0.5).abs() < 1e-6)
+                || pts.iter().all(|p| (p[0] + 0.5).abs() < 1e-6);
+            if !at_x_end {
+                continue;
+            }
+            caps += 1;
+            let base: Vec<_> = pts.iter().filter(|p| p[1].abs() < 1e-6).collect();
+            assert_eq!(base.len(), 2, "end cap is not a wall tri: {pts:?}");
+            for p in base {
+                assert!(
+                    (p[2].abs() - 0.56).abs() < 1e-5,
+                    "gable end cap stops short of the eave: {p:?}"
+                );
+            }
+        }
+        assert_eq!(caps, 2, "gable has {caps} end caps, expected one per end");
     }
 
     /// Teeth repeat along the frontage and tile it exactly: the count is the

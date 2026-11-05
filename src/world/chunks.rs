@@ -781,7 +781,12 @@ fn spawn_roof(
             let (count, width) = profile.teeth(l);
             for i in 0..count {
                 let lx = -l * 0.5 + (i as f32 + 0.5) * width;
-                let offset = yaw * Vec3::new(lx, rise * 0.5, 0.0);
+                // The unit tooth's base is at y = 0, so it sits directly on the
+                // wall top. The old code also lifted it by `rise * 0.5` as if
+                // the mesh were centre-origin, which floated the whole sawtooth
+                // half a rise above the wall and left a band of sky between the
+                // two -- the roof's "gap to the sky".
+                let offset = yaw * Vec3::new(lx, 0.0, 0.0);
                 parent.spawn((
                     Name::new("RoofTooth"),
                     Mesh3d(roof.tooth.clone()),
