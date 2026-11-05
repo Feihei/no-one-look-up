@@ -13,7 +13,7 @@ license = "MIT OR Apache-2.0"
 exclude = ["vendor/bevy_elements"]
 
 [dependencies]
-bevy = { version = "=0.20.0", features = ["serialize"] }
+bevy = { version = "=0.20.1", features = ["serialize"] }
 bevy_elements = "0.6.0"
 rand = "0.9"
 rand_chacha = "0.9"

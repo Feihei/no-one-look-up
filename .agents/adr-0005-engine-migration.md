@@ -50,7 +50,7 @@
 
 ### 5. 版本与生态策略
 
-- 精确锁定 `bevy = "=0.20.0"`、`bevy_elements = "0.5.3"`（详见根 AGENTS.md）
+- 精确锁定 `bevy = "=0.20.1"`（补丁位，2026-11-05 由 0.20.0 升级）、`bevy_elements = "0.5.3"`（详见根 AGENTS.md）
 - Bevy 0.20 淘汰自研 WGSL 方言、改用 WESL：本项目自写 shader 一律 `.wesl`；不使用带 `#import` 的旧 `.wgsl` 教程代码
 - 引擎升级只作为独立里程碑：先核对 bevy_elements 是否跟进新版 Bevy，再做迁移
 

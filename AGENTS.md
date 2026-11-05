@@ -11,7 +11,7 @@
 | 项目 | 值 |
 |------|-----|
 | 名称 | `heads_up`（Rust workspace 名建议 `heads_up_bevy`） |
-| 引擎 | **Bevy 0.20.0**（crates.io，2026-10-08 发布；最低 Rust 1.97.1） |
+| 引擎 | **Bevy 0.20.1**（crates.io，2026-10-28 补丁发布；最低 Rust 1.97.1） |
 | 天气/天空插件 | **bevy_elements 0.6.0**（vendored + 3 个云 shader 补丁，见 `vendor/bevy_elements/PATCHES.md`）。bevy_flora 0.46 试装已结束（结论：自研树为准，依赖已移除，见 dev-plan R0.6） |
 | 语言 | Rust（edition 2024），所有代码 |
 | 目标平台 | PC（Windows 优先，兼顾跨平台） |
@@ -23,7 +23,7 @@
 
 ```toml
 [dependencies]
-bevy = "=0.20.0"
+bevy = "=0.20.1"
 bevy_elements = "0.6.0"   # vendored（含 3 个云 shader 补丁，升级必须重合并，见 PATCHES.md）
 # bevy_flora 0.46 试装已结束：自研树为准，依赖已移除（结论见 .agents/dev-plan.md R0.6）
 rand_chacha = "0.9"       # 确定性 seed 生成
@@ -32,6 +32,7 @@ serde_json = "1"
 ```
 
 - 动手前先 `cargo add` 试拉一遍依赖并 `cargo check`，确认 bevy_elements 0.5.3 的 Bevy 依赖确为 0.20。
+- **补丁位升级（0.20.0 → 0.20.1）不算里程碑**：只改 `Cargo.toml` 的精确版本 + `cargo update -p bevy --precise 0.20.1`（实测只动 bevy 家族 59 个包 + ruzstd，45 个无关依赖不动；裸 `cargo update` 会顺带升 icu/tokio/wasm-bindgen 等几十个，禁止）。小版本（0.20 → 0.21）升级才走独立里程碑流程。
 - bevy_elements 自述为 "vibe coded"（AI 辅助编写、有测试覆盖、无逐行人工审计），**引入前 Agent 须先读其源码**，尤其是 Cloud/Fog/Celestial 模块；把它当依赖而非黑盒。
 
 ## 文档索引

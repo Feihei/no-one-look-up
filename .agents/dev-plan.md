@@ -17,6 +17,7 @@
 - [x] 0.3 阅读并记录 bevy_elements 的 Cloud/Celestial/Fog/Climate 模块源码要点（无人工审计 crate，先读再信）
 - [x] 0.4 项目脚手架：Plugin 结构（SkyPlugin / WorldPlugin / SeasonPlugin / SavePlugin / MenuPlugin）、`Result` 错误处理约定、CI 工作流（fmt/clippy/test 门）
 - [x] 0.5 树资产链路验证：aspen_1 等 5 种树从 .blend 导出 glTF，Bevy 加载正常（⚠️ 原项目仅 3 种非备份树 .blend：aspen_1/tree_2/tree_3，已导出并通过 headless 加载测试；第 4/5 种树待 Feihei 提供 .blend）
+- [x] 0.6 补丁升级 bevy 0.20.0 → 0.20.1（2026-11-05）：`cargo update -p bevy --precise 0.20.1`，只动 59 个 bevy 包 + ruzstd，45 个无关依赖不变。收益两条都对我们有效——① #25336 雾体积在相机贴近/进入近平面距离时被斜切或消失（R1 的 `VolumetricFog` 常开，黄昏雾霭会吃到）；② #25419 实体索引复用后祖先链遍历跳过活实体、导致 transform 不更新（R2 chunk 流式高频 despawn 的潜伏雷）。clippy（`--all-targets -D warnings`）/ lib test 204 项 / assets_load / `sky_screenshot --ignored` 全绿
 
 ### 边界方案（2026-10-21 用户决策，偏离原版）
 
