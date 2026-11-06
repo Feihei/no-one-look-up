@@ -37,7 +37,7 @@
 **目标**：用 Bevy 0.20 Atmosphere + bevy_elements 复现原 M1 的黄昏氛围。
 
 - [x] 1.1 集成 bevy_elements：`ElementsCamera` + Atmosphere/EnvironmentMapLight/DepthPrepass/VolumetricFog/Exposure 自动挂接
-- [x] 1.2 编写 `HeadsUpSky` Resource：时间锁定 17:30（`WorldClock` time_scale=0 + paused）、天气锁定晴朗（`WeatherDirector::force(WeatherPreset::Clear, Duration::ZERO)`）、黄昏参数接口（cloud_cover/cloud_layer 覆盖 + 曝光基准；星星可见度为保留接口——星场内置于 CelestialPlugin 无公开 API，黄金时刻被亮天空掩盖属预期）
+- [x] 1.2 编写 `DuskSky` Resource：时间锁定 17:30（`WorldClock` time_scale=0 + paused）、天气锁定晴朗（`WeatherDirector::force(WeatherPreset::Clear, Duration::ZERO)`）、黄昏参数接口（cloud_cover/cloud_layer 覆盖 + 曝光基准；星星可见度为保留接口——星场内置于 CelestialPlugin 无公开 API，黄金时刻被亮天空掩盖属预期）
 - [x] 1.3 配置黄昏色调：物理散射 + `Exposure { ev100: 13.0 }` + ACES + Bloom（intensity 0.3）；选定 date=2026-03-21 + lon=125.0 → 17:30 太阳 3.5°/月亮 36°；实测：太阳盘+光晕+暖地平线带+云剪影暖镶边+冷蓝顶渐变（橙红饱和度/天顶紫调待 Feihei 人眼迭代，估 60%）
 - [x] 1.4 裁剪 bevy_elements 未用模块（Wind/Precipitation/Lightning/Dust/Terrain/Hydrology/Water/GroundCover/Weathered 共 9 个 disable，保留 Climate/Celestial/Fog/Cloud）
 - [x] 1.5 天空动态变化：世界坐标噪声（sum-of-sines，确定性）驱动 exposure 微扰 ±0.15 ev100；ScatteringMedium 密度乘子受 GPU LUT 资产限制（每帧重建不可行），记录在笔记中
@@ -155,7 +155,7 @@
     - 新增 `procedural_trees_stream_with_their_chunks`：断言树在出生点生成、每棵只有 1 个 `Mesh3d`、网格非空、**传送到 300 m 外后树跟着走且没有一棵留在原地或脱离 chunk root**。已验证**把“树挂到 chunk root 外”的 bug 放回去该测试即失败**（报 184 trees not attached）
   - **第五轮（2026-10-27，Feihei 反馈：仍需按两次 F7 才加载新区域的树；并清理临时文件）**：
     - **真实原因：Feihei 看到的一直是 F7 画廊，不是世界里的树**。实测确认 chunk 树一直正常流式（走 100 m 后 chunk 范围 4..11 → 6..14，树 191 → 230）；而画廊是固定快照，走出范围就空、按两次才会在新位置重建——现象完全吻合
-    - **处置：F7 画廊从 `HeadsUpPlugins` 注销**。它已完成使命（形态定稿），世界树由 chunk 提供；模块保留作为 `examples/tree_gallery.rs` 的形态参照
+    - **处置：F7 画廊从 `GamePlugins` 注销**。它已完成使命（形态定稿），世界树由 chunk 提供；模块保留作为 `examples/tree_gallery.rs` 的形态参照
     - **顺带修掉两个每帧泄漏（严重）**：
       1. `build_placement_assets` **没有 guard，每帧重跑**——每帧重烘 12 个树 mesh、重建全部建筑材质、替换 `PlacementAssets` 资源。实测 240 帧：mesh 13 → 3242、材质 15 → 3411。加 `existing.is_some()` 早退后稳定在 64/65
       2. `spawn_chunk_content` **每个建筑都 `meshes.add(Cuboid)`**——改为共享单位立方体 + 每实例缩放，`spawn_chunk_content` 不再需要 `Assets<Mesh>`
@@ -358,7 +358,7 @@ R3.11 落地时暴露的三个耦合缺陷，作为一个任务整体修复。�
 **目标**：云端与黄昏调参是迭代过程，参数互相影响（cover 改变云类型、湿度再改一次、曝光决定你能看到多少），改一次编译一次太慢。
 
 - [x] `plugins/sky_panel.rs`：F5 开关，Up/Down 选行，Left/Right 调值（长按连续）
-- [x] `HeadsUpSky` 扩展可调参数：`relative_humidity` / `storminess` / `wind_speed_ms` / `bloom_intensity`，与已有 `cloud_cover` / `cloud_layer` / `exposure_ev100` / `exposure_noise_amplitude` 凑成 9 行
+- [x] `DuskSky` 扩展可调参数：`relative_humidity` / `storminess` / `wind_speed_ms` / `bloom_intensity`，与已有 `cloud_cover` / `cloud_layer` / `exposure_ev100` / `exposure_noise_amplitude` 凑成 9 行
 - [x] `apply_weather_overrides` 取代原 `apply_cloud_cover_override`：湿度/风暴/风速**始终生效**（只影响云的类型），cover 仍可保持 preset
 - [x] `apply_bloom_intensity`：面板改 bloom 下一帧生效
 - [x] 参数表用 `get`/`set` 闭包描述，新增参数只加一行；范围与步进各自声明，统一钳制

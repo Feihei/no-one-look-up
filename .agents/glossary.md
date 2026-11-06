@@ -37,7 +37,7 @@
 | **ElementsCamera** | bevy_elements 的相机标记组件，自动挂接 AtmosphereSettings/IBL/DepthPrepass/VolumetricFog/Exposure |
 | **WorldClock** | bevy_elements 的世界时间组件（本地日期+小时+time_scale），本项目锁定 17:30 黄昏（time_scale=0） |
 | **WeatherDirector** | bevy_elements 的天气强制/释放接口，本项目用于锁定晴朗低云量 |
-| **HeadsUpSky** | 自写 Resource，封装黄昏参数接口（云密度/星星可见度/月亮形态/时间与天气锁定） |
+| **DuskSky** | 自写 Resource，封装黄昏参数接口（云密度/星星可见度/月亮形态/时间与天气锁定） |
 | **MaterialExtension** | Bevy 的材质扩展 trait，树的顶点色摆动（WESL 顶点着色器）与季节全局参数由此实现 |
 | **共享 storage buffer** | 替代 Godot global_shader_uniform 的机制：一个 storage buffer 承载季节全局参数，所有树着色器直接读取，切换零开销 |
 | **WESL** | WGSL 标准化扩展，Bevy 0.20 起的着色器语言；自写 shader 一律 `.wesl` |
@@ -49,7 +49,7 @@
 
 | Godot 版概念 | Bevy 版对应 |
 |--------------|-------------|
-| sky-3D 插件 + HeadsUpSky 管理器 | Atmosphere + bevy_elements + HeadsUpSky Resource |
+| sky-3D 插件 + DuskSky 管理器 | Atmosphere + bevy_elements + DuskSky Resource |
 | global_shader_uniform + RenderingServer | 共享 storage buffer |
 | StaticBody3D + ConvexPolygonShape3D | 自研运动学控制器 + 凸棱柱数学 |
 | signal | Message / Observer |

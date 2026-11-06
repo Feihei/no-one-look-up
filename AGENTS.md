@@ -1,6 +1,6 @@
 # Agents 开发指南（Bevy 迁移版）
 
-> 本文档供自动化 Agent 开发 Heads-Up 的 Bevy 版本时使用。所有设计决策见 `.agents/` 下的 ADR 文档，本文仅提供工程引导和关键约束。
+> 本文档供自动化 Agent 开发《No One Looks Up Even Alone》（简称 No One）的 Bevy 版本时使用。所有设计决策见 `.agents/` 下的 ADR 文档，本文仅提供工程引导和关键约束。
 >
 > 本项目是 Godot 4.7 项目（`E:\play\Godot\heads_up`）向 Rust/Bevy 的迁移。原项目的 ADR 设计要点被最大化保留，仅做引擎映射层面改写——映射关系见 `.agents/adr-0005-engine-migration.md`。
 
@@ -10,7 +10,8 @@
 
 | 项目 | 值 |
 |------|-----|
-| 名称 | `heads_up`（Rust workspace 名建议 `heads_up_bevy`） |
+| 名称 | 中文《即使独自漫步你也很少看天》／英文 `No One Looks Up Even Alone`（简称 **No One**）；Godot 原作目录名仍为 `heads_up` |
+| Rust 包名 | `no_one_looks_up`（snake_case，Cargo 要求） |
 | 引擎 | **Bevy 0.20.1**（crates.io，2026-10-28 补丁发布；最低 Rust 1.97.1） |
 | 天气/天空插件 | **bevy_elements 0.6.0**（vendored + 3 个云 shader 补丁，见 `vendor/bevy_elements/PATCHES.md`）。bevy_flora 0.46 试装已结束（结论：自研树为准，依赖已移除，见 dev-plan R0.6） |
 | 语言 | Rust（edition 2024），所有代码 |
@@ -60,7 +61,7 @@ serde_json = "1"
 | foliage.gdshader 顶点色摆动 | `MaterialExtension` 顶点着色器（WESL），保留顶点色 R 通道控制摆动强度的艺术接口 |
 | StaticBody3D + ConvexPolygonShape3D 碰撞 | 自研运动学控制器 + 半平面裁剪数学（见 adr-0005 决策），不引入物理引擎 |
 | CanvasLayer 菜单 UI | Bevy UI（0.20 已有 em/rem 单位与 Feathers widget 可选） |
-| sky-3D + HeadsUpSky 管理器 | bevy_elements（Atmosphere/Celestial/Cloud）+ 自写 `HeadsUpSky` Resource 封装 |
+| sky-3D + DuskSky 管理器 | bevy_elements（Atmosphere/Celestial/Cloud）+ 自写 `DuskSky` Resource 封装 |
 | BoxMesh 建筑占位 | glTF（Blender 导出）+ `StandardMaterial`/`MaterialExtension` 程序化做旧材质 |
 | Chunk spawn/despawn | Bevy entity spawn/despawn + `despawn_all`（0.20 批量性能已优化） |
 
@@ -117,7 +118,7 @@ serde_json = "1"
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | R0 | 项目骨架 + 依赖锁定 + 版本验证 | 完成（2026-10-20，R0.5 树资产仅 3/5 种，其余待 .blend） |
-| R1 | 天空系统迁移（Atmosphere + bevy_elements + HeadsUpSky） | 完成（2026-10-20；黄昏渐变饱和度待人眼迭代） |
+| R1 | 天空系统迁移（Atmosphere + bevy_elements + DuskSky） | 完成（2026-10-20；黄昏渐变饱和度待人眼迭代） |
 | R2 | 布局图/WorldGrid + Chunk 流式（Rust 移植） | 待开始 |
 | R3 | 放置/碰撞/季节（负形街道模型） | 待开始 |
 | R4 | 存档与菜单 | 待开始 |

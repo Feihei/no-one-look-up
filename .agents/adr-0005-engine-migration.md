@@ -30,7 +30,7 @@
 |--------|--------|------|
 | GDScript 脚本 | Rust systems（`SystemParam` 分模块） | 模块划分沿用原 Manager 划分：WorldManager → world 系统集，SeasonManager → season 模块，SaveManager → save Resource |
 | signal | Bevy Message/Observer | `player_chunk_changed` → Message；`world_exploration_completed` → Message |
-| autoload 单例 | `Resource` + Plugin | SaveManager、HeadsUpSky 均为 Resource |
+| autoload 单例 | `Resource` + Plugin | SaveManager、DuskSky 均为 Resource |
 | `global_shader_uniform` | 共享 storage buffer | 见 ADR-0004 第 6 节 |
 | CanvasLayer 代码构建 UI | Bevy UI（em/rem） | 菜单/HUD 用 Bevy UI 代码构建，沿用原 M4 结构 |
 | StaticBody3D + WorldBoundaryShape3D | 移除 | 负形街道模型已取代边界长墙 |

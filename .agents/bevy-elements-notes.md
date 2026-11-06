@@ -275,7 +275,7 @@ R1.7 截图冒烟测试（`tests/sky_screenshot.rs`）踩坑记录，后续截�
 - **测试帧必须节流（delta 饿死）**：测试循环 600 帧只跑 ~1.5s，`Time<Virtual>` delta≈0，bevy_elements 的时间平滑/读回 cadence 全部饿死，天空渲染成均匀平色（各值与清屏色不同但无内容）。测试循环每帧 `sleep(16ms)` 模拟真实节奏后，完整天空（渐变+太阳盘+云）立即正常。这是 headless 截图测试的第一嫌疑。
 - **`Hdr` 相机（ElementsCamera required）+ LDR 图片目标 = 渲染被跳过**：输出停在清屏色 `srgb_u8(43,44,47)`，无任何错误。必须 `Rgba16Float` 目标；断言用曝光不变的比值/分带分析（线性值含曝光标度，阈值放宽）。
 - **MinimalPlugins 不含 TransformPlugin**：GlobalTransform 永不传播，破坏 bevy_elements 的相机跟随雾与大气视图（平色帧）。测试插件组合最终清单：
-  `MinimalPlugins + TransformPlugin + AssetPlugin + RenderPlugin + WindowPlugin{None} + ImagePlugin + MeshPlugin + CameraPlugin + CorePipelinePlugin` + `PostProcessPlugin + GltfPlugin(先于 PbrPlugin!) + PbrPlugin + LightPlugin + GizmoPlugin + HeadsUpPlugins + LogPlugin`。
+  `MinimalPlugins + TransformPlugin + AssetPlugin + RenderPlugin + WindowPlugin{None} + ImagePlugin + MeshPlugin + CameraPlugin + CorePipelinePlugin` + `PostProcessPlugin + GltfPlugin(先于 PbrPlugin!) + PbrPlugin + LightPlugin + GizmoPlugin + GamePlugins + LogPlugin`。
 - **Bevy 0.20 API 变化**：`RenderTarget` 是独立 Component（不再是 `Camera.target` 字段）；`Camera` 无 `fov` 字段（用 `Projection::Perspective`）；`Exposure { ev100 }` 在 prelude；Bloom 在 `bevy::post_process::bloom`；TextureFormat 在 `bevy::render::render_resource`；PbrPlugin 非 unit struct（用 `::default()`）。
 - **黄昏取景**：pitch 50° + 默认 fov 45° → 画面覆盖 27°–72° 仰角，完全看不到地平线带（易误判"天空没渲染"）。验证/截图应对准太阳方向或 pitch ≤ 15°。
 - **太阳高度调参经验**：北京纬度 + 3 月 21 日，经度每 +1° → 17:30 太阳高度约 −0.78°。116.4°→10.06°、121.8°→5.95°、125.0°→3.5°（dusk_tint 线性：alt/10° 即因子，10° 起始、0° 全橙、−6° 淡出）。

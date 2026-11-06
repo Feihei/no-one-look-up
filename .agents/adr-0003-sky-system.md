@@ -12,7 +12,7 @@
 
 ### 技术选型
 
-- **主方案（A）**: Bevy 0.20 内置 `Atmosphere`（`ScatteringMedium::earth`，物理基 Rayleigh/Mie 散射）+ bevy_elements 的 Celestial/Cloud/Fog 模块，外封装一层 `HeadsUpSky` Resource 管理器
+- **主方案（A）**: Bevy 0.20 内置 `Atmosphere`（`ScatteringMedium::earth`，物理基 Rayleigh/Mie 散射）+ bevy_elements 的 Celestial/Cloud/Fog 模块，外封装一层 `DuskSky` Resource 管理器
 - **备选（B）**: 不用 bevy_elements，只用官方内置 Atmosphere + VolumetricFog + 自写云（`FullscreenMaterial`/compute raymarch）——零外部依赖但工作量大，作为 bevy_elements 不满足需求时的退路
 - **已否决（C）**: bevy_weather / bevy-volumetric-clouds——截至 2026-10-19 分别停在 Bevy 0.19 / 0.18，未跟进 0.20；且 bevy-volumetric-clouds 不读 depth buffer（不能飞进云里）、未与内置 atmosphere 集成
 
@@ -23,8 +23,8 @@
 | 黄昏色调：金黄→橙红→深蓝紫渐变 | 内置 `Atmosphere` 物理散射在低太阳仰角自动呈现橙红天色（0.18 的 Atmosphere Occlusion + PBR 整合）；固定时间见下节 |
 | 云层：随机生成、缓慢飘移，每次加载不同 | bevy_elements CloudPlugin：compute ray-march 云，由 weather map 驱动；云影（CloudShadows）投射地面 |
 | 星星：黄昏后期缓缓显现 | bevy_elements CelestialPlugin：Yale 亮星星表；0.20 的 atmosphere 合成方式使星空随天色变亮自然熄灭 |
-| 月亮：天际较高位置，可选弯月/满月，位置随机 | bevy_elements 月亮盘（LROC 贴图 + 相位正确）；形态/位置参数经 HeadsUpSky 封装暴露 |
-| 不同位置天空氛围细微差异（世界坐标噪声） | 【适配】需自写：以世界坐标驱动 `ScatteringMedium` 密度乘子（`with_density_multiplier`）或 exposure 微扰，作为 HeadsUpSky 的一部分 |
+| 月亮：天际较高位置，可选弯月/满月，位置随机 | bevy_elements 月亮盘（LROC 贴图 + 相位正确）；形态/位置参数经 DuskSky 封装暴露 |
+| 不同位置天空氛围细微差异（世界坐标噪声） | 【适配】需自写：以世界坐标驱动 `ScatteringMedium` 密度乘子（`with_density_multiplier`）或 exposure 微扰，作为 DuskSky 的一部分 |
 
 ### 黄昏固定与天气锁定（保持 ADR-0001"晴朗黄昏"）
 
@@ -43,7 +43,7 @@
 
 - 接口预留以支持后期添加：飞鸟、飞机、风筝、气球等高空元素
 - 高空元素作为独立 entity 挂在天空系统下（天空 entity 子级），受独立生成逻辑控制
-- HeadsUpSky Resource 提供参数接口：黄昏强度、云密度、星星可见度、月亮形态等
+- DuskSky Resource 提供参数接口：黄昏强度、云密度、星星可见度、月亮形态等
 
 ## 备选方案
 
@@ -53,7 +53,7 @@
 
 ## 后果
 
-- 需要编写 `HeadsUpSky` Resource 封装（黄昏参数接口、时间锁定、天气锁定、世界坐标噪声微扰）
+- 需要编写 `DuskSky` Resource 封装（黄昏参数接口、时间锁定、天气锁定、世界坐标噪声微扰）
 - bevy_elements 的 WorldClock/Weather/Cloud/Celestial/Fog 模块需按上表逐项配置与裁剪（禁用未用模块，减小编译体积）
 - 需确认 bevy_elements 云的配色与内置 `Atmosphere` 联动正常（其 CloudPlugin 设计上"lit with the sun colour from Bevy's atmosphere"）
 - 需确保后期效果栈与物理大气散射的色彩搭配（Bloom/Tonemapping/DoF/CA）
