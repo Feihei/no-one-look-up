@@ -9,9 +9,9 @@
 //! ```
 use bevy::math::Vec2;
 
-use heads_up_bevy::player::{ACCELERATION, MAX_WALK_SPEED};
-use heads_up_bevy::world::collision::{CollisionIndex, PLAYER_RADIUS, is_solid};
-use heads_up_bevy::world::path_network::generate_world;
+use no_one_looks_up::player::{ACCELERATION, MAX_WALK_SPEED};
+use no_one_looks_up::world::collision::{CollisionIndex, PLAYER_RADIUS, is_solid};
+use no_one_looks_up::world::path_network::generate_world;
 
 /// Same fixed-step motion loop as the controller, returning the final point.
 fn walk(index: &CollisionIndex, start: Vec2, yaw: f32, speed: f32, frames: u32) -> Vec2 {

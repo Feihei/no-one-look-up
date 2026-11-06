@@ -5,8 +5,8 @@
 //! and prints the distribution so a regression shows up as a number, not a
 //! missing-building mystery.
 
-use heads_up_bevy::world::layout_graph::BlockType;
-use heads_up_bevy::world::path_network::generate_world;
+use no_one_looks_up::world::layout_graph::BlockType;
+use no_one_looks_up::world::path_network::generate_world;
 use std::collections::HashMap;
 
 fn main() {

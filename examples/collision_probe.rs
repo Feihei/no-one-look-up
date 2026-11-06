@@ -10,10 +10,10 @@
 //! ```
 use bevy::math::Vec2;
 
-use heads_up_bevy::world::collision::{CollisionIndex, PLAYER_RADIUS, is_solid};
-use heads_up_bevy::world::layout_graph::LayoutGraph;
-use heads_up_bevy::world::path_network::generate_world;
-use heads_up_bevy::world::world_grid::WorldGrid;
+use no_one_looks_up::world::collision::{CollisionIndex, PLAYER_RADIUS, is_solid};
+use no_one_looks_up::world::layout_graph::LayoutGraph;
+use no_one_looks_up::world::path_network::generate_world;
+use no_one_looks_up::world::world_grid::WorldGrid;
 
 fn index_world(graph: &LayoutGraph, grid: &WorldGrid) -> CollisionIndex {
     let mut index = CollisionIndex::default();
@@ -42,7 +42,7 @@ fn main() {
 
     // Sample a grid of points: how much of the map is walkable?
     let step = 5.0f32;
-    let world = heads_up_bevy::world::WORLD_SIZE;
+    let world = no_one_looks_up::world::WORLD_SIZE;
     let (mut free, mut blocked) = (0u32, 0u32);
     let mut y = 0.0;
     while y < world {
@@ -65,7 +65,7 @@ fn main() {
 
     // Walk a straight line along a street: start at the middle of the map and
     // walk east until the resolver stops advancing.
-    let mut pos = Vec2::splat(heads_up_bevy::world::world_center());
+    let mut pos = Vec2::splat(no_one_looks_up::world::world_center());
     // Nudge onto the nearest street first: if the centre is inside a block,
     // resolve() pushes it out.
     pos = index.resolve(pos, PLAYER_RADIUS);

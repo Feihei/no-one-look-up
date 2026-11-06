@@ -5,10 +5,10 @@
 //! per-edge attempts. Numbers, not vibes: a placement regression shows up here
 //! before it shows up on screen.
 
-use heads_up_bevy::world::layout_graph::BlockType;
-use heads_up_bevy::world::path_network::generate_world;
-use heads_up_bevy::world::placement::{PlacedKind, plan_chunk};
-use heads_up_bevy::world::props::PropKind;
+use no_one_looks_up::world::layout_graph::BlockType;
+use no_one_looks_up::world::path_network::generate_world;
+use no_one_looks_up::world::placement::{PlacedKind, plan_chunk};
+use no_one_looks_up::world::props::PropKind;
 use std::collections::HashMap;
 
 fn main() {

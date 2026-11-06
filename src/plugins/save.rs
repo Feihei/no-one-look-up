@@ -15,7 +15,7 @@ use crate::player::{EYE_HEIGHT, PlayerBody};
 use crate::world::chunks::{ChunkManager, ChunkRoot, WorldSystems};
 use crate::world::collision::CollisionIndex;
 use crate::world::explored::ExploredBitmap;
-use crate::world::path_network::{HeadsUpSeed, generate_world};
+use crate::world::path_network::{WorldSeed, generate_world};
 use crate::world::season::SeasonState;
 
 pub use self::save_data::{
@@ -122,7 +122,7 @@ fn handle_load_request(
 
     // The seed resource must agree with the restored world for anything that
     // reads it later (e.g. a menu-initiated restart).
-    commands.insert_resource(HeadsUpSeed(data.seed));
+    commands.insert_resource(WorldSeed(data.seed));
 
     // R3.5: restore the season with the world. This is the ONLY place a run's
     // season can come from a file (ADR-0001: fixed for the run), and it runs
@@ -163,7 +163,7 @@ struct SaveInputs<'w, 's> {
     cameras: Query<'w, 's, &'static Transform, With<Camera3d>>,
     players: Query<'w, 's, &'static PlayerBody>,
     bitmap: Res<'w, ExploredBitmap>,
-    seed: Option<Res<'w, HeadsUpSeed>>,
+    seed: Option<Res<'w, WorldSeed>>,
     season: Option<Res<'w, SeasonState>>,
 }
 

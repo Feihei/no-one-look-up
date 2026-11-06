@@ -20,7 +20,7 @@ use crate::world::collision::CollisionIndex;
 use crate::world::facade::{FacadeStyle, VARIANT_COUNT, bake_facade, texture_image};
 use crate::world::layout_graph::BlockType;
 use crate::world::layout_graph::LayoutGraph;
-use crate::world::path_network::{HeadsUpSeed, generate_world};
+use crate::world::path_network::{WorldSeed, generate_world};
 use crate::world::placement;
 use crate::world::props::PropKind;
 use crate::world::roof::{RoofKind, RoofProfile, bake_gable, bake_tooth};
@@ -147,7 +147,7 @@ pub enum WorldSystems {
 
 /// Generates the world layout at startup from the seed resource (or the
 /// default seed until the R4 menu exists) and initializes the chunk manager.
-fn generate_layout(mut commands: Commands, seed: Option<Res<HeadsUpSeed>>) {
+fn generate_layout(mut commands: Commands, seed: Option<Res<WorldSeed>>) {
     let seed_value = seed.map(|s| s.0).unwrap_or(DEFAULT_SEED);
     match generate_world(seed_value) {
         Ok((grid, graph)) => {
@@ -175,7 +175,7 @@ pub(crate) fn update_chunk_streaming(
     mut collision: ResMut<CollisionIndex>,
     graph: Option<Res<LayoutGraph>>,
     assets: Option<Res<PlacementAssets>>,
-    seed: Option<Res<HeadsUpSeed>>,
+    seed: Option<Res<WorldSeed>>,
     mut commands: Commands,
     mut meshes: Option<ResMut<Assets<Mesh>>>,
     mut materials: Option<ResMut<Assets<StandardMaterial>>>,

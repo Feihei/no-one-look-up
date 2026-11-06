@@ -22,7 +22,7 @@ use crate::core::input::{PAUSE, SEASON_CYCLE};
 use crate::plugins::save::{LoadRequest, SaveData, list_slots};
 use crate::world::chunks::DEFAULT_SEED;
 use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
-use crate::world::path_network::HeadsUpSeed;
+use crate::world::path_network::WorldSeed;
 use crate::world::season::SeasonState;
 use crate::world::world_center;
 
@@ -120,7 +120,7 @@ fn sync_ui_root(
     let lines: Vec<String> = match *phase {
         GamePhase::MainMenu => {
             let mut lines = vec![
-                "HEADS-UP".to_string(),
+                "NO ONE LOOKS UP".to_string(),
                 String::new(),
                 "Seed (type digits, backspace): ".to_string() + &seed_input.0,
                 format!("Season: {} [Tab]", season.season.label()),
@@ -221,7 +221,7 @@ fn menu_input(
                     .unwrap_or([world_center(), world_center()]);
                 let fresh =
                     SaveData::capture(seed, season.season, &ExploredBitmap::default(), pose, 0.0);
-                commands.insert_resource(HeadsUpSeed(seed));
+                commands.insert_resource(WorldSeed(seed));
                 commands.queue(|world: &mut World| {
                     world.write_message(LoadRequest(fresh));
                 });

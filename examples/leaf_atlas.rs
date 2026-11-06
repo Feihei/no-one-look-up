@@ -17,7 +17,7 @@
 //! Encoder: plain RGBA PNG via stored deflate, so this needs no image crate --
 //! the same approach `tree_gallery` uses, extended with an alpha channel.
 
-use heads_up_bevy::world::leaf_shape::{
+use no_one_looks_up::world::leaf_shape::{
     ALPHA_CUTOFF, AlphaMask, bake_leaf_alpha, build_mip_chain, default_mip_radius, leaf_profiles,
 };
 
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(out_dir)?;
 
     let mut baked: Vec<(
-        &'static heads_up_bevy::world::leaf_shape::LeafProfile,
+        &'static no_one_looks_up::world::leaf_shape::LeafProfile,
         AlphaMask,
     )> = Vec::new();
     let mut chains: Vec<Vec<AlphaMask>> = Vec::new();

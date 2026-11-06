@@ -21,7 +21,7 @@ use rand::{Rng, SeedableRng};
 use bevy::ecs::prelude::Resource;
 use bevy::math::Vec2;
 
-use crate::core::error::{HeadsUpError, HeadsUpResult};
+use crate::core::error::{GameError, GameResult};
 use crate::world::geometry::inset_polygon_clip_with_insets;
 use crate::world::layout_graph::{
     BlockType, LayoutBlock, LayoutGraph, NodeKind, NodeVertex, StreetUnitEdge,
@@ -36,7 +36,7 @@ use crate::world::{
 /// map). Inserted before adding the world plugin (R4 menu provides it);
 /// defaults to [`DEFAULT_SEED`] in dev builds until then.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeadsUpSeed(pub u64);
+pub struct WorldSeed(pub u64);
 
 /// Block id used for cells that belong to no block: the scenery band behind
 /// the ring road (the outermost cell ring).
@@ -59,7 +59,7 @@ const P_APT_AREA: f32 = 0.10;
 ///
 /// Runs at startup in well under 1 s (pure CPU over a 40x40 grid, no mesh
 /// data). Returns the serde-friendly [`WorldGrid`] plus the [`LayoutGraph`].
-pub fn generate_world(seed: u64) -> HeadsUpResult<(WorldGrid, LayoutGraph)> {
+pub fn generate_world(seed: u64) -> GameResult<(WorldGrid, LayoutGraph)> {
     let mut rng = StdRng::seed_from_u64(seed);
     // R2.9: perturbed lattice nodes are the single vertex source for every
     // block polygon (original `_generate_nodes`). Generated first so block
@@ -155,10 +155,7 @@ pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
 /// `rect()` completion is what guarantees no remnants: after carving a
 /// rectangle out of the free region, the leftover to its right and below is
 /// itself a rectangle, which the scan reaches later.
-fn partition_blocks(
-    rng: &mut StdRng,
-    nodes: &[Vec2],
-) -> HeadsUpResult<(Vec<LayoutBlock>, WorldGrid)> {
+fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutBlock>, WorldGrid)> {
     let width = GRID_CELLS;
     let height = GRID_CELLS;
     let mut grid = WorldGrid::filled(width, height, SCENERY_BAND_CELL);
@@ -244,7 +241,7 @@ fn partition_blocks(
             let half = street_width * 0.5;
             let polygon = inset_polygon_clip_with_insets(&perimeter, &vec![half; perimeter.len()])
                 .ok_or_else(|| {
-                    HeadsUpError::Generation(format!(
+                    GameError::Generation(format!(
                         "block {block_id} polygon collapsed (width {street_width})"
                     ))
                 })?;
@@ -476,7 +473,7 @@ fn mark_grid_flags(
     grid: &mut WorldGrid,
     unit_edges: &[StreetUnitEdge],
     node_vertices: &[NodeVertex],
-) -> HeadsUpResult<()> {
+) -> GameResult<()> {
     for edge in unit_edges {
         let ((r0, c0), (r1, c1)) = edge.vertices;
         // Vertical unit edge ((r, c)..(r+1, c)): the line between columns

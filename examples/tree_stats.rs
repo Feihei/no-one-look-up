@@ -10,9 +10,9 @@
 //! leaves read as the finest silhouette) is judged by the opening rate and
 //! card counts here, not by eyeballing a shrunk gallery sheet.
 
-use heads_up_bevy::world::leaf_shape::{ATLAS_HEIGHT, bake_species_atlas};
-use heads_up_bevy::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
-use heads_up_bevy::world::tree_shape::{TREE_PROFILES, grow_tree};
+use no_one_looks_up::world::leaf_shape::{ATLAS_HEIGHT, bake_species_atlas};
+use no_one_looks_up::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
+use no_one_looks_up::world::tree_shape::{TREE_PROFILES, grow_tree};
 
 /// Seed variants per species averaged.
 const VARIANTS: u64 = 4;
@@ -144,7 +144,7 @@ fn quad_sizes(positions: &[[f32; 3]]) -> (f32, f32) {
 fn sky_opening(
     positions: &[[f32; 3]],
     uvs: &[[f32; 2]],
-    atlas: &heads_up_bevy::world::leaf_shape::AlphaMask,
+    atlas: &no_one_looks_up::world::leaf_shape::AlphaMask,
 ) -> f32 {
     if positions.is_empty() || uvs.len() != positions.len() {
         return 0.0;

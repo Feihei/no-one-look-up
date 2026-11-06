@@ -3066,18 +3066,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "heads_up_bevy"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_elements",
- "rand 0.9.5",
- "rand_chacha",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3805,6 +3793,18 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "no_one_looks_up"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_elements",
+ "rand 0.9.5",
+ "rand_chacha",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

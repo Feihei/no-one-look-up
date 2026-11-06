@@ -355,7 +355,7 @@ pub fn hull_of(polygon: &[Vec2]) -> Vec<Vec2> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::path_network::{HeadsUpSeed, generate_world};
+    use crate::world::path_network::{WorldSeed, generate_world};
 
     fn world(seed: u64) -> (crate::world::world_grid::WorldGrid, LayoutGraph) {
         generate_world(seed).expect("generation")
@@ -662,7 +662,7 @@ mod tests {
             CHUNK_SIZE,
             GRID_CELLS,
             OUTER_BAND_CELLS,
-            HeadsUpSeed(0),
+            WorldSeed(0),
         );
         keys.into_iter().collect()
     }

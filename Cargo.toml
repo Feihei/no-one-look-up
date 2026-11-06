@@ -1,9 +1,9 @@
 [package]
-name = "heads_up_bevy"
+name = "no_one_looks_up"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Heads-Up: a first-person endless strolling experience focused on the golden-hour sky (Bevy 0.20 migration of the original Godot 4.7 project)"
+description = "No One Looks Up Even Alone: a first-person endless strolling experience focused on the golden-hour sky (Bevy 0.20 migration of the original Godot 4.7 project)"
 license = "MIT OR Apache-2.0"
 
 [workspace]

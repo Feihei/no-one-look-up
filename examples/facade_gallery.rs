@@ -18,8 +18,8 @@
 //! show the two things unit tests cannot: whether the rhythm reads, and whether
 //! the wall is too bright for a silhouette.
 
-use heads_up_bevy::plugins::facade::WINDOW_EMISSIVE;
-use heads_up_bevy::world::facade::{
+use no_one_looks_up::plugins::facade::WINDOW_EMISSIVE;
+use no_one_looks_up::world::facade::{
     BASE_SIZE, BAYS_PER_TILE, FacadeStyle, VARIANT_COUNT, bake_facade, sample,
 };
 
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tile.y,
             BAYS_PER_TILE,
             dims.bay,
-            heads_up_bevy::world::facade::FLOORS_PER_TILE,
+            no_one_looks_up::world::facade::FLOORS_PER_TILE,
             dims.floor
         );
     }

@@ -1,4 +1,4 @@
-//! Feature plugins for Heads-Up.
+//! Feature plugins for No One Looks Up Even Alone.
 //!
 //! Plugin split mirrors the original Godot Manager layout (see ADR-0005
 //! mapping table): SkyPlugin, WorldPlugin, SeasonPlugin, SavePlugin,
@@ -38,9 +38,9 @@ use world::WorldPlugin;
 use crate::world::debug_viz::DebugVizPlugin;
 
 /// Group plugin wiring every feature plugin in dependency order.
-pub struct HeadsUpPlugins;
+pub struct GamePlugins;
 
-impl PluginGroup for HeadsUpPlugins {
+impl PluginGroup for GamePlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
             .add(SkyPlugin)

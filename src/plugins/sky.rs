@@ -142,7 +142,7 @@ impl CloudKind {
 ///
 /// Insert this resource before adding [`SkyPlugin`] to override the defaults.
 #[derive(Resource, Clone, Debug)]
-pub struct HeadsUpSky {
+pub struct DuskSky {
     /// Calendar date driving both the sun altitude at the golden hour and the
     /// moon phase. The two are coupled through the date (a fixed location +
     /// fixed hour leaves the date as the single tuning knob).
@@ -189,7 +189,7 @@ pub struct HeadsUpSky {
     pub bloom_intensity: f32,
 }
 
-impl Default for HeadsUpSky {
+impl Default for DuskSky {
     fn default() -> Self {
         Self {
             // Equinox: sunset over Beijing is ~18:15, so 17:30 lands the sun
@@ -231,7 +231,7 @@ impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
         let sky = app
             .world()
-            .get_resource::<HeadsUpSky>()
+            .get_resource::<DuskSky>()
             .cloned()
             .unwrap_or_default();
         app.insert_resource(sky.clone());
@@ -303,7 +303,7 @@ impl Plugin for SkyPlugin {
 /// Returns `None` for a clear sky (no kind), which is a real state the game
 /// needs: ADR-0001's golden hour is meant to be mostly clear, and an
 /// overcast-only renderer could not produce it.
-pub fn resolve_clouds(sky: &HeadsUpSky) -> Option<ResolvedClouds> {
+pub fn resolve_clouds(sky: &DuskSky) -> Option<ResolvedClouds> {
     let kind = sky.cloud_kind?;
     let amount = sky.cloud_amount.clamp(0.0, 1.0);
     // Cover scales with amount; a slip of cover at amount 0 keeps the crate's
@@ -333,7 +333,7 @@ pub struct ResolvedClouds {
     pub layer: (f32, f32),
 }
 
-fn apply_weather_overrides(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elements::Weather>) {
+fn apply_weather_overrides(sky: Res<DuskSky>, mut weather: ResMut<bevy_elements::Weather>) {
     match resolve_clouds(&sky) {
         Some(clouds) => {
             weather.cloud_cover = clouds.cover;
@@ -352,7 +352,7 @@ fn apply_weather_overrides(sky: Res<HeadsUpSky>, mut weather: ResMut<bevy_elemen
     }
 }
 
-fn apply_cloud_layer_override(sky: Res<HeadsUpSky>, mut layer: ResMut<CloudLayer>) {
+fn apply_cloud_layer_override(sky: Res<DuskSky>, mut layer: ResMut<CloudLayer>) {
     // A clear sky still needs a valid layer: the crate derives one every frame
     // from `Weather`, and leaving a stale one would make the next kind switch
     // pop.
@@ -372,7 +372,7 @@ fn apply_cloud_layer_override(sky: Res<HeadsUpSky>, mut layer: ResMut<CloudLayer
 /// the ADR's "density multiplier / exposure jitter" is implemented (recorded
 /// in bevy-elements-notes.md).
 fn perturb_exposure(
-    sky: Res<HeadsUpSky>,
+    sky: Res<DuskSky>,
     cameras: Query<(&GlobalTransform, &mut Exposure), With<ElementsCamera>>,
 ) {
     let amplitude = sky.exposure_noise_amplitude;
@@ -388,12 +388,9 @@ fn perturb_exposure(
     }
 }
 
-/// Keeps every `GoldenHourCamera` bloom in step with `HeadsUpSky::bloom_intensity`,
+/// Keeps every `GoldenHourCamera` bloom in step with `DuskSky::bloom_intensity`,
 /// so the panel's bloom knob takes effect on the next frame.
-fn apply_bloom_intensity(
-    sky: Res<HeadsUpSky>,
-    mut cameras: Query<&mut Bloom, With<ElementsCamera>>,
-) {
+fn apply_bloom_intensity(sky: Res<DuskSky>, mut cameras: Query<&mut Bloom, With<ElementsCamera>>) {
     for mut bloom in &mut cameras {
         if bloom.intensity != sky.bloom_intensity {
             bloom.intensity = sky.bloom_intensity;
@@ -420,7 +417,7 @@ impl Default for GoldenHourCamera {
                 ..ElementsCamera::default()
             },
             exposure: Exposure {
-                ev100: HeadsUpSky::default().exposure_ev100,
+                ev100: DuskSky::default().exposure_ev100,
             },
             tonemapping: Tonemapping::AcesFitted,
             // Above NATURAL's 0.15: spreads the low-sun glow across the
@@ -446,7 +443,7 @@ mod tests {
         //
         // Asserted because it is a deliberate art direction that a "sensible
         // default" refactor would happily undo.
-        let sky = HeadsUpSky::default();
+        let sky = DuskSky::default();
         assert_eq!(
             sky.cloud_kind, None,
             "volume clouds must ship disabled; a default kind changes the look              of every existing save"

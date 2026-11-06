@@ -30,7 +30,7 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy_elements::{ElementsCamera, SunState};
 
-use heads_up_bevy::plugins::HeadsUpPlugins;
+use no_one_looks_up::plugins::GamePlugins;
 
 use std::time::Duration;
 
@@ -77,7 +77,7 @@ fn golden_hour_sky_renders() {
         bevy::light::LightPlugin,
         // LightPlugin's render-side gizmo systems need Assets<GizmoAsset>.
         bevy::gizmos::GizmoPlugin,
-        HeadsUpPlugins,
+        GamePlugins,
         LogPlugin::default(),
     ));
     // `finish()` unpacks render resources (see tests/assets_load.rs).

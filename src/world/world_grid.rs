@@ -16,7 +16,7 @@ use bevy::ecs::prelude::Resource;
 use bevy::math::Vec2;
 use serde::{Deserialize, Serialize};
 
-use crate::core::error::{HeadsUpError, HeadsUpResult};
+use crate::core::error::{GameError, GameResult};
 
 /// Per-cell record. `block_id` indexes into `LayoutGraph::blocks`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,9 +72,9 @@ impl WorldGrid {
     }
 
     /// Fast cell lookup. Row-major indexing; row 0 is the northernmost band.
-    pub fn get_cell(&self, row: u32, col: u32) -> HeadsUpResult<&CellInfo> {
+    pub fn get_cell(&self, row: u32, col: u32) -> GameResult<&CellInfo> {
         if row >= self.height || col >= self.width {
-            return Err(HeadsUpError::Generation(format!(
+            return Err(GameError::Generation(format!(
                 "cell ({row}, {col}) outside the {}x{} grid",
                 self.width, self.height
             )));
@@ -83,9 +83,9 @@ impl WorldGrid {
     }
 
     /// Mutable cell access used by the generator to fill derived flags.
-    pub fn get_cell_mut(&mut self, row: u32, col: u32) -> HeadsUpResult<&mut CellInfo> {
+    pub fn get_cell_mut(&mut self, row: u32, col: u32) -> GameResult<&mut CellInfo> {
         if row >= self.height || col >= self.width {
-            return Err(HeadsUpError::Generation(format!(
+            return Err(GameError::Generation(format!(
                 "cell ({row}, {col}) outside the {}x{} grid",
                 self.width, self.height
             )));

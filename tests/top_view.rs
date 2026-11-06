@@ -28,10 +28,10 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy_elements::ElementsCamera;
 
-use heads_up_bevy::plugins::HeadsUpPlugins;
-use heads_up_bevy::world::WORLD_SIZE;
-use heads_up_bevy::world::debug_viz::DebugVizEnabled;
-use heads_up_bevy::world::path_network::HeadsUpSeed;
+use no_one_looks_up::plugins::GamePlugins;
+use no_one_looks_up::world::WORLD_SIZE;
+use no_one_looks_up::world::debug_viz::DebugVizEnabled;
+use no_one_looks_up::world::path_network::WorldSeed;
 
 const IMAGE_SIZE: u32 = 1600;
 /// Orthographic camera height above the ground plane (only the projection
@@ -54,7 +54,7 @@ fn main() {
                 None => raw.parse().ok(),
             }
         })
-        .unwrap_or(heads_up_bevy::world::chunks::DEFAULT_SEED);
+        .unwrap_or(no_one_looks_up::world::chunks::DEFAULT_SEED);
     let out = std::env::var("WORLD_TOP_VIEW_OUT")
         .unwrap_or_else(|_| "target/world_top_view.png".to_string());
 
@@ -81,11 +81,11 @@ fn main() {
         bevy::pbr::PbrPlugin::default(),
         bevy::light::LightPlugin,
         bevy::gizmos::GizmoPlugin,
-        HeadsUpPlugins,
+        GamePlugins,
         LogPlugin::default(),
     ));
     app.finish();
-    app.insert_resource(HeadsUpSeed(seed));
+    app.insert_resource(WorldSeed(seed));
     app.insert_resource(DebugVizEnabled(true));
     app.init_resource::<FrameCounter>();
     app.init_resource::<CapturedFrame>();

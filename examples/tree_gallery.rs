@@ -17,7 +17,7 @@
 //! Output: plain PPM (P6) plus a small stored-deflate PNG writer, so the
 //! example needs no image crate.
 
-use heads_up_bevy::world::tree_shape::{TREE_PROFILES, TreeSkeleton, grow_tree};
+use no_one_looks_up::world::tree_shape::{TREE_PROFILES, TreeSkeleton, grow_tree};
 
 const WIDTH: usize = 2400;
 /// Three species sheets plus the close-up sheet stack to `HEIGHT`.
@@ -221,7 +221,7 @@ fn draw_tree(
     tree: &TreeSkeleton,
     sheet: &Sheet,
     species: u8,
-    atlas: &heads_up_bevy::world::leaf_shape::AlphaMask,
+    atlas: &no_one_looks_up::world::leaf_shape::AlphaMask,
 ) {
     for branch in &tree.branches {
         let (a, da) = sheet.project(branch.start);
@@ -269,10 +269,10 @@ fn draw_tree(
 /// sheet worth having.
 fn draw_leaf_cards(
     canvas: &mut Canvas,
-    foliage: &heads_up_bevy::world::tree_shape::Foliage,
+    foliage: &no_one_looks_up::world::tree_shape::Foliage,
     sheet: &Sheet,
     species: u8,
-    atlas: &heads_up_bevy::world::leaf_shape::AlphaMask,
+    atlas: &no_one_looks_up::world::leaf_shape::AlphaMask,
 ) {
     // Ask the GAME for the geometry instead of re-implementing it here.
     //
@@ -280,14 +280,14 @@ fn draw_leaf_cards(
     // drifted immediately: the sheet kept showing randomly-oriented cards after
     // the game had been fixed to point petioles at the branch. A preview that
     // can disagree with the shader is worse than no preview.
-    let skeleton = heads_up_bevy::world::tree_shape::TreeSkeleton {
+    let skeleton = no_one_looks_up::world::tree_shape::TreeSkeleton {
         branches: Vec::new(),
         foliage: vec![*foliage],
         species: 0,
         total_length: 0.0,
     };
-    let profile = heads_up_bevy::world::tree_shape::TREE_PROFILES[species as usize];
-    let parts = heads_up_bevy::world::tree_mesh::bake_skeleton(&skeleton, &profile, species);
+    let profile = no_one_looks_up::world::tree_shape::TREE_PROFILES[species as usize];
+    let parts = no_one_looks_up::world::tree_mesh::bake_skeleton(&skeleton, &profile, species);
     let Some(positions) = parts.leaves.attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION) else {
         return;
     };
@@ -363,8 +363,8 @@ fn main() {
 
     // The world's single shared atlas (the same one `chunks.rs` builds); each
     // species' cards sample their own cell via the UVs the game bakes.
-    let atlas = heads_up_bevy::world::leaf_shape::bake_species_atlas(
-        heads_up_bevy::world::leaf_shape::ATLAS_HEIGHT,
+    let atlas = no_one_looks_up::world::leaf_shape::bake_species_atlas(
+        no_one_looks_up::world::leaf_shape::ATLAS_HEIGHT,
     );
 
     for (species, profile) in TREE_PROFILES.iter().enumerate() {

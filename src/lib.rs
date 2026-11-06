@@ -1,4 +1,4 @@
-//! Heads-Up library crate: sky/world/season/save/menu plugin wiring.
+//! No One Looks Up Even Alone library crate: sky/world/season/save/menu plugin wiring.
 //!
 //! The binary (`main.rs`) only assembles the app; all systems and plugins
 //! live here so integration tests can drive them headless.

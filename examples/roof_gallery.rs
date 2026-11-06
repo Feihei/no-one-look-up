@@ -12,8 +12,8 @@
 //! What it has to answer is binary and belongs to the skyline: does the gable
 //! cut the sky, does the parapet read as a wall, do the sawtooth teeth zigzag.
 
-use heads_up_bevy::world::facade::FacadeStyle;
-use heads_up_bevy::world::roof::{RoofKind, RoofProfile, bake_gable, bake_tooth};
+use no_one_looks_up::world::facade::FacadeStyle;
+use no_one_looks_up::world::roof::{RoofKind, RoofProfile, bake_gable, bake_tooth};
 
 /// Camera: yaw around +Y and a shallow downward pitch, like standing on the
 /// street and looking slightly up at the roofline.

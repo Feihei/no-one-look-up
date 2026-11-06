@@ -2,7 +2,7 @@
 //! look.
 //!
 //! F5 opens it; Up/Down picks a row, Left/Right nudges the value. Every change
-//! writes `HeadsUpSky`, which the sky systems already treat as the single
+//! writes `DuskSky`, which the sky systems already treat as the single
 //! source of truth, so nothing here is a preview-only path — what you tune in
 //! the panel is what the game renders.
 //!
@@ -21,7 +21,7 @@ use bevy::prelude::*;
 use crate::core::input::{
     DEV_PANEL_DOWN, DEV_PANEL_LEFT, DEV_PANEL_RIGHT, DEV_PANEL_UP, DEV_TOGGLE_SKY_PANEL,
 };
-use crate::plugins::sky::HeadsUpSky;
+use crate::plugins::sky::DuskSky;
 
 /// Whether the panel is drawn and accepting keys.
 #[derive(Resource, Debug, Default)]
@@ -35,8 +35,8 @@ pub struct SkyPanelState {
 pub enum SkyValue {
     /// A plain float with range and step.
     Float {
-        get: fn(&HeadsUpSky) -> f32,
-        set: fn(&mut HeadsUpSky, f32),
+        get: fn(&DuskSky) -> f32,
+        set: fn(&mut DuskSky, f32),
         step: f32,
         range: (f32, f32),
         decimals: usize,
@@ -201,11 +201,11 @@ fn cloud_kind_cycle(
 #[derive(Component)]
 struct SkyPanelRoot;
 
-/// Reads input and updates `HeadsUpSky` / [`SkyPanelState`].
+/// Reads input and updates `DuskSky` / [`SkyPanelState`].
 fn sky_panel_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<SkyPanelState>,
-    mut sky: ResMut<HeadsUpSky>,
+    mut sky: ResMut<DuskSky>,
     mut cirrus: ResMut<crate::plugins::cirrus::CirrusSettings>,
 ) {
     if keys.just_pressed(DEV_TOGGLE_SKY_PANEL) {
@@ -302,7 +302,7 @@ fn sky_panel_input(
 /// Renders a row's value for the panel and the log line.
 fn format_row(
     param: &SkyParam,
-    sky: &HeadsUpSky,
+    sky: &DuskSky,
     cirrus: &crate::plugins::cirrus::CirrusSettings,
 ) -> String {
     match &param.value {
@@ -326,7 +326,7 @@ fn format_row(
 /// changed (there are ~9 lines, but rebuilding every frame is still waste).
 fn sky_panel_ui(
     state: Res<SkyPanelState>,
-    sky: Res<HeadsUpSky>,
+    sky: Res<DuskSky>,
     cirrus: Res<crate::plugins::cirrus::CirrusSettings>,
     mut commands: Commands,
     roots: Query<Entity, With<SkyPanelRoot>>,
@@ -395,7 +395,7 @@ pub struct SkyPanelPlugin;
 impl Plugin for SkyPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyPanelState>()
-            .init_resource::<HeadsUpSky>()
+            .init_resource::<DuskSky>()
             .add_systems(Update, (sky_panel_input, sky_panel_ui).chain());
     }
 }
@@ -410,7 +410,7 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<SkyPanelState>()
-            .init_resource::<HeadsUpSky>()
+            .init_resource::<DuskSky>()
             .init_resource::<crate::plugins::cirrus::CirrusSettings>()
             .add_systems(Update, sky_panel_input);
         app
@@ -443,9 +443,9 @@ mod tests {
     #[test]
     fn panel_starts_closed_and_ignores_keys_until_opened() {
         let mut app = app_with_panel();
-        let before = app.world().resource::<HeadsUpSky>().exposure_ev100;
+        let before = app.world().resource::<DuskSky>().exposure_ev100;
         tap(&mut app, DEV_PANEL_RIGHT);
-        assert_eq!(app.world().resource::<HeadsUpSky>().exposure_ev100, before);
+        assert_eq!(app.world().resource::<DuskSky>().exposure_ev100, before);
         assert!(!app.world().resource::<SkyPanelState>().open);
     }
 
@@ -465,15 +465,15 @@ mod tests {
         let mut app = app_with_panel();
         tap(&mut app, DEV_TOGGLE_SKY_PANEL);
         app.world_mut().resource_mut::<SkyPanelState>().selected = row("cloud kind");
-        app.world_mut().resource_mut::<HeadsUpSky>().cloud_kind = Some(CloudKind::ALL[0]);
+        app.world_mut().resource_mut::<DuskSky>().cloud_kind = Some(CloudKind::ALL[0]);
 
         // Starting on ALL[0], it takes one press per remaining kind plus one
         // more to step off the end into the clear state. Seed the list with
         // the starting kind, or it looks like the cycle skipped it.
-        let mut seen = vec![app.world().resource::<HeadsUpSky>().cloud_kind];
+        let mut seen = vec![app.world().resource::<DuskSky>().cloud_kind];
         for _ in 0..CloudKind::ALL.len() {
             tap(&mut app, DEV_PANEL_RIGHT);
-            seen.push(app.world().resource::<HeadsUpSky>().cloud_kind);
+            seen.push(app.world().resource::<DuskSky>().cloud_kind);
         }
 
         for kind in CloudKind::ALL {
@@ -498,12 +498,12 @@ mod tests {
         tap(&mut app, DEV_TOGGLE_SKY_PANEL);
         app.world_mut().resource_mut::<SkyPanelState>().selected = row("cloud kind");
         {
-            let mut sky = app.world_mut().resource_mut::<HeadsUpSky>();
+            let mut sky = app.world_mut().resource_mut::<DuskSky>();
             sky.cloud_kind = None;
             sky.cloud_amount = 0.0;
         }
         tap(&mut app, DEV_PANEL_RIGHT);
-        let sky = app.world().resource::<HeadsUpSky>();
+        let sky = app.world().resource::<DuskSky>();
         assert!(sky.cloud_kind.is_some());
         assert!(
             sky.cloud_amount > 0.0,
@@ -516,7 +516,7 @@ mod tests {
     fn clear_sky_resolves_to_no_cover() {
         // The clear state must actually clear: a stale cover would leave the
         // previous cloud sheet in the sky.
-        let sky = HeadsUpSky {
+        let sky = DuskSky {
             cloud_kind: None,
             ..Default::default()
         };
@@ -526,7 +526,7 @@ mod tests {
         );
 
         // Amount 0 with a kind keeps the kind but shows nothing.
-        let sky = HeadsUpSky {
+        let sky = DuskSky {
             cloud_kind: Some(CloudKind::BrokenCumulus),
             cloud_amount: 0.0,
             ..Default::default()
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn every_kind_resolves_to_weather_the_crate_can_use() {
         for kind in CloudKind::ALL {
-            let sky = HeadsUpSky {
+            let sky = DuskSky {
                 cloud_kind: Some(kind),
                 cloud_amount: 1.0,
                 ..Default::default()
@@ -584,7 +584,7 @@ mod tests {
             for _ in 0..120 {
                 tap(&mut app, DEV_PANEL_RIGHT);
             }
-            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
+            if let Some((base, top)) = app.world().resource::<DuskSky>().cloud_layer {
                 assert!(
                     top > base,
                     "{name}: top {top} <= base {base} at the high end"
@@ -593,7 +593,7 @@ mod tests {
             for _ in 0..240 {
                 tap(&mut app, DEV_PANEL_LEFT);
             }
-            if let Some((base, top)) = app.world().resource::<HeadsUpSky>().cloud_layer {
+            if let Some((base, top)) = app.world().resource::<DuskSky>().cloud_layer {
                 assert!(
                     top > base,
                     "{name}: top {top} <= base {base} at the low end"
@@ -616,11 +616,11 @@ mod tests {
             for _ in 0..200 {
                 tap(&mut app, DEV_PANEL_RIGHT);
             }
-            let high = get(app.world().resource::<HeadsUpSky>());
+            let high = get(app.world().resource::<DuskSky>());
             for _ in 0..400 {
                 tap(&mut app, DEV_PANEL_LEFT);
             }
-            let low = get(app.world().resource::<HeadsUpSky>());
+            let low = get(app.world().resource::<DuskSky>());
             for (value, end) in [(high, "high"), (low, "low")] {
                 assert!(value.is_finite(), "{} is non-finite at {end}", param.name);
                 assert!(

@@ -27,9 +27,9 @@
 use std::collections::HashMap;
 
 use bevy::math::Vec2;
-use heads_up_bevy::world::layout_graph::{BlockType, NodeKind};
-use heads_up_bevy::world::path_network::generate_world;
-use heads_up_bevy::world::{CELL_SIZE, GRID_CELLS, WORLD_SIZE};
+use no_one_looks_up::world::layout_graph::{BlockType, NodeKind};
+use no_one_looks_up::world::path_network::generate_world;
+use no_one_looks_up::world::{CELL_SIZE, GRID_CELLS, WORLD_SIZE};
 
 /// Pixels per metre. 2 px/m keeps 6-10 m streets legible; derived from
 /// `WORLD_SIZE` so resizing the map never leaves the canvas mismatched.
@@ -251,7 +251,7 @@ fn main() {
                 None => raw.parse().unwrap_or_default(),
             }
         })
-        .unwrap_or(heads_up_bevy::world::chunks::DEFAULT_SEED);
+        .unwrap_or(no_one_looks_up::world::chunks::DEFAULT_SEED);
     let out = std::env::var("WORLD_MAP_OUT").unwrap_or_else(|_| "target/world_map.png".to_string());
 
     let (grid, graph) = match generate_world(seed) {

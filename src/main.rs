@@ -1,4 +1,4 @@
-//! Heads-Up: a first-person endless strolling experience focused on the
+//! No One Looks Up Even Alone: a first-person endless strolling experience focused on the
 //! golden-hour sky. Bevy 0.20 migration of the original Godot 4.7 project.
 //!
 //! R2: world generation + chunk streaming (ground tiles stream around the
@@ -9,21 +9,21 @@
 use bevy::camera::Exposure;
 use bevy::prelude::*;
 
-use heads_up_bevy::player::{EYE_HEIGHT, PlayerBody, PlayerPlugin};
-use heads_up_bevy::plugins::{GoldenHourCamera, HeadsUpPlugins, sky::HeadsUpSky};
-use heads_up_bevy::world::world_center;
+use no_one_looks_up::player::{EYE_HEIGHT, PlayerBody, PlayerPlugin};
+use no_one_looks_up::plugins::{GamePlugins, GoldenHourCamera, sky::DuskSky};
+use no_one_looks_up::world::world_center;
 
 fn main() -> AppExit {
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Heads-Up".to_string(),
+                    title: "No One Looks Up Even Alone".to_string(),
                     ..default()
                 }),
                 ..default()
             }),
-            HeadsUpPlugins,
+            GamePlugins,
             PlayerPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_sky_state.after(setup_scene)))
@@ -38,7 +38,7 @@ fn main() -> AppExit {
 /// implicit-ordering trap the project forbids. The controller starts pitched
 /// at the top of the allowed band (60°) so the golden-hour sky fills the view
 /// the way ADR-0001 describes.
-fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
+fn setup_scene(mut commands: Commands, sky: Res<DuskSky>) {
     commands.spawn((
         Name::new("Player"),
         Camera3d::default(),
@@ -56,7 +56,7 @@ fn setup_scene(mut commands: Commands, sky: Res<HeadsUpSky>) {
 /// One-shot startup log: confirms the golden-hour lock took effect. The first
 /// frame's `SunState` is still the default (update runs after Startup), so
 /// `report_sun_altitude` shows the settled ephemeris.
-fn log_sky_state(sky: Res<HeadsUpSky>) {
+fn log_sky_state(sky: Res<DuskSky>) {
     info!(
         "golden hour locked: date={:?} hour={} loc=({:.4}, {:.4}, UTC+{})",
         sky.date,
