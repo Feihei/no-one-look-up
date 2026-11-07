@@ -136,7 +136,7 @@ tests/               资产链路、天空截图、顶视图
 
 ## 已知缺口
 
-- `tests/assets_load.rs` 需要 `assets/models/` 下的三个 glTF，而该目录未入库；新克隆的仓库跑 `cargo test` 时只有这一个测试会因缺文件失败（报错信息会直接指出缺少哪个文件）。程序化树不依赖这些资产，游戏本身可以正常运行。
+- `tests/assets_load.rs` 需要 `assets/models/` 下的三个 glTF，而该目录未入库（本地专有，约 32 MB）。三个文件全缺时该测试跳过（新克隆和 CI 即此情况），部分缺失仍会失败并指出缺哪个文件。程序化树不依赖这些资产，游戏本身可以正常运行。
 - 仓库目前没有 `LICENSE` 文件，`Cargo.toml` 声明的是 `MIT OR Apache-2.0`。
 - 树种的生长参数（塔形杨 / 行道树 / 宽叶）与三张叶片蒙版（杨 / 槐 / 柳）尚未完全一一对齐，观感上能区分，命名上还没统一。
 - 云的边缘仍有 32–64 m 尺度的块状感，根因是噪声分辨率，属已知边界。
@@ -289,7 +289,7 @@ Everything about *why* it is shaped this way lives in `.agents/` (in Chinese):
 
 ## Known gaps
 
-- `tests/assets_load.rs` needs the three glTF files under `assets/models/`, which are not tracked. In a fresh clone that one test fails on a missing file (the assertion names the file). Procedural trees do not use them, so the game itself runs fine.
+- `tests/assets_load.rs` needs the three glTF files under `assets/models/`, which are not tracked (local-only, ~32 MB). When all three are absent the test skips — the case for a fresh clone and CI; a partial export still fails and names the missing file. Procedural trees do not use them, so the game itself runs fine.
 - There is no `LICENSE` file yet, though `Cargo.toml` declares `MIT OR Apache-2.0`.
 - The growth profiles (columnar aspen / street tree / broadleaf) and the three leaf masks (poplar / sophora / willow) are not fully aligned one-to-one yet: they read as distinct species, but the naming is not consistent.
 - Cloud edges still read as blocky at a 32–64 m scale; the cause is noise resolution and it is a known boundary.
