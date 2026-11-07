@@ -5,24 +5,70 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to the same branch makes the previous run obsolete. Cancel it on
+# pull requests so review feedback follows the newest commit instead of queueing
+# behind a stale Windows build; pushes to main are left to finish so every
+# landing commit gets one complete verification.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Errors on warnings in this workspace only: cargo compiles dependencies with
+  # `--cap-lints allow`, so a third-party deprecation cannot fail the gate.
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
+  # Formatting is seconds of work with no compilation. Keeping it separate means
+  # a stray blank line reports back immediately instead of after a full build,
+  # and it stays cheap enough to leave out of the cache.
+  fmt:
+    name: Format
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - name: Format
         run: cargo fmt --check
+
+  # Clippy and the test suite each need the whole dependency graph compiled, so
+  # they run in parallel rather than in sequence. They share one rust-cache key:
+  # dependencies are the expensive part and are identical between them, while
+  # the local crate is cheap to rebuild.
+  lint:
+    name: Clippy
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-stable
       - name: Clippy
-        run: cargo clippy -- -D warnings
-      - name: Tests
-        run: cargo test
+        # `--all-targets` lints tests, examples and benches too: they are the
+        # half of the tree a plain `cargo clippy` never looks at.
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build
-        run: cargo build
+        # Proves the binary links; clippy alone only type-checks.
+        run: cargo build --locked
+
+  test:
+    name: Test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-stable
+      - name: Tests
+        # GPU-dependent tests are `#[ignore]`d (see tests/sky_screenshot.rs).
+        run: cargo test --locked
