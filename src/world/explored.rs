@@ -39,15 +39,19 @@ impl ExploredBitmap {
         self.explored.is_empty()
     }
 
+    /// Total number of chunks in the world: the exploration denominator.
+    pub fn total(&self) -> usize {
+        (GRID_CELLS * GRID_CELLS) as usize
+    }
+
     /// Fraction of the world explored (0.0-1.0).
     pub fn fraction(&self) -> f32 {
-        let total = (GRID_CELLS * GRID_CELLS) as f32;
-        self.explored.len() as f32 / total
+        self.explored.len() as f32 / self.total() as f32
     }
 
     /// True once every chunk has been visited (R4.6 completion gate).
     pub fn is_complete(&self) -> bool {
-        self.explored.len() >= (GRID_CELLS * GRID_CELLS) as usize
+        self.explored.len() >= self.total()
     }
 
     /// Explored keys, sorted, for deterministic serialization (R4.2).

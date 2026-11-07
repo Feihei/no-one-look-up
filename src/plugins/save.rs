@@ -242,6 +242,11 @@ mod tests {
     /// World centre, derived from the world constants.
     const CENTER: f32 = crate::world::WORLD_SIZE * 0.5;
 
+    /// Serializes tests that touch the real autosave file. They share one
+    /// path on disk, so running them concurrently makes the "no autosave
+    /// yet" / "autosave exists" assertions race each other.
+    static AUTOSAVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn app_with_world() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, WorldPlugin, SavePlugin))
@@ -334,6 +339,9 @@ mod tests {
 
     #[test]
     fn slot_list_reflects_what_was_written_and_tolerates_corruption() {
+        let _guard = AUTOSAVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Clean the slots this test owns (autosave + one user slot), then
         // verify the list API mirrors reality.
         let _ = std::fs::remove_file(save_path(AUTOSAVE_SLOT));
@@ -368,6 +376,9 @@ mod tests {
 
     #[test]
     fn autosave_writes_only_after_the_interval() {
+        let _guard = AUTOSAVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut app = app_with_world();
         app.update();
         app.update();

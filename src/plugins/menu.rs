@@ -135,8 +135,9 @@ fn sync_ui_root(
             lines
         }
         GamePhase::Playing => vec![format!(
-            "Explored: {} / 1600 ({:.1}%)",
+            "Explored: {} / {} ({:.1}%)",
             bitmap.len(),
+            bitmap.total(),
             bitmap.fraction() * 100.0
         )],
         GamePhase::Paused => vec![
@@ -144,7 +145,7 @@ fn sync_ui_root(
             String::new(),
             "[Esc] Resume".to_string(),
             "[S] Save (slot 1-3)".to_string(),
-            "[M] Main menu".to_string(),
+            "[Backspace] Main menu".to_string(),
         ],
     };
     // The exploration-complete dialog rides on top of the pause menu.
@@ -274,7 +275,9 @@ fn menu_input(
                     }
                 }
             }
-            if keys.just_pressed(KeyCode::KeyM) {
+            // M now toggles the minimap while walking, so the pause menu
+            // uses Backspace for returning to the main menu.
+            if keys.just_pressed(KeyCode::Backspace) {
                 *phase = GamePhase::MainMenu;
             }
         }
@@ -321,8 +324,9 @@ fn update_hud(
         // First child is the header for menus; while playing the panel only
         // holds the HUD line.
         **text = format!(
-            "Explored: {} / 1600 ({:.1}%)",
+            "Explored: {} / {} ({:.1}%)",
             bitmap.len(),
+            bitmap.total(),
             bitmap.fraction() * 100.0
         );
     }
@@ -518,10 +522,10 @@ mod tests {
         app.update();
         assert_eq!(*app.world().resource::<GamePhase>(), GamePhase::Paused);
 
-        // M: back to the main menu (world stays alive underneath).
+        // Backspace: back to the main menu (world stays alive underneath).
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::KeyM);
+            .press(KeyCode::Backspace);
         app.update();
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -537,5 +541,34 @@ mod tests {
         app.update();
         let root = app.world().resource::<MenuUiRoot>();
         assert!(root.entity.is_some(), "the main menu panel exists");
+    }
+
+    #[test]
+    fn hud_denominator_is_the_live_chunk_grid() {
+        // The HUD used to hard-code 1600 (the old 40x40 map) while the world
+        // is GRID_CELLS x GRID_CELLS; a full walk showed "256 / 1600".
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+
+        let total = (crate::world::GRID_CELLS * crate::world::GRID_CELLS) as usize;
+        let mut query = app.world_mut().query::<&Text>();
+        let hud = query
+            .iter(app.world())
+            .find(|text| text.starts_with("Explored:"))
+            .map(|text| (**text).clone())
+            .expect("the playing HUD shows exploration progress");
+        assert!(
+            hud.contains(&format!("/ {total} ")),
+            "HUD must use the live grid size, got: {hud}"
+        );
     }
 }

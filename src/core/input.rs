@@ -24,6 +24,9 @@ pub const TOGGLE_MOUSE: KeyCode = PAUSE;
 // Menu / system
 pub const PAUSE: KeyCode = KeyCode::Escape;
 
+// Minimap HUD toggle (only while walking, see `plugins::minimap`).
+pub const MINIMAP_TOGGLE: KeyCode = KeyCode::KeyM;
+
 // Development shortcuts (stripped or gated in release builds)
 pub const DEV_TOGGLE_GIZMOS: KeyCode = KeyCode::KeyG;
 
